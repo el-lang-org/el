@@ -281,35 +281,35 @@ shell without implementing the language.
 
 **Deliverables**
 
-- Pin the exact Rust toolchain.
-- Create the workspace plus `el-cli` (with binary name `el`), `el-driver`,
+- [ ] Pin the exact Rust toolchain.
+- [ ] Create the workspace plus `el-cli` (with binary name `el`), `el-driver`,
   `el-span`, and `el-runtime`; add the remaining stage crates with their first
   vertical slice instead of landing empty future scaffolding.
-- Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and
+- [ ] Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and
   `pest_derive` only when the parser crate is introduced.
-- Record LLVM 22.1.0 and Inkwell 0.9.0 requirements without forcing ordinary
+- [ ] Record LLVM 22.1.0 and Inkwell 0.9.0 requirements without forcing ordinary
   frontend-only tests to link LLVM.
-- Select, document, and prepare the exact vendored Boehm GC release without
+- [ ] Select, document, and prepare the exact vendored Boehm GC release without
   exposing it through source-language APIs.
-- Implement exact `el --help` and `el --version` stream/exit behavior.
-- Build a strict command parser whose known-but-unimplemented project commands
+- [ ] Implement exact `el --help` and `el --version` stream/exit behavior.
+- [ ] Build a strict command parser whose known-but-unimplemented project commands
   fail as ordinary tool errors, not panics.
-- Discover the nearest ancestor `el.toml` for project commands.
-- Add structured error plumbing, temporary-directory test support, golden-file
+- [ ] Discover the nearest ancestor `el.toml` for project commands.
+- [ ] Add structured error plumbing, temporary-directory test support, golden-file
   conventions, and CI jobs for format, lint, unit tests, and license checks.
-- Document local prerequisites and keep frontend checks runnable without LLVM
+- [ ] Document local prerequisites and keep frontend checks runnable without LLVM
   or Boehm GC.
 
 **Tests**
 
-- Help and version output, streams, and status 0.
-- Unknown commands, duplicate options, missing values, and status 2.
-- Manifest discovery from the project root, descendants, and missing-manifest
+- [ ] Help and version output, streams, and status 0.
+- [ ] Unknown commands, duplicate options, missing values, and status 2.
+- [ ] Manifest discovery from the project root, descendants, and missing-manifest
   paths.
-- Workspace builds with no network access after dependencies are fetched.
+- [ ] Workspace builds with no network access after dependencies are fetched.
 
-**Exit gate:** `el --help` runs and CI builds the workspace. All standard Rust
-checks pass.
+- [ ] **Exit gate:** `el --help` runs and CI builds the workspace. All standard Rust
+  checks pass.
 
 ### Milestone 1 — Parser and AST
 
@@ -318,42 +318,42 @@ spanned AST that later stages can trust.
 
 **Deliverables**
 
-1. Implement source decoding rules: UTF-8, BOM rejection, LF/CRLF handling,
+1. [ ] Implement source decoding rules: UTF-8, BOM rejection, LF/CRLF handling,
    horizontal whitespace, comments, identifiers, keywords, and attributes.
-2. Implement literal tokens and decoding for integers, floats, strings, runes,
+2. [ ] Implement literal tokens and decoding for integers, floats, strings, runes,
    atoms, booleans, and `unit`, preserving spelling and decoded value.
-3. Encode significant-newline behavior explicitly. Test delimiter depth,
+3. [ ] Encode significant-newline behavior explicitly. Test delimiter depth,
    commas, trailing operators, comment-only lines, leading operators, and
    semicolon rejection.
-4. Add declarations and types: modules, functions, structs, aliases, protocols,
+4. [ ] Add declarations and types: modules, functions, structs, aliases, protocols,
    implementations, generics, constraints, associated types, composites,
    functions, unions, and fixed literal array lengths.
-5. Add expressions and blocks with the exact precedence and associativity
+5. [ ] Add expressions and blocks with the exact precedence and associativity
    ladder, including postfix forms, `::`, and `|>`.
-6. Add every collection constructor, control-flow form, pattern family,
+6. [ ] Add every collection constructor, control-flow form, pattern family,
    `defer`, and byte-aligned bitstring form.
-7. Convert `pest` pairs into parser-independent AST types with byte spans.
-8. Run grammar validation before semantic analysis: pipeline target shape,
+7. [ ] Convert `pest` pairs into parser-independent AST types with byte spans.
+8. [ ] Run grammar validation before semantic analysis: pipeline target shape,
    assignment target shape, protocol body contents, chained non-associative
    operators, bitstring modifiers, semicolons, leading-operator continuation,
    and remaining recovery nodes.
-9. Add focused recovery at declaration and block boundaries. Recovered trees
+9. [ ] Add focused recovery at declaration and block boundaries. Recovered trees
    may produce diagnostics but cannot become conforming ASTs.
-10. Add deterministic AST debug output.
+10. [ ] Add deterministic AST debug output.
 
 **Tests**
 
-- Accepted and rejected fixture for every grammar production and validation
+- [ ] Accepted and rejected fixture for every grammar production and validation
   rule.
-- Adjacent precedence-level snapshots and associativity cases.
-- Longest-token conflicts: `|`/`|>`, `:`/`::`/`:=`, `#`/`#[`, shifts, arrows,
+- [ ] Adjacent precedence-level snapshots and associativity cases.
+- [ ] Longest-token conflicts: `|`/`|>`, `:`/`::`/`:=`, `#`/`#[`, shifts, arrows,
   comparisons, and concatenation.
-- Literal boundaries, escapes, separators, overflow-independent tokenization,
+- [ ] Literal boundaries, escapes, separators, overflow-independent tokenization,
   and invalid identifier forms.
-- Span snapshots including multibyte text and CRLF.
-- Recovery tests proving malformed input never reaches name resolution.
+- [ ] Span snapshots including multibyte text and CRLF.
+- [ ] Recovery tests proving malformed input never reaches name resolution.
 
-**Exit gate:** parse a typed `Main.main() -> i32` and snapshot its complete AST.
+- [ ] **Exit gate:** parse a typed `Main.main() -> i32` and snapshot its complete AST.
 
 ### Milestone 2 — Names, types, Typed AST, and initial Core IR
 
@@ -362,56 +362,56 @@ establish verified source-to-Core boundaries.
 
 **Pass order**
 
-1. Validate module paths and collect declarations in source order.
-2. Build separate module, type, protocol, function, local-value, and associated-
+1. [ ] Validate module paths and collect declarations in source order.
+2. [ ] Build separate module, type, protocol, function, local-value, and associated-
    type namespaces.
-3. Resolve visibility, package ownership, lexical scopes, and the closed core
+3. [ ] Resolve visibility, package ownership, lexical scopes, and the closed core
    prelude using stable IDs.
-4. Expand transparent aliases and reject direct, mutual, generic, and cross-
+4. [ ] Expand transparent aliases and reject direct, mutual, generic, and cross-
    module cycles.
-5. Form canonical types and collect implicit function type parameters and
+5. [ ] Form canonical types and collect implicit function type parameters and
    explicit named-type parameters.
-6. Validate constraints and the subset of implementation metadata needed by the
+6. [ ] Validate constraints and the subset of implementation metadata needed by the
    initial slice; complete protocol dispatch remains Milestone 7.
-7. Bidirectionally check expressions and patterns, using expected types only at
+7. [ ] Bidirectionally check expressions and patterns, using expected types only at
    the locations allowed by `TYPES.md`.
-8. Normalize unions, remove duplicates, sort members canonically, and use
+8. [ ] Normalize unions, remove duplicates, sort members canonically, and use
    occurs-checked first-order unification to reject overlap with witnesses.
-9. Reject infinite inline layouts; recognize only specified built-in managed
+9. [ ] Reject infinite inline layouts; recognize only specified built-in managed
    indirection boundaries.
-10. Produce and verify a Typed AST with resolved identities, canonical `TypeId`s,
+10. [ ] Produce and verify a Typed AST with resolved identities, canonical `TypeId`s,
     substitutions, value categories, pattern facts, and explicit union
     injections.
-11. Define the shared Core IR CFG: typed operations, block parameters,
+11. [ ] Define the shared Core IR CFG: typed operations, block parameters,
     terminators, typed slots, source origins, and stage markers.
-12. Lower the milestone's supported source forms into Generic Core IR and verify
+12. [ ] Lower the milestone's supported source forms into Generic Core IR and verify
     ID ownership, typing, slot initialization, exact control-flow signatures,
     and absence of forbidden sugar.
 
 **Initial semantic slice**
 
-- Primitive `i32`, `i64`, `bool`, and `unit` types.
-- Function signatures and direct calls.
-- Immutable and mutable bindings, exact `:=`, lexical scopes, and shadowing.
-- Checked arithmetic representation, returns, blocks, and initial generics.
-- Expected-type-directed literals, empty-value diagnostics, named function
+- [ ] Primitive `i32`, `i64`, `bool`, and `unit` types.
+- [ ] Function signatures and direct calls.
+- [ ] Immutable and mutable bindings, exact `:=`, lexical scopes, and shadowing.
+- [ ] Checked arithmetic representation, returns, blocks, and initial generics.
+- [ ] Expected-type-directed literals, empty-value diagnostics, named function
   resolution, aliases, and structural union injection.
 
 **Tests**
 
-- Accepted/rejected pairs for each static rule in the initial slice.
-- Scope, shadowing, duplicate name, visibility, and stable-ID snapshots.
-- Generic inference from arguments and expected results, recursive generic
+- [ ] Accepted/rejected pairs for each static rule in the initial slice.
+- [ ] Scope, shadowing, duplicate name, visibility, and stable-ID snapshots.
+- [ ] Generic inference from arguments and expected results, recursive generic
   calls, ambiguity, and unsatisfied constraints.
-- Alias-cycle, union normalization/overlap, occurs-check, witness, and finite-
+- [ ] Alias-cycle, union normalization/overlap, occurs-check, witness, and finite-
   layout cases.
-- Typed AST snapshots and malformed Typed AST verifier tests.
-- Generic Core IR evaluation-order snapshots and malformed CFG tests.
-- Source spans on all negative cases; no invalid module reaches lowering.
+- [ ] Typed AST snapshots and malformed Typed AST verifier tests.
+- [ ] Generic Core IR evaluation-order snapshots and malformed CFG tests.
+- [ ] Source spans on all negative cases; no invalid module reaches lowering.
 
-**Exit gate:** accepted and rejected programs cover binding, mutation, calls,
-return types, generic inference, and ambiguous empty values without invoking
-LLVM.
+- [ ] **Exit gate:** accepted and rejected programs cover binding, mutation, calls,
+  return types, generic inference, and ambiguous empty values without invoking
+  LLVM.
 
 ### Milestone 3 — First native executable
 
@@ -420,33 +420,33 @@ executable.
 
 **Deliverables**
 
-- Implement deterministic reachability roots beginning at `Main.main() -> i32`.
-- Monomorphize reachable unconstrained generic functions and concrete generic
+- [ ] Implement deterministic reachability roots beginning at `Main.main() -> i32`.
+- [ ] Monomorphize reachable unconstrained generic functions and concrete generic
   layouts using `(declaration identity, normalized substitution)` worklist keys.
-- Reuse identical specializations and reject any residual type parameter,
+- [ ] Reuse identical specializations and reject any residual type parameter,
   projection, constraint call, derive request, or abstract layout.
-- Compute target layout for `i32`, `i64`, `bool`, and `unit`.
-- Lower Concrete Core IR arithmetic, direct calls, slots, blocks, and returns to
+- [ ] Compute target layout for `i32`, `i64`, `bool`, and `unit`.
+- [ ] Lower Concrete Core IR arithmetic, direct calls, slots, blocks, and returns to
   private Inkwell-backed LLVM code.
-- Emit mandatory integer checks with source origins and no debug/release semantic
+- [ ] Emit mandatory integer checks with source origins and no debug/release semantic
   difference.
-- Initialize the host target, verify LLVM modules, emit object files, and invoke
+- [ ] Initialize the host target, verify LLVM modules, emit object files, and invoke
   the host compiler driver as linker.
-- Add the native process entry shim that calls EL `Main.main` and forwards its
+- [ ] Add the native process entry shim that calls EL `Main.main` and forwards its
   `i32` result.
-- Record target triple and pointer width in reproducibility metadata.
-- Implement development and release output directories from the CLI contract.
+- [ ] Record target triple and pointer width in reproducibility metadata.
+- [ ] Implement development and release output directories from the CLI contract.
 
 **Tests**
 
-- Monomorphization reuse, recursion, deterministic order, and malformed
+- [ ] Monomorphization reuse, recursion, deterministic order, and malformed
   Concrete Core IR rejection.
-- LLVM module verification and only narrowly targeted LLVM text assertions.
-- Linker failure diagnostics without panics.
-- Debug and release executable parity for arithmetic and exit status.
+- [ ] LLVM module verification and only narrowly targeted LLVM text assertions.
+- [ ] Linker failure diagnostics without panics.
+- [ ] Debug and release executable parity for arithmetic and exit status.
 
-**Exit gate:** compile and run a program whose process exit status is calculated
-by EL code.
+- [ ] **Exit gate:** compile and run a program whose process exit status is calculated
+  by EL code.
 
 ### Milestone 4 — Core control flow and matching
 
@@ -455,32 +455,32 @@ make cleanup explicit in Core IR.
 
 **Deliverables**
 
-- Comparisons, `if`, `while`, short-circuit `and`/`or`, and early `return`.
-- Tuples, atoms, closed unions, explicit injection, discriminants, payloads,
+- [ ] Comparisons, `if`, `while`, short-circuit `and`/`or`, and early `return`.
+- [ ] Tuples, atoms, closed unions, explicit injection, discriminants, payloads,
   typed member patterns, tagged tuples, and exhaustive `match`.
-- Pattern usefulness/exhaustiveness analysis with unreachable-arm diagnostics.
-- Pipeline validation and desugaring that evaluates the left input before
+- [ ] Pattern usefulness/exhaustiveness analysis with unreachable-arm diagnostics.
+- [ ] Pipeline validation and desugaring that evaluates the left input before
   explicit arguments.
-- `defer` registration: immediate target/argument evaluation for calls and
+- [ ] `defer` registration: immediate target/argument evaluation for calls and
   by-value capture environments for blocks.
-- Cleanup CFGs that preserve block results and run actions once in LIFO order on
+- [ ] Cleanup CFGs that preserve block results and run actions once in LIFO order on
   fallthrough and every normal `return` path.
-- Unrecoverable failure terminators that deliberately bypass cleanup.
-- LLVM lowering for block parameters, conditional branches, switches, aggregate
+- [ ] Unrecoverable failure terminators that deliberately bypass cleanup.
+- [ ] LLVM lowering for block parameters, conditional branches, switches, aggregate
   values, and cleanup paths.
 
 **Tests**
 
-- Branch values, loops, nested returns, short-circuit effects, and pipelines.
-- Exhaustive and non-exhaustive finite/structural matches, top-to-bottom arm
+- [ ] Branch values, loops, nested returns, short-circuit effects, and pipelines.
+- [ ] Exhaustive and non-exhaustive finite/structural matches, top-to-bottom arm
   order, typed union patterns, and unreachable arms.
-- Deferred call timing versus block timing, capture snapshots, per-iteration
+- [ ] Deferred call timing versus block timing, capture snapshots, per-iteration
   cleanup, nested scopes, saved results, LIFO order, and failure skipping.
-- Core IR cleanup verifier tests and LLVM verification for every generated
+- [ ] Core IR cleanup verifier tests and LLVM verification for every generated
   module.
 
-**Exit gate:** compile and run iterative factorial, a tagged-result parser, and
-an exhaustive `i64 | string` match.
+- [ ] **Exit gate:** compile and run iterative factorial, a tagged-result parser, and
+  an exhaustive `i64 | string` match.
 
 ### Milestone 5 — Boehm GC integration
 
@@ -489,33 +489,33 @@ collection before adding the bulk of heap-backed types.
 
 **Deliverables**
 
-- Define and version a small private runtime ABI.
-- Vendor, build, and statically link the pinned Boehm GC release.
-- Initialize the collector before any managed runtime state.
-- Provide separate scanned and pointer-free allocation wrappers whose scan class
+- [ ] Define and version a small private runtime ABI.
+- [ ] Vendor, build, and statically link the pinned Boehm GC release.
+- [ ] Initialize the collector before any managed runtime state.
+- [ ] Provide separate scanned and pointer-free allocation wrappers whose scan class
   never changes.
-- Classify private runtime calls as allocating or non-allocating while treating
+- [ ] Classify private runtime calls as allocating or non-allocating while treating
   every EL call as a possible collection point.
-- Preserve live, aligned, unmodified base pointers across every collection point
+- [ ] Preserve live, aligned, unmodified base pointers across every collection point
   in locals, arguments, returns, globals, aggregate payloads, and hidden cleanup
   state.
-- Add managed-global registration and allocation-exhaustion termination.
-- Add a test-only stress mode that attempts collection at every managed
+- [ ] Add managed-global registration and allocation-exhaustion termination.
+- [ ] Add a test-only stress mode that attempts collection at every managed
   allocation.
-- Keep all Boehm types and controls out of compiler stage APIs and EL source.
+- [ ] Keep all Boehm types and controls out of compiler stage APIs and EL source.
 
 **Tests**
 
-- Graph retention and reclamation pressure in debug and optimized builds.
-- Base-pointer survival in registers, stack slots, calls, recursion, unions,
+- [ ] Graph retention and reclamation pressure in debug and optimized builds.
+- [ ] Base-pointer survival in registers, stack slots, calls, recursion, unions,
   saved block results, and deferred captures.
-- Scanned object graphs and pointer-free buffers.
-- Allocation exhaustion category, source location, nonzero exit, and no cleanup
+- [ ] Scanned object graphs and pointer-free buffers.
+- [ ] Allocation exhaustion category, source location, nonzero exit, and no cleanup
   unwinding.
 
-**Exit gate:** an optimized native EL program retains a reachable heap graph and
-survives collection-at-every-allocation stress while temporary allocations are
-reclaimable.
+- [ ] **Exit gate:** an optimized native EL program retains a reachable heap graph and
+  survives collection-at-every-allocation stress while temporary allocations are
+  reclaimable.
 
 ### Milestone 6 — Data types and text
 
@@ -524,47 +524,47 @@ verified managed runtime.
 
 **Deliverable groups**
 
-1. **Structs:** nominal identity, all-fields construction, field projection,
+1. [ ] **Structs:** nominal identity, all-fields construction, field projection,
    generic specialization, immutable value semantics, and direct mutable-root
    field update by reconstruction.
-2. **Sequential data:** lists, fixed arrays, slices, indexing, managed backing
+2. [ ] **Sequential data:** lists, fixed arrays, slices, indexing, managed backing
    retention, O(1) subslicing, and explicit copying.
-3. **Maps:** immutable operations, `Eq`/`Hash` key requirements, seeded hashing,
+3. [ ] **Maps:** immutable operations, `Eq`/`Hash` key requirements, seeded hashing,
    deterministic insertion order, duplicate replacement, and order-independent
    equality.
-4. **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
+4. [ ] **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
    `bits`, byte-aligned source bitstrings, conversions, bounds checks, and
    inspectable UTF-8 errors.
-5. **Unicode:** bundle Unicode 17.0.0 data and implement untailored UAX #29
+5. [ ] **Unicode:** bundle Unicode 17.0.0 data and implement untailored UAX #29
    revision 47 grapheme segmentation independent of host locale.
-6. **Views:** eager codepoint/grapheme collections and lazy views that retain
+6. [ ] **Views:** eager codepoint/grapheme collections and lazy views that retain
    source backing storage.
-7. **Buffer:** explicit value-style byte/string append operations and immutable
+7. [ ] **Buffer:** explicit value-style byte/string append operations and immutable
    conversion snapshots.
-8. **Function values:** exact monomorphic direct code targets, indirect calls,
+8. [ ] **Function values:** exact monomorphic direct code targets, indirect calls,
    visibility behavior, and generic specialization from expected types.
-9. **Numbers:** remaining integer widths, pointer-sized integers, floats,
+9. [ ] **Numbers:** remaining integer widths, pointer-sized integers, floats,
    explicit checked conversions, shifts, bitwise operations, and wrapping APIs.
-10. **Collection helpers:** `Enum` traversal machinery needed by the data layer
+10. [ ] **Collection helpers:** `Enum` traversal machinery needed by the data layer
     plus the fixed List/Array/Slice/Bytes operations. Protocol surface integration
     is completed in Milestone 7.
 
 **Tests**
 
-- Construction, inference, layout, access, and immutable-copy semantics for
+- [ ] Construction, inference, layout, access, and immutable-copy semantics for
   every data category.
-- Fixed-array length inference and rejection of symbolic/derived lengths.
-- Map insertion order across seeds and all update/remove/reinsert cases.
-- Bounds and numeric failure categories in debug and release.
-- Valid/invalid UTF-8 offsets and parity between string and buffer validation.
-- Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
+- [ ] Fixed-array length inference and rejection of symbolic/derived lengths.
+- [ ] Map insertion order across seeds and all update/remove/reinsert cases.
+- [ ] Bounds and numeric failure categories in debug and release.
+- [ ] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
+- [ ] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
   length APIs.
-- GC stress for nested composite graphs, views, base retention, immutable
+- [ ] GC stress for nested composite graphs, views, base retention, immutable
   sharing, and function values.
-- Compile-time rejection of `string[index]`.
+- [ ] Compile-time rejection of `string[index]`.
 
-**Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
-graphs under GC stress, and diagnose integer indexing on `string`.
+- [ ] **Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
+  graphs under GC stress, and diagnose integer indexing on `string`.
 
 ### Milestone 7 — Protocols and iteration
 
@@ -573,37 +573,37 @@ operators, and generic traversal.
 
 **Deliverables**
 
-- Parse-to-Typed-AST support for `defprotocol`, `defimpl`, `Self`, explicit
+- [ ] Parse-to-Typed-AST support for `defprotocol`, `defimpl`, `Self`, explicit
   associated type declarations/assignments, and qualified projections.
-- Protocol ownership/orphan checks across the resolved package graph.
-- Implementation completeness, exact substituted signatures, uniqueness, and
+- [ ] Protocol ownership/orphan checks across the resolved package graph.
+- [ ] Implementation completeness, exact substituted signatures, uniqueness, and
   overlap detection without using positive constraints as disambiguation.
-- Generic constraint checking once and concrete implementation selection during
+- [ ] Generic constraint checking once and concrete implementation selection during
   monomorphization.
-- Core protocols: `Eq`, `Ord`, `Show`, `Hash`, `Iterable`, and `Concat`.
-- Compiler-generated standard implementations and `@derive` for `Eq`, `Ord`,
+- [ ] Core protocols: `Eq`, `Ord`, `Show`, `Hash`, `Iterable`, and `Concat`.
+- [ ] Compiler-generated standard implementations and `@derive` for `Eq`, `Ord`,
   `Show`, and `Hash` when all field constraints hold.
-- `for` lowering through one statically selected `Iterable` implementation,
+- [ ] `for` lowering through one statically selected `Iterable` implementation,
   immutable cursors, associated `Item`, and irrefutable patterns.
-- Protocol lowering for nonprimitive equality/ordering and `++`.
-- Complete `Enum` APIs with deterministic traversal and short-circuit behavior.
+- [ ] Protocol lowering for nonprimitive equality/ordering and `++`.
+- [ ] Complete `Enum` APIs with deterministic traversal and short-circuit behavior.
 
 **Tests**
 
-- Completeness, duplicate/unknown associated types, orphan rejection, coherence,
+- [ ] Completeness, duplicate/unknown associated types, orphan rejection, coherence,
   overlapping generic heads, and alias/union target rejection.
-- Concrete dispatch at multiple instantiations, projection normalization,
+- [ ] Concrete dispatch at multiple instantiations, projection normalization,
   specialization reuse, and defensive post-substitution checks.
-- Derivation success/failure for generic and nested structs.
-- `Eq`/`Ord`/`Hash` law tests for standard implementations.
-- Every standard iteration order, map tuple order, cursor threading, and
+- [ ] Derivation success/failure for generic and nested structs.
+- [ ] `Eq`/`Ord`/`Hash` law tests for standard implementations.
+- [ ] Every standard iteration order, map tuple order, cursor threading, and
   irrefutable/refutable `for` patterns, including zero-based `Enum.at` hits and
   misses plus bounded traversal through the requested position.
-- Concatenation for `string`, `bytes`, `bits`, and lists.
+- [ ] Concatenation for `string`, `bytes`, `bits`, and lists.
 
-**Exit gate:** derive protocols for a generic struct, instantiate constrained
-generic functions at several concrete types, iterate multiple container types,
-and concatenate every standard `Concat` type.
+- [ ] **Exit gate:** derive protocols for a generic struct, instantiate constrained
+  generic functions at several concrete types, iterate multiple container types,
+  and concatenate every standard `Concat` type.
 
 ### Milestone 8 — Packages, I/O, and standard library
 
@@ -612,44 +612,44 @@ provide recoverable process/file boundaries.
 
 **Deliverable groups**
 
-1. Strict `el.toml` parsing for package ID, namespace, semantic version,
+1. [ ] Strict `el.toml` parsing for package ID, namespace, semantic version,
    dependencies, and optional single executable target; unknown keys are errors.
-2. Strict `src/` discovery and mechanical path-to-module validation.
-3. Package-relative, dependency-qualified, and prelude name resolution with
+2. [ ] Strict `src/` discovery and mechanical path-to-module validation.
+3. [ ] Package-relative, dependency-qualified, and prelude name resolution with
    collision and ambiguity diagnostics.
-4. Exact path dependency resolution and full-commit Git dependency resolution.
-5. Graph-wide package/source/version/revision uniqueness, namespace uniqueness,
+4. [ ] Exact path dependency resolution and full-commit Git dependency resolution.
+5. [ ] Graph-wide package/source/version/revision uniqueness, namespace uniqueness,
    dependency cycle detection, and deterministic traversal.
-6. Deterministic `el.lock` generation/refresh and non-mutating `--locked`
+6. [ ] Deterministic `el.lock` generation/refresh and non-mutating `--locked`
    verification.
-7. Full `el check`, `el build`, and `el emit llvm-ir --module ...` behavior,
+7. [ ] Full `el check`, `el build`, and `el emit llvm-ir --module ...` behavior,
    output paths, streams, and status classes.
-8. `Reader` and `Writer` with associated errors and tagged result values.
-9. Console conveniences constrained by `Show`, plus recoverable standard stream
+8. [ ] `Reader` and `Writer` with associated errors and tagged result values.
+9. [ ] Console conveniences constrained by `Show`, plus recoverable standard stream
    handles.
-10. Typed file reader/writer handles, shared external identity, close-through-
+10. [ ] Typed file reader/writer handles, shared external identity, close-through-
     alias behavior, tagged closed-handle errors, and explicit `defer` cleanup.
-11. Stable error kind/operation/code inspection, internal interrupted-call
+11. [ ] Stable error kind/operation/code inspection, internal interrupted-call
     retry, and exact protocol laws.
-12. Launch-time process arguments/environment snapshots with strict native
+12. [ ] Launch-time process arguments/environment snapshots with strict native
     UTF conversion and exact platform-specific string path conversion.
-13. Complete reserved prelude and standard modules with no implicit functions.
+13. [ ] Complete reserved prelude and standard modules with no implicit functions.
 
 **Tests**
 
-- Manifest keys, module mapping, visibility, package ownership, dependency
+- [ ] Manifest keys, module mapping, visibility, package ownership, dependency
   conflicts, cycles, namespaces, exact versions, Git pins, and lock stability.
-- `--locked` missing/stale behavior without filesystem mutation.
-- CLI option orders, duplicate/unknown options, streams, statuses 0/1/2, output
+- [ ] `--locked` missing/stale behavior without filesystem mutation.
+- [ ] CLI option orders, duplicate/unknown options, streams, statuses 0/1/2, output
   locations, library-only behavior, and absence of deferred commands.
-- Complete writes, EOF, flush, console newline behavior, typed file modes,
+- [ ] Complete writes, EOF, flush, console newline behavior, typed file modes,
   error mappings/accessors, alias/close behavior, and interrupted calls.
-- Argument ordering, executable-name exclusion, environment snapshots, invalid
+- [ ] Argument ordering, executable-name exclusion, environment snapshots, invalid
   native text, embedded NULs, and exact Unix/Windows path conversion.
-- Multi-package and multi-module end-to-end builds using only source packages.
+- [ ] Multi-package and multi-module end-to-end builds using only source packages.
 
-**Exit gate:** build a multi-module manifest target that reads, transforms, and
-writes data while handling every recoverable error through exhaustive `match`.
+- [ ] **Exit gate:** build a multi-module manifest target that reads, transforms, and
+  writes data while handling every recoverable error through exhaustive `match`.
 
 ### Milestone 9 — V1 stabilization
 
@@ -658,22 +658,22 @@ every claimed host and freeze the v1 delivery contract.
 
 **Deliverables**
 
-- Complete grammar, type-system, IR, CLI, runtime, standard-library, and package
+- [ ] Complete grammar, type-system, IR, CLI, runtime, standard-library, and package
   conformance suites traceable to specification sections.
-- Promote conforming programs from `EXAMPLES.md` into executable fixtures and
+- [ ] Promote conforming programs from `EXAMPLES.md` into executable fixtures and
   its invalid examples into negative fixtures.
-- Stabilize diagnostic codes, labels, source presentation, and path handling.
-- Run all semantic tests in development and optimized builds where required.
-- Verify GC stress mode on every supported target.
-- Freeze the v1 manifest format and private runtime ABI version for the matching
+- [ ] Stabilize diagnostic codes, labels, source presentation, and path handling.
+- [ ] Run all semantic tests in development and optimized builds where required.
+- [ ] Verify GC stress mode on every supported target.
+- [ ] Freeze the v1 manifest format and private runtime ABI version for the matching
   compiler distribution.
-- Document supported targets, LLVM/Boehm/runtime packaging, linker prerequisites,
+- [ ] Document supported targets, LLVM/Boehm/runtime packaging, linker prerequisites,
   licenses, reproducible build metadata, installation, and troubleshooting.
-- Audit the binary to ensure no v2 feature, extra CLI command, public FFI,
+- [ ] Audit the binary to ensure no v2 feature, extra CLI command, public FFI,
   unstable native type, or host-only behavior leaked into v1.
 
-**Exit gate:** all v1 examples and negative conformance programs behave
-identically on every supported target with GC stress enabled.
+- [ ] **Exit gate:** all v1 examples and negative conformance programs behave
+  identically on every supported target with GC stress enabled.
 
 ## 8. Test architecture
 
@@ -727,29 +727,29 @@ independent frontend and representation checks.
 
 The first reviewable changes should be small enough to verify independently:
 
-1. **Workspace and pins:** toolchain, workspace manifests, license policy,
+1. [ ] **Workspace and pins:** toolchain, workspace manifests, license policy,
    initial `el-span`, `el-runtime`, `el-driver`, and `el-cli` crates, plus a CI
    build.
-2. **CLI shell:** exact help/version and strict command parsing with CLI
+2. [ ] **CLI shell:** exact help/version and strict command parsing with CLI
    conformance fixtures.
-3. **Source foundation:** source database, `FileId`, `Span`, line mapping,
+3. [ ] **Source foundation:** source database, `FileId`, `Span`, line mapping,
    structured diagnostics, and renderer snapshots.
-4. **Project discovery:** ancestor manifest search and minimal project errors.
-5. **Lexical grammar:** source encoding, whitespace/comments, identifiers,
+4. [ ] **Project discovery:** ancestor manifest search and minimal project errors.
+5. [ ] **Lexical grammar:** source encoding, whitespace/comments, identifiers,
    keywords, literal tokens, and newline model.
-6. **Declaration/type grammar:** module, functions, signatures, bindings, scalar
+6. [ ] **Declaration/type grammar:** module, functions, signatures, bindings, scalar
    types, and the first typed-main parse.
-7. **Expression grammar:** precedence, postfix forms, blocks, and arithmetic.
-8. **AST adapter:** parser-independent AST, span propagation, deterministic
+7. [ ] **Expression grammar:** precedence, postfix forms, blocks, and arithmetic.
+8. [ ] **AST adapter:** parser-independent AST, span propagation, deterministic
    snapshots, and the Milestone 1 starter exit test.
-9. **Remaining v1 grammar:** composites, generics, protocols, patterns,
+9. [ ] **Remaining v1 grammar:** composites, generics, protocols, patterns,
    bitstrings, control flow, validation, and recovery conformance.
-10. **Semantic foundations:** typed IDs, declaration collection, namespaces,
+10. [ ] **Semantic foundations:** typed IDs, declaration collection, namespaces,
     canonical type arena, and the first Typed AST slice.
-11. **Initial checking:** bindings, mutation, calls, returns, literals, expected
+11. [ ] **Initial checking:** bindings, mutation, calls, returns, literals, expected
     types, aliases, generics, unions, and layout validation.
-12. **Core IR:** shared CFG, verifier, source-to-Generic lowering, and snapshots.
-13. **First backend:** monomorphization, Concrete verifier, LLVM lowering,
+12. [ ] **Core IR:** shared CFG, verifier, source-to-Generic lowering, and snapshots.
+13. [ ] **First backend:** monomorphization, Concrete verifier, LLVM lowering,
     object emission, linking, and computed process exit status.
 
 Do not combine the parser, type checker, Core IR, and backend into one large
@@ -866,21 +866,22 @@ commands, and audit every milestone against the v1 non-goals.
 
 ## 12. Progress tracking
 
-Use this table as the high-level implementation ledger. A milestone changes to
-complete only after its exit gate and workspace checks pass.
+Use this checklist as the high-level implementation ledger. Check a milestone
+only after its exit gate and workspace checks pass. Leave incomplete work
+unchecked and add `(in progress)` after the item when useful.
 
-| Milestone | Status | Exit evidence |
-| --- | --- | --- |
-| 0 — Project skeleton | Not started | `el --help`; CI workspace build |
-| 1 — Parser and AST | Not started | typed-main AST snapshot |
-| 2 — Names and types | Not started | accepted/rejected semantic suite without LLVM |
-| 3 — First native executable | Not started | computed native process exit status |
-| 4 — Core control and matching | Not started | factorial, tagged parser, union match |
-| 5 — Boehm GC | Not started | optimized graph retention under GC stress |
-| 6 — Data types and text | Not started | UTF-8, composites, views, GC, string-index rejection |
-| 7 — Protocols and iteration | Not started | derive, constrained generics, iteration, concat |
-| 8 — Packages, I/O, stdlib | Not started | multi-module recoverable I/O program |
-| 9 — V1 stabilization | Not started | cross-target full conformance under GC stress |
+- [ ] **0 — Project skeleton:** `el --help`; CI workspace build.
+- [ ] **1 — Parser and AST:** typed-main AST snapshot.
+- [ ] **2 — Names and types:** accepted/rejected semantic suite without LLVM.
+- [ ] **3 — First native executable:** computed native process exit status.
+- [ ] **4 — Core control and matching:** factorial, tagged parser, union match.
+- [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
+- [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
+  rejection.
+- [ ] **7 — Protocols and iteration:** derive, constrained generics, iteration,
+  concat.
+- [ ] **8 — Packages, I/O, stdlib:** multi-module recoverable I/O program.
+- [ ] **9 — V1 stabilization:** cross-target full conformance under GC stress.
 
 ## 13. Definition of implementation-ready
 
