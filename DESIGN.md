@@ -60,6 +60,8 @@ and fewer feature interactions. The decision log must explain exceptions.
 - Support the pipeline operator (`|>`).
 - Support strings, binary data, and garbage-collected heap values.
 - Build projects described by an `el.toml` manifest.
+- Expose command-line arguments, environment lookup, and portable string-based
+  file paths through a defined process boundary.
 - Make source programs visually familiar to an Elixir programmer.
 - Keep the runtime and compiler small enough to understand.
 
@@ -80,19 +82,26 @@ and fewer feature interactions. The decision log must explain exceptions.
 ### 2.3 Systems-programming intent
 
 Native code alone does not make a language suitable for systems programming.
-EL needs explicit-width numeric types, defined data layout, predictable runtime
-behavior, and deterministic handling of operating-system resources. Garbage
-collection manages memory, but it must not manage files, sockets, or other
-scarce resources.
+EL v1 provides native compilation, exact scalar widths, checked arithmetic,
+contiguous arrays and slices, predictable runtime behavior, and deterministic
+handling of operating-system resources. Garbage collection manages memory, but
+it must not manage files, sockets, or other scarce resources.
 
 V1 does not expose an FFI or an `unsafe` language feature. The compiler runtime
 and standard library may use native platform APIs internally, but that boundary
 is not part of the EL language. A public FFI is out of scope unless a future
 decision explicitly adds it.
 
+Aggregate memory layout, foreign calling conventions, and object-file
+compatibility are not source-language guarantees in v1. EL v1 is therefore a
+systems-oriented native language foundation, not yet a language for layout-
+sensitive FFI, memory-mapped hardware, kernel code, or interoperable binary
+libraries.
+
 ## 3. Language tour
 
-This example is illustrative. Syntax remains subject to parser prototypes.
+This example is illustrative, but every syntax form it uses conforms to the
+normative v1 grammar in section 12.
 
 ```el
 defmodule Main do
@@ -115,7 +124,7 @@ defmodule Main do
     end
 
     [origin]
-    |> List.map(distance_squared)
+    |> Enum.map(distance_squared)
     |> IO.println()
 
     0
@@ -140,21 +149,24 @@ In this example:
 
 - Source file extension: `.el`.
 - Source text is UTF-8.
-- Identifiers use ASCII letters, digits, and `_` in the initial implementation.
+- UTF-8 BOMs are not accepted. A physical newline is either LF or CRLF; a bare
+  carriage return is invalid. Outside literals, horizontal whitespace is ASCII
+  space or tab. A line comment excludes its terminating newline.
+- V1 identifiers use ASCII letters, digits, and `_` as specified in section 12.
 - Value and function names use `snake_case`.
 - Primitive type names are lower case.
 - Type variables are lower case; named type constructors, protocols, and modules
   use `PascalCase`.
-- `#` begins a line comment.
+- `#[` begins an array literal; any other `#` begins a line comment.
 - Nested block comments are deferred.
 
 ### 4.2 Keywords
 
-Initial reserved words:
+V1 reserved words:
 
 ```text
-def defimpl defmodule defp defprotocol defstruct do else end false for if in
-match mut return true when while
+def defer defimpl defmodule defp defprotocol defstruct do else end false for if in
+match mut return true type when while
 ```
 
 `@derive` and `@type` are built-in attributes and are reserved as complete
@@ -187,6 +199,33 @@ complete expression on the previous line. Blank and comment-only lines do not
 produce empty statements. A semicolon receives a syntax diagnostic rather than
 being treated as optional punctuation.
 
+### 4.4 Literals
+
+Integer literals use decimal notation or the `0b`, `0o`, and `0x` prefixes for
+binary, octal, and hexadecimal. An underscore may separate digits but may not
+lead, trail, or repeat. Integer literals have no suffix; their type comes from
+an expected type or defaults to `i64`. A leading `-` is the unary operator and
+is not part of the literal token.
+
+Floating-point literals use decimal notation and contain a decimal point, an
+exponent, or both, as in `1.0`, `1e10`, and `1.5e-3`. Digits may use the same
+underscore separators. An otherwise unconstrained floating literal defaults to
+`f64`. Hexadecimal floating literals and literal spellings for NaN and infinity
+are not supported in v1.
+
+A double-quoted string literal is valid UTF-8. A single-quoted rune literal must
+contain exactly one Unicode scalar value. The supported escapes, where
+applicable, are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, `\xNN`, and
+`\u{...}`. The decoded result of a string literal must remain valid UTF-8, and a
+Unicode escape must denote a scalar value rather than a surrogate. String
+interpolation, raw strings, multiline strings, and adjacent-literal
+concatenation are deferred.
+
+An atom literal is `:` followed by an ASCII `snake_case` identifier, such as
+`:ok` or `:not_found`. Quoted atoms and conversion of runtime strings to atoms
+are not supported. `true`, `false`, and `unit` are the literal values of `bool`
+and `unit`.
+
 ## 5. Bindings and mutability
 
 ### 5.1 Immutable binding
@@ -214,16 +253,37 @@ Rules:
 
 - `mut` is part of a binding declaration, not a type qualifier.
 - `:=` updates an existing mutable local binding.
+- `name.field := expression` performs a direct struct-field update by replacing
+  the value held by the mutable local binding `name`.
 - `:=` is a statement and evaluates to `unit`.
 - Assigning to an immutable binding is a compile-time error.
-- The assigned expression must have exactly the binding's type.
+- The assigned expression must have exactly the target's type: the binding type
+  for a local update or the declared field type for a field update.
 - A mutable binding must be initialized.
 - Parameters are immutable in v1.
 
-In the initial v1 semantics, mutability applies to the local binding itself. It
-does not implicitly make an aggregate, its fields, or aliased values mutable.
-Field assignment (`point.x := 2`) and indexed assignment (`items[0] := 2`) are
-deferred until aliasing and value/reference semantics are designed.
+Mutability applies to the local binding itself. It does not make an aggregate,
+its fields, or aliased values mutable. V1 nevertheless permits a direct field
+update rooted at a mutable local:
+
+```el
+mut point = %Point{x: 1, y: 2}
+point.x := point.x + 1
+```
+
+This is field-update syntax that reconstructs the struct and rebinds the mutable
+root `point`. It is semantically equivalent to evaluating the right-hand side
+against the old value and then replacing `point` with a shallow fieldwise copy
+whose `x` field contains the result. Other values copied from `point` are not
+changed. The compiler may lower the operation to an in-place store only when
+that optimization is unobservable.
+
+The root must be a mutable local binding, the named direct field must exist, and
+the right-hand side must have exactly the field's declared type. An immutable
+local, parameter, temporary expression, or arbitrary call result cannot be an
+update root. Nested field updates (`user.address.city := value`) and indexed
+updates (`items[0] := value`) are deferred. Keeping the accepted target narrow
+avoids introducing general reference or shared-mutation semantics.
 
 ### 5.3 Why `=` and `:=` differ
 
@@ -233,6 +293,8 @@ EL intentionally does not copy Go's meaning of `:=`. The language uses:
 name = expression       introduce an immutable binding
 mut name = expression   introduce a mutable binding
 name := expression      update a mutable binding
+name.field := expression
+                        reconstruct a struct and update its mutable root binding
 ```
 
 This rule is simple to parse, simple to type-check, and makes mutation visible.
@@ -262,6 +324,13 @@ unit
 values). `string`, `bytes`, and `bits` have dedicated semantics in section 7.
 `Buffer` is a standard-library type, not a primitive, so it uses PascalCase.
 
+The fixed-width signed integers use two's-complement representation, and the
+fixed-width unsigned integers use ordinary binary representation. `isize` and
+`usize` have the compilation target's pointer width; v1 targets have either
+32-bit or 64-bit pointers. `f32` and `f64` use IEEE 754 binary32 and binary64.
+A `rune` converts losslessly to `u32`, though its in-memory representation is not
+otherwise public.
+
 Implementation starts with `bool`, `i64`, `i32`, and `unit`; the other built-ins
 are added after the pipeline works end to end.
 
@@ -270,12 +339,41 @@ Rules:
 - Integer literals are checked against the expected type when one exists.
 - An otherwise unconstrained integer literal defaults to `i64`.
 - An otherwise unconstrained floating literal defaults to `f64`.
-- Arithmetic requires matching operand types.
+- Arithmetic requires matching operand types, except that a shift count has
+  type `usize`.
 - Conversions are explicit, for example `i32(value)`.
-- Integer arithmetic is checked for overflow in every build mode. Overflow in
-  ordinary arithmetic is an unrecoverable runtime failure; compile-time-known
-  overflow is a compile-time error. Wrapping is available only through explicit
-  opt-in wrapping operations.
+- Integer addition, subtraction, multiplication, and unary negation are checked
+  for overflow in every build mode. Unary negation is invalid for unsigned
+  integers. Ordinary overflow is an unrecoverable runtime failure;
+  compile-time-known overflow is a compile-time error.
+- Signed integer division truncates toward zero, and its remainder has the sign
+  of the dividend. Division or remainder by zero and the signed `MIN / -1` or
+  `MIN % -1` cases are unrecoverable failures unless known at compile time, when
+  they are errors.
+- Bitwise `&`, `|`, and `^` require matching integer types. Unary `~` preserves
+  its integer type. Shift counts are `usize`; a count at least as large as the
+  left operand's width fails. Left shift is checked for discarded significant
+  bits, signed right shift is arithmetic, and unsigned right shift is logical.
+- PascalCase modules corresponding to every integer type, such as `I64` and
+  `Usize`, provide explicit `wrapping_add`, `wrapping_sub`, `wrapping_mul`,
+  `wrapping_neg`, `wrapping_shl`, and `wrapping_shr` operations. Wrapping shifts
+  reduce the count modulo the width; a wrapping left shift discards high bits.
+- Integer-to-integer conversion checks the destination range. Float-to-integer
+  conversion truncates toward zero and rejects NaN, infinity, and out-of-range
+  results. Integer-to-float conversion permits explicit precision loss, while
+  `f64` to `f32` uses IEEE rounding and may produce infinity. Integer-to-`rune`
+  conversion rejects values that are not Unicode scalar values. A statically
+  known invalid conversion is a compile-time error; otherwise it is an
+  unrecoverable runtime failure.
+- `f32` and `f64` follow IEEE 754 round-to-nearest, ties-to-even semantics.
+  Floating division by zero produces IEEE infinity or NaN, and optimized builds
+  may not use transformations that violate these semantics. NaN payload and sign
+  are unspecified. NaN is unequal to every value, ordered comparisons involving
+  NaN are false, and positive and negative zero compare equal.
+- Floats support primitive comparison operators but do not implement `Eq`,
+  `Ord`, or `Hash` in v1. They therefore cannot be map keys and prevent those
+  protocols from being derived for a containing type. A future explicit
+  total-order wrapper may provide those capabilities.
 - EL has no `null`, null literal, nullable reference, or implicit zero reference.
 
 ### 6.2 Generics, custom types, and aliases
@@ -338,7 +436,7 @@ ascription:
 
 ```el
 value: i64 = Parser.parse("42")
-empty: [i64] = List.new()
+empty: [i64] = []
 sum(Parser.parse_all(lines) :: [i64])
 ```
 
@@ -358,6 +456,12 @@ fails with a diagnostic rather than choosing an arbitrary type.
 future distinct-type feature must use different syntax rather than changing
 transparent alias semantics.
 
+Transparent aliases must be acyclic. Direct, mutual, generic, and cross-module
+alias cycles are rejected even when a reference occurs beneath a managed
+container. This keeps alias expansion, type equality, union normalization, and
+diagnostics finite. Recursive data uses a nominal struct with recursion guarded
+by a managed container instead.
+
 #### 6.2.1 Structural union types
 
 `A | B` forms a closed structural union in any type position. It does not create
@@ -367,9 +471,19 @@ uses a canonical member order. For example, `A | (B | A)` and `B | A` are the
 same type.
 
 Every normalized alternative must be provably disjoint from every other
-alternative for all permitted generic substitutions. Distinct primitive types,
-nominal struct types, atoms, and differently tagged tuple shapes are disjoint.
-These generic tagged unions are therefore valid:
+alternative for all permitted finite generic substitutions. Formally, two
+alternatives are disjoint when no such substitution can make their normalized
+types equal. This is a static type rule rather than a comparison of physical
+representations; the union's hidden discriminant records which alternative was
+injected.
+
+Concrete unequal types are disjoint. This includes different primitive types,
+atoms, nominal struct constructors, invariant applications of the same generic
+constructor, tuple shapes or element types, array lengths or element types, and
+function signatures. Consequently, `List(i64) | List(string)` and
+`{:ok, i64} | {:ok, string}` are valid even if some values have similar runtime
+representations. These generic tagged unions are also valid; the second is the
+prelude's canonical optional-value type:
 
 ```el
 @type Result(a, e) = {:ok, a} | {:error, e}
@@ -382,6 +496,26 @@ Unconstrained alternatives that may overlap are rejected:
 @type Either(a, b) = a | b       # invalid: a and b may be the same type
 @type Optional(a) = a | :none    # invalid: a may include :none
 ```
+
+The compiler decides this by first-order unification after normalization.
+Generic constructors are invariant, nominal constructor identities must match,
+and tuple fields, array lengths and elements, and function parameters and return
+types unify recursively. The unifier performs an occurs check and never accepts
+an infinite substitution. Positive protocol constraints do not establish
+disjointness, and an unresolved associated-type projection is treated
+conservatively as capable of overlap.
+
+Before checking, the compiler expands acyclic transparent aliases, flattens
+nested unions, normalizes members recursively, removes members that are already
+exactly equal, and sorts them into a stable canonical order. It then tests every
+remaining pair. When overlap is found, the diagnostic should show a witness
+substitution where possible; for example, `Box(a) | Box(i64)` overlaps when
+`a = i64`.
+
+A generic union is checked at its declaration and normalized again after each
+concrete substitution. The concrete check is a defensive compiler invariant;
+a declaration accepted by the generic check must not acquire overlapping
+members during monomorphization.
 
 A value injects implicitly into a union only when an expected union type is
 available from a parameter, declared return type, binding annotation, or `::`
@@ -437,15 +571,40 @@ end
 user = %User{id: 1, name: "Ada"}
 ```
 
-All fields must be initialized in v1. Fields are immutable after construction.
-There is no implicit zero-value construction. Structs have value semantics: a
-binding, argument, return, or aggregate field contains a struct value rather
-than an observable reference with identity. A struct copy is shallow and
-fieldwise, so immutable reference-backed fields may share storage. The compiler
-may keep a struct in registers, place it inline, pass it indirectly, share
-immutable storage, or allocate it on the managed heap when those choices cannot
-be observed by EL code. Struct values are never null and have no identity
-operation. Directly recursive structs are rejected in v1.
+All fields must be initialized in v1. Fields are immutable components of the
+struct value; `mutable_local.field := value` reconstructs the struct and rebinds
+the mutable root rather than mutating a field through object identity. There is
+no implicit zero-value construction. Structs have value semantics: a binding,
+argument, return, or aggregate field contains a struct value rather than an
+observable reference with identity. A struct copy is shallow and fieldwise, so
+immutable reference-backed fields may share storage. The compiler may keep a
+struct in registers, place it inline, pass it indirectly, share immutable
+storage, or allocate it on the managed heap when those choices cannot be
+observed by EL code. Struct values are never null and have no identity operation.
+
+A recursive struct is well formed only when every recursive containment cycle
+crosses a built-in managed-indirection boundary. Structs, tuples, fixed arrays,
+structural unions, transparent aliases, and user-defined generic structs are
+inline constructors and do not break a cycle. `List(a)`, `Map(k, v)`,
+`Slice(a)`, `string`, `bytes`, `bits`, and designated opaque managed standard-
+library types do break a cycle. Zero-length arrays receive no exception.
+
+```el
+defstruct Invalid do
+  next: Invalid             # invalid: inline infinite layout
+end
+
+defstruct Node do
+  children: [Node]          # valid: List is managed indirection
+end
+```
+
+The same rule detects mutual, cross-module, and generic constructor cycles. For
+example, wrapping a recursive field in an inline tuple, array, union, or
+`Box(a)`-style value struct does not make it finite. If an associated-type
+projection affects layout, the compiler checks the concrete projection again
+after protocol resolution and reports both the declaration and instantiation
+that create an invalid cycle.
 
 `@derive` requests compiler-generated `defimpl` blocks. Derivation succeeds only
 when every participating field supports the requested protocol. For example,
@@ -462,7 +621,8 @@ V1 supports these composite categories:
 - tuples: heterogeneous fixed-size values such as `{string, i64}`;
 - lists: immutable homogeneous linked lists, type `[a]`;
 - maps: immutable key/value collections, type `Map(k, v)`;
-- arrays: fixed-size homogeneous values, type `[a; N]`;
+- arrays: fixed-size homogeneous values such as `[i64; 3]`, where the length is
+  part of the type;
 - slices: bounded views over contiguous elements, type `Slice(a)`;
 - structs: nominal records declared with `defstruct`;
 - functions: callable values such as `(i64, i64) -> i64`; and
@@ -486,6 +646,165 @@ Atoms have singleton literal identities. They are commonly used as the first
 element of a tagged tuple. Arbitrary conversion of runtime strings to atoms is
 not supported because an unbounded atom table would create a memory leak.
 
+Composite construction has one canonical spelling per category:
+
+```el
+tuple = {name, score}
+list = [1, 2, 3]
+list_with_tail = [head | tail]
+array = #[1, 2, 3]
+map = %{"one" => 1, "two" => 2}
+point = %Point{x: 1, y: 2}
+```
+
+A tuple contains at least two elements. V1 has no singleton tuple, and `unit`
+serves instead of an empty tuple. List literals are immutable and homogeneous;
+`[head | tail]` requires `tail` to have the same list type. `#[...]` constructs a
+fixed-size homogeneous array, and its element count is inferred into the array
+type. For example, `coordinates = #[10, 20, 30]` infers `[i64; 3]`; a local
+binding does not repeat the length unless an explicit contract is useful. Array
+repetition syntax is deferred. Empty list and map literals require an expected
+type when their element types cannot otherwise be inferred. An empty array
+literal always has length zero but likewise needs an expected item type, as in
+`empty: [u8; 0] = #[]`.
+
+In user-written types, an array length is a nonnegative integer literal
+representable as `usize`, such as `[a; 2]` or `[Point; 16]`. V1 has no symbolic
+length variables, const generics, length arithmetic, or inferred `_` placeholder
+inside an array type. A function may remain generic over the item type while
+fixing a literal length, but it cannot abstract over the length:
+
+```el
+def first_of_pair(values: [a; 2]) -> a do
+  values[0]
+end
+```
+
+Algorithms accepting arbitrary contiguous lengths use `Slice(a)`; generic
+traversal uses `Iterable` or `Enum`. Arrays of different lengths are distinct
+types and have no implicit conversion.
+
+`%{key => value}` constructs an immutable `Map(k, v)`. Map construction and key
+operations require `k` to implement both `Eq` and `Hash`. The core option type is
+the transparent tagged union `Option(a) = {:some, a} | :none`, and the minimal
+immutable map API is:
+
+```el
+Map.new() -> Map(k, v)
+Map.fetch(map: Map(k, v), key: k) -> Option(v)
+Map.put(map: Map(k, v), key: k, value: v) -> Map(k, v)
+Map.remove(map: Map(k, v), key: k) -> Map(k, v)
+Map.size(map: Map(k, v)) -> usize
+```
+
+Each operation that examines or changes keys requires `k: Eq` and `k: Hash`;
+signatures above omit repeated `when` clauses for readability.
+
+Maps iterate in deterministic insertion order. Replacing the value for an
+existing equal key preserves that key's position. Removing a key deletes its
+position, and inserting it again appends it at the end. Map literals evaluate
+entries from left to right; a later duplicate replaces the earlier value
+without moving the key. Map equality compares key/value membership and ignores
+insertion order, while `Show` and `Iterable` observe insertion order. The
+runtime's seeded hash strategy never changes this order.
+
+Read indexing is supported for arrays, slices, `bytes`, and `bits`:
+
+```el
+item = array[index]
+item = slice[index]
+byte = data[index]
+bit = bit_data[index]
+```
+
+The index has type `usize`. An out-of-bounds index is an unrecoverable runtime
+failure. Array and slice indexing returns their item type, byte indexing returns
+`u8`, and bit indexing returns `bool`. Bit index zero denotes the most-significant
+bit of the first source byte. Strings, lists, and maps do not support index
+syntax; maps use `Map.fetch` so absence remains explicit. Indexed update remains
+outside v1.
+
+Slices are constructed and subdivided through functions rather than range
+syntax:
+
+```el
+whole = Slice.from_array(array)
+part = Slice.subslice(whole, start, length)
+copy = Slice.copy(part)
+```
+
+`from_array` creates a managed view over the array's elements. `subslice` is
+bounds-checked and shares backing storage; `copy` creates compact independent
+managed storage. V1 has no slice literal or range expression.
+
+#### 6.4.1 Core collection modules
+
+Generic traversal belongs to `Enum`, not to a particular collection module.
+Every `Enum` signature below requires `i: Iterable`; the repeated `when i:
+Iterable` clause is omitted from the listing for readability but remains
+mandatory in the actual EL declaration:
+
+```el
+Enum.count(values: i) -> usize
+Enum.to_list(values: i) -> [Iterable.Item(i)]
+Enum.map(values: i, function: (Iterable.Item(i)) -> b) -> [b]
+Enum.filter(values: i, predicate: (Iterable.Item(i)) -> bool) ->
+  [Iterable.Item(i)]
+Enum.reduce(values: i, initial: a,
+  reducer: (a, Iterable.Item(i)) -> a) -> a
+Enum.each(values: i, function: (Iterable.Item(i)) -> unit) -> unit
+Enum.any(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
+Enum.all(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
+```
+
+These functions follow the selected iterable's deterministic order.
+`to_list`, `map`, and `filter` return lists because v1 has no higher-kinded
+abstraction for reconstructing an arbitrary input container. `reduce` is strict
+and left-to-right. `each` visits every item, while `any` and `all` stop as soon
+as their result is known. On maps the item type is `{k, v}` and order is
+insertion order. Function arguments are monomorphic named function values in
+v1 because anonymous functions and closures are deferred.
+
+`Enum.count` traverses the iterable and is O(n). Collection-specific structural
+sizes and minimal conversion operations are:
+
+```el
+List.reverse(values: [a]) -> [a]
+Array.length(values: [a; N]) -> usize
+Slice.length(values: Slice(a)) -> usize
+Bytes.byte_size(values: bytes) -> usize
+Bytes.slice(values: bytes, start: usize, length: usize) -> bytes
+Bytes.from_list(values: [u8]) -> bytes
+Bytes.to_list(values: bytes) -> [u8]
+```
+
+Here `N` schematically denotes the array type's compiler-known length; it is not
+valid user generic syntax. `Array.length` and `Slice.from_array` are compiler-
+provided standard intrinsics instantiated for every concrete literal length.
+Standard array implementations of `Eq`, `Ord`, `Hash`, `Show`, and `Iterable`
+are generated on the same concrete-length basis when their item constraints
+hold. Array, slice, and byte sizes are O(1). `List.reverse`, byte/list
+conversion, and `Enum` list-producing operations are O(n) and allocate fresh
+logical values. `Bytes.slice` is bounds-checked with `index_out_of_bounds` and
+may share immutable backing storage. `List.new` is omitted: an empty list is
+written `[]` with an expected type when necessary. Sorting, searching, zipping,
+chunking, and similar conveniences are ordinary future library growth rather
+than v1 language surface.
+
+#### 6.4.2 Representation boundary
+
+Arrays contain exactly `N` elements in source order. Arrays and slices are
+semantically contiguous and provide O(1) indexing; slice offsets and lengths are
+representable as `usize`. A string exposes one stable UTF-8 byte sequence through
+its APIs regardless of how the compiler stores it.
+
+V1 does not stabilize struct field offsets, padding, or alignment; tuple, union,
+list, map, string, or slice physical layouts; union discriminant sizes or
+values; the storage size of `bool`, atoms, or `unit`; managed-object headers;
+function-value representation; symbol mangling; or calling conventions. The
+compiler may scalarize, copy, share, inline, or heap-allocate values whenever EL
+code cannot observe the choice.
+
 ### 6.5 Functions and visibility
 
 ```el
@@ -507,8 +826,24 @@ end
 - Bare `return` is not supported; a unit-returning function uses `return unit`.
 - Omitting `-> type` means `-> unit`.
 - Overloading by parameter types is not supported.
-- Named functions can be used as function values.
+- A bare named function such as `square` produces a function value; a qualified
+  reference such as `Math.square` does the same after ordinary visibility and
+  module resolution. Adding parentheses calls the function.
+- Every function value has one exact structural type such as `(i64) -> i64` and
+  contains no captured environment. Parameter and result types must match
+  exactly; v1 has no function-type variance or implicit coercion.
+- A local binding shadows a bare function name. Qualification can still name a
+  visible public function. Outside code cannot directly name a `defp` function,
+  although owning-module code may pass or return its value.
+- A generic named function is specialized to one concrete function value using
+  its expected function type and surrounding inference. V1 has no polymorphic
+  function values; an undetermined specialization is a compile-time error.
+- Protocol operations cannot be taken as function values in v1. Code that needs
+  one defines an ordinary named wrapper with the required protocol constraint.
+- Function values can be called and passed but implement none of `Eq`, `Ord`,
+  `Hash`, or `Show`.
 - Closures and anonymous functions are deferred.
+- Partial application and bound receiver methods are deferred.
 - Lowercase type identifiers in the signature are inferred generic parameters.
 - `when parameter: Protocol` clauses constrain generic parameters.
 - Call sites never supply an explicit type-argument list.
@@ -551,6 +886,60 @@ implementation based only on a matching method name.
 through a constrained generic parameter, including those required by core
 protocols such as `Iterable`.
 
+An associated type is a named type selected by an implementation. The protocol
+must declare each associated type explicitly even when its uses in method
+signatures might permit inference:
+
+```el
+defprotocol Iterable do
+  type Item
+  type Cursor
+
+  def iter(value: Self) -> Cursor
+  def next(cursor: Cursor) -> {:item, Item, Cursor} | :done
+end
+```
+
+Every implementation assigns each declared associated type exactly once:
+
+```el
+defimpl Iterable, for: List(a) do
+  type Item = a
+  type Cursor = List.Cursor(a)
+
+  def iter(value: List(a)) -> List.Cursor(a) do
+    # implementation
+  end
+
+  def next(cursor: List.Cursor(a)) ->
+      {:item, a, List.Cursor(a)} | :done do
+    # implementation
+  end
+end
+```
+
+Missing, duplicate, or undeclared assignments are compile-time errors. Associated
+types have no defaults, parameters, or separate constraints in v1. After
+substituting `Self` and all associated types, every implementation method must
+exactly match its protocol signature. Only `def` methods are allowed inside a
+`defimpl`; they are protocol entries rather than separately exported module
+functions.
+
+Outside a protocol declaration, an associated type is referenced with a
+qualified projection such as `Iterable.Item(a)`, `Iterable.Cursor(a)`, or
+`Reader.Error(r)`. Inside the declaring protocol its bare name is used. A
+projection remains abstract while a constrained generic body is checked and is
+resolved statically for each concrete monomorphized implementation.
+
+An implementation may be declared only by the package that owns the protocol or
+the package that owns the target type. Across the resolved dependency graph,
+exactly one implementation may exist for a protocol/type pair. Generic
+implementation heads must not overlap, and positive protocol constraints do not
+make otherwise overlapping heads distinct. V1 has no specialization, negative
+implementations, default protocol method bodies, or protocol inheritance.
+Transparent aliases and structural unions are not implementation targets.
+Requesting `@derive` when an explicit implementation already exists is an error.
+
 ### 6.7 Core standard-library protocols
 
 The initial standard library defines:
@@ -568,6 +957,18 @@ The initial standard library defines:
 The core method sets are:
 
 ```el
+defprotocol Eq do
+  def eq(left: Self, right: Self) -> bool
+end
+
+defprotocol Ord do
+  def compare(left: Self, right: Self) -> :less | :equal | :greater
+end
+
+defprotocol Show do
+  def show(value: Self) -> string
+end
+
 defprotocol Iterable do
   type Item
   type Cursor
@@ -600,6 +1001,12 @@ implementation supplies `next`; a cursor does not trigger independent protocol
 dispatch. Cursors are immutable state values, and `for` threads each returned
 cursor into the next call.
 
+Standard iteration order is part of the API: lists traverse head to tail;
+arrays and slices use increasing indices; `bytes` uses increasing byte offsets;
+string codepoint and grapheme views follow source order; and maps yield `{key,
+value}` tuples in insertion order. An implementation may choose any immutable
+cursor representation that preserves its documented order.
+
 `Reader.read` returns at most `max_bytes`. Except when `max_bytes` is zero, an
 `{:ok, data}` result contains at least one byte, so callers cannot confuse an
 empty successful read with end-of-input. `read_exact`, `read_all`, and similar
@@ -611,10 +1018,128 @@ implementation. A string-writing helper exposes the string's UTF-8 bytes and
 calls `write`. Resource release is deliberately absent from both `Reader` and
 `Writer` and remains explicit through `defer` and type-specific cleanup APIs.
 
+The common console functions accept any value that implements `Show` and return
+`unit`:
+
+```el
+IO.print(value: a) -> unit when a: Show
+IO.println(value: a) -> unit when a: Show
+IO.report(value: a) -> unit when a: Show
+```
+
+`print` writes to standard output without a newline; `println` writes to standard
+output with one newline; and `report` writes to standard error with one newline.
+Each function statically invokes the selected `Show.show` implementation; this
+is behavior declared by the function's constraint, not a general implicit
+conversion to `string`. A `string` therefore writes as itself, while errors,
+numbers, and collections can be passed directly. Failure in these convenience
+functions is unrecoverable. Programs that must recover use
+`IO.stdin() -> IO.Stdin`, `IO.stdout() -> IO.Stdout`, and
+`IO.stderr() -> IO.Stderr`. `IO.Stdin` implements `Reader`; the output types
+implement `Writer`; their associated error type is `IO.Error`. These
+process-owned handles are not closed by EL programs.
+
+Files expose statically separated byte reader and writer handles:
+
+```el
+File.open_read(path: string) ->
+  {:ok, File.Reader} | {:error, File.Error}
+File.create(path: string) ->
+  {:ok, File.Writer} | {:error, File.Error}
+File.append(path: string) ->
+  {:ok, File.Writer} | {:error, File.Error}
+@type File.Stream = File.Reader | File.Writer
+File.close(stream: File.Stream) ->
+  {:ok, unit} | {:error, File.Error}
+```
+
+`File.Reader` implements `Reader`, and `File.Writer` implements `Writer`.
+`create` creates or truncates; `append` creates if absent and otherwise writes at
+the end. V1 has no combined read/write handle, seeking, permission API, or text
+mode. Text encoding remains explicit through `String.from_bytes` and
+`String.bytes`. `IO.Error` and `File.Error` implement `Show`, so diagnostic
+branches can pass them directly to `IO.report`.
+
+`IO.Error` and `File.Error` are opaque immutable values with stable inspection
+APIs. The shared closed kind and operation types are:
+
+```el
+@type IO.ErrorKind =
+  :not_found | :permission_denied | :already_exists | :invalid_input |
+  :is_directory | :not_directory | :closed | :broken_pipe |
+  :out_of_space | :other
+
+@type IO.Operation =
+  :open_read | :create | :append | :read | :write | :flush | :close
+
+IO.error_kind(error: IO.Error) -> IO.ErrorKind
+IO.error_operation(error: IO.Error) -> IO.Operation
+IO.error_code(error: IO.Error) -> Option(i64)
+
+File.error_kind(error: File.Error) -> IO.ErrorKind
+File.error_operation(error: File.Error) -> IO.Operation
+File.error_code(error: File.Error) -> Option(i64)
+```
+
+The kind is the portable basis for control flow. `:other` represents a host
+failure without a more specific v1 mapping. The optional code preserves a
+target-dependent operating-system error number for diagnostics; portable
+programs do not branch on it. Runtime I/O retries interrupted host operations
+internally rather than exposing interruption as a stable kind. Adding a new
+kind or operation changes an exhaustive union and therefore requires a recorded
+language-version decision.
+
+Both error types implement `Show`, `Eq`, and `Hash`, but not `Ord`. Equality and
+hashing use exactly the documented operation, kind, and optional system code;
+unexposed diagnostic text does not participate. Copies have ordinary value
+semantics and no resource identity. Values are created only by the standard
+library rather than by user construction.
+
 `Hasher` is an opaque standard-library state initialized with a runtime-selected
 seed. `Hash.hash` returns updated state rather than a stable public integer.
 Values equal under `Eq` must feed equivalent data into `Hasher`; derived `Hash`
 implementations process struct fields in declaration order.
+
+Protocol implementations must obey these semantic laws:
+
+- `Eq` is reflexive, symmetric, and transitive.
+- `Ord` defines a total order and returns `:equal` exactly when `Eq.eq` is true.
+- Values equal under `Eq` feed equivalent data into `Hash`.
+
+A user implementation that violates these laws has erroneous behavior, such as
+failed lookups or inconsistent comparisons, but cannot by itself cause memory
+unsafety. Equality and ordering require matching operand types; v1 has no
+cross-numeric equality or ordering. Floats implement none of `Eq`, `Ord`, or
+`Hash` because IEEE NaN behavior conflicts with these laws.
+
+The standard implementations are fixed as follows:
+
+- `Eq` covers `bool`, integers, `rune`, `string`, `bytes`, `bits`, atoms, and
+  `unit`; tuples when every element implements `Eq`; lists, arrays, and slices
+  when their item type does; maps when their values do; and derived structs when
+  every field does. Equality is structural. Slices compare visible contents,
+  and map equality ignores insertion order.
+- `Ord` covers the same scalar types, except maps, and extends structurally to
+  tuples, lists, arrays, slices, and derived structs whose components implement
+  `Ord`. Sequential values compare lexicographically with a proper prefix
+  first; derived structs compare fields in declaration order. Strings compare
+  Unicode scalar values without normalization or case folding.
+- `Hash` covers the lawful `Eq` scalar and sequential types and extends to
+  tuples and derived structs when every component implements `Hash`. Strings
+  hash their exact UTF-8 bytes. Maps do not implement `Hash` in v1.
+- `Show` covers standard scalar and collection types and derived structs. Its
+  output is human-readable diagnostics, not a stable serialization format, and
+  formatting may evolve between language releases. Standard I/O and file error
+  types also implement `Show`.
+
+The opaque standard errors `IO.Error`, `File.Error`, and `String.Utf8Error`
+implement `Eq`, `Hash`, and `Show` according to their documented inspection
+fields. They do not implement `Ord`.
+
+Functions, buffers, floats, and resource handles implement none of `Eq`, `Ord`,
+or `Hash`. Maps implement neither `Ord` nor `Hash`. Structural unions do not
+automatically implement protocols; a nominal wrapper or explicit conversion is
+required when protocol behavior is needed.
 
 The `Concat` operation is spelled `concat`:
 
@@ -629,12 +1154,63 @@ The `++` operator desugars to `Concat.concat(left, right)`. Concatenating an
 immutable linked list requires copying its left spine, so repeated list `++`
 inside a loop may be quadratic; diagnostics or documentation should flag this.
 
+### 6.8 Process inputs and native paths
+
+V1 programs receive process arguments and read environment variables through
+the reserved `Process` module:
+
+```el
+Process.arguments() -> {:ok, [string]} | {:error, {:invalid_text, usize}}
+Process.get_env(name: string) ->
+  {:ok, string} | :not_found | {:error, :invalid_name | :invalid_text}
+```
+
+`arguments` returns only the arguments supplied after the executable name, in
+launch order. The `usize` in `{:invalid_text, index}` is the zero-based index in
+that returned argument list. Conversion is all-or-nothing: the function does
+not return a partial list. `get_env` returns the launch-time value of one
+variable; it returns `:not_found` when the name was absent. A name containing
+U+0000 or `=` returns `{:error, :invalid_name}`. V1 provides no environment
+enumeration, mutation, current-directory mutation, or executable-path API.
+
+The runtime snapshots the arguments and environment before calling `Main.main`,
+so repeated calls observe the same values. On Unix-like targets, native argument
+and environment byte strings must be valid UTF-8. On Windows, native UTF-16 must
+be a well-formed scalar sequence. Invalid input is reported by the tagged result
+above; it never undergoes replacement-character or locale-dependent conversion.
+The host's environment-name comparison rules remain target-dependent, including
+Windows case insensitivity.
+
+All v1 file functions continue to accept `string` paths. Conversion to a native
+path is exact and locale-independent:
+
+- Unix-like targets pass the string's UTF-8 bytes unchanged.
+- Windows targets transcode Unicode scalar values to UTF-16 without
+  normalization, case folding, separator rewriting, or canonicalization.
+- A path containing U+0000 fails with `File.Error` kind `:invalid_input` and the
+  requested file operation.
+
+Consequently, every accepted EL `string` path is converted without loss, but v1
+cannot name a Unix path containing invalid UTF-8 bytes or a Windows path
+containing unpaired UTF-16 surrogates. Native path spelling, separators,
+absolute-path rules, case-sensitivity, and symbolic-link behavior otherwise
+follow the host operating system. A future native-string/path type may widen
+access without changing the meaning of existing `string` paths.
+
 ## 7. Strings and binaries
 
 ### 7.1 `string`
 
 `string` is distinct from binary data and is always valid UTF-8. Construction
 from untrusted bytes validates encoding and returns a tagged success/error value.
+
+EL v1 pins text semantics to Unicode 17.0.0. Grapheme boundaries use the
+untailored default extended-grapheme-cluster algorithm from Unicode Standard
+Annex #29 revision 47, conformance clause UAX29-C1-1. Compiler distributions
+bundle the corresponding Unicode Character Database and segmentation tables;
+host locale, operating-system APIs, and installed ICU versions cannot change an
+EL program's result. A future Unicode upgrade is a recorded language-semantic
+change rather than an incidental dependency update.
 
 Integer indexing is not supported: `text[i]` is a compile-time error. UTF-8 code
 points have variable encoded width, so such an operation would hide whether `i`
@@ -647,6 +1223,8 @@ String.length(text)
 String.bytes(text)
 String.codepoints(text)
 String.graphemes(text)
+String.codepoint_view(text)
+String.grapheme_view(text)
 ```
 
 Their semantics are:
@@ -654,16 +1232,50 @@ Their semantics are:
 - `byte_size(s) -> usize` returns the number of bytes in the UTF-8 encoding. It
   is O(1) because `string` stores its byte length.
 - `length(s) -> usize` returns the number of Unicode grapheme clusters. It is
-  generally O(n), matching Elixir's human-text-oriented meaning of length.
-- `bytes(s)` returns a read-only, non-allocating view whose items are `u8`; the
-  view retains the immutable string storage.
-- `codepoints(s)` returns an iterable view whose items are `rune` values.
-- `graphemes(s)` returns an iterable view whose items are valid `string` slices,
-  one extended grapheme cluster at a time.
+  generally O(n), matching Elixir's human-text-oriented meaning of length. Its
+  boundaries are exactly those used by `graphemes` and `grapheme_view`.
+- `bytes(s) -> bytes` returns the first-class immutable UTF-8 byte sequence and
+  may share the string's immutable storage.
+- `codepoints(s) -> [rune]` eagerly returns Unicode scalar values in source
+  order.
+- `graphemes(s) -> [string]` eagerly returns one valid string per extended
+  Unicode grapheme cluster in source order under the pinned untailored UAX #29
+  rules. Returned strings may share immutable source storage.
+- `codepoint_view(s) -> String.CodepointView` lazily iterates `rune` values.
+- `grapheme_view(s) -> String.GraphemeView` lazily iterates grapheme-cluster
+  string slices.
 
-The exact concrete view types remain an API-design task, but these operations do
-not return mutable access to the string's storage. Code-point and grapheme
-iteration are distinct operations.
+The eager list functions favor the common developer experience and make their
+allocation visible in the return type. The explicitly named views retain the
+source string and support allocation-sensitive or early-terminating traversal.
+No operation returns mutable access to string storage.
+
+EL performs no implicit normalization, case folding, or locale tailoring before
+segmentation. The default UAX #29 rules operate directly on the source scalar
+sequence while preserving canonical-equivalent boundaries. Unicode scalar-value
+validity itself includes unassigned non-surrogate code points and therefore does
+not depend on whether Unicode 17.0 assigns a character to a value.
+
+The minimal conversion API is:
+
+```el
+String.from_bytes(data: bytes) ->
+  {:ok, string} | {:error, String.Utf8Error}
+String.utf8_error_offset(error: String.Utf8Error) -> usize
+Rune.to_string(value: rune) -> string
+Bytes.to_bits(data: bytes) -> bits
+Bits.to_bytes(data: bits) -> Option(bytes)
+```
+
+`from_bytes` validates UTF-8. `Bytes.to_bits` is lossless, while `Bits.to_bytes`
+returns `:none` unless the bit length is byte-aligned. Conversions may share
+immutable storage but never expose mutation.
+
+`String.Utf8Error` is an opaque immutable value whose offset is the zero-based
+byte offset of the first invalid UTF-8 sequence. An incomplete final sequence
+reports the offset at which that sequence begins. It implements `Show`, `Eq`,
+and `Hash`, but not `Ord`; equality and hashing use only the offset. The same
+rules apply when `Buffer.to_string` reports this error.
 
 ### 7.2 `bytes`, `bits`, and `rune`
 
@@ -674,70 +1286,104 @@ iteration are distinct operations.
 Conversions among these types are explicit. Converting `bytes` to `string`
 validates UTF-8. Converting `string` to `bytes` exposes its UTF-8 encoding.
 
+The minimal arbitrary-length bit API is:
+
+```el
+Bits.bit_size(value: bits) -> usize
+Bits.slice(value: bits, start: usize, length: usize) -> bits
+Bits.to_bytes(value: bits) -> Option(bytes)
+Bytes.to_bits(value: bytes) -> bits
+```
+
+`Bits.slice` is bounds-checked and fails with `index_out_of_bounds` rather than
+returning an option. It may produce a non-byte-aligned value. `Bits.to_bytes`
+returns `:none` when the bit length is not divisible by eight. `bits` supports
+read indexing as described in section 6.4 and concatenation through `Concat`.
+
 ### 7.3 `Buffer`
 
 `Buffer` is a growable standard-library builder for constructing `string` or
-`bytes` without repeated immutable concatenation. Its initial value-style API
-keeps mutation explicit:
+`bytes` without repeated immutable concatenation. It is a byte builder with an
+explicit value-style API:
 
 ```el
 mut buffer = Buffer.new()
-buffer := Buffer.append(buffer, "hello")
-buffer := Buffer.append(buffer, " world")
-text = Buffer.to_string(buffer)
+buffer := Buffer.append_string(buffer, "hello")
+buffer := Buffer.append_byte(buffer, 0x20)
+buffer := Buffer.append_string(buffer, "world")
 ```
 
-The runtime may reuse storage when it can prove uniqueness, but observable
-semantics remain local rebinding. `Buffer.to_string` validates UTF-8 when the
-buffer was built from raw bytes.
+Its minimal API is:
+
+```el
+Buffer.new() -> Buffer
+Buffer.byte_size(buffer: Buffer) -> usize
+Buffer.append_byte(buffer: Buffer, value: u8) -> Buffer
+Buffer.append_bytes(buffer: Buffer, value: bytes) -> Buffer
+Buffer.append_string(buffer: Buffer, value: string) -> Buffer
+Buffer.to_bytes(buffer: Buffer) -> bytes
+Buffer.to_string(buffer: Buffer) ->
+  {:ok, string} | {:error, String.Utf8Error}
+```
+
+There is no overloaded `append`. `to_bytes` always succeeds, while `to_string`
+validates the complete byte sequence. Values returned by either conversion never
+change after later buffer operations. The runtime may reuse uniquely held
+storage or use copy-on-write, but observable semantics remain local rebinding
+and immutable snapshots.
 
 ### 7.4 Bitstring construction and matching
 
-The target design supports Elixir-style bit-level construction and pattern
-matching. V1 supports byte-aligned segments and matching; the `bits` value model
-itself permits arbitrary bit lengths. Explicit library operations may construct
-and inspect arbitrary-length `bits` values.
-
-Full source-level patterns with arbitrary or dynamic bit widths are deferred to
-the next language version because they require substantially more parsing,
-type-checking, bounds, exhaustiveness, and lowering rules. The post-v1 syntax
-follows Elixir's segment-modifier model, adapted to EL's `bytes` and `bits`
-names:
+V1 source syntax is deliberately byte-aligned. A `<<...>>` construction
+expression produces `bytes`, and a bitstring pattern consumes `bytes`:
 
 ```el
-<<version::size(3),
-  flags::size(5),
+packet = <<version::unsigned-big-size(8),
   length::unsigned-big-size(16),
-  payload::bits-size(length),
-  rest::bits>>
+  payload::bytes>>
+
+match packet do
+  <<version::unsigned-big-size(8),
+    length::unsigned-big-size(16),
+    payload::bytes-size(usize(length))>> -> consume(version, payload)
+  _ -> reject_packet()
+end
 ```
 
 A segment is `value_or_pattern::modifier-modifier...`. Modifier order does not
-affect semantics, though the formatter emits a canonical order. The supported
-modifier categories are:
+affect semantics; the formatter emits kind, sign, byte order, then size. V1
+accepts only these forms:
 
-- kind: `integer`, `float`, `bytes`, `bits`, `utf8`, `utf16`, or `utf32`;
-- integer sign: `signed` or `unsigned`, defaulting to `unsigned`;
-- byte order where relevant: `big`, `little`, or `native`, defaulting to `big`;
-- `size(expression)`; and
-- `unit(positive_integer)`.
+- integer segments, optionally marked `integer`, with `signed` or `unsigned`
+  (default `unsigned`), `big`, `little`, or `native` byte order (default `big`),
+  and a required literal `size` of 8, 16, 24, 32, 40, 48, 56, or 64 bits;
+- `bytes` segments with an optional `size(expression)` measured in bytes; and
+- a final unsized `bytes` pattern that captures the remaining input.
 
-Effective width is `size * unit` bits. The default unit is one bit for integer,
-float, and `bits` segments and eight bits for `bytes`. Integer segments default
-to a size of eight bits. The shortcut `value::n` means `value::size(n)`, and
-`value::n*u` means `value::size(n)-unit(u)`.
+In construction, an integer operand may have any integer type and must fit the
+declared signedness and width. A sized `bytes` operand must contain exactly the
+declared number of bytes. A statically known violation is a compile-time error;
+otherwise construction fails unrecoverably with `bitstring_size_mismatch` and
+never truncates or pads a value. An unsized construction `bytes` segment appends
+the operand's complete contents.
 
-In a pattern, a dynamic size may use an in-scope value or a value bound by an
-earlier segment, but not one bound later in the same pattern. An unsized `bits`
-or `bytes` pattern captures the remainder and must be the final segment;
-unsized `bytes` additionally requires byte alignment. Insufficient input or a
-segment mismatch makes the enclosing pattern fail normally. Duplicate or
-conflicting modifiers are compile-time errors.
+In a pattern, unsigned integer segments bind `u64` and signed integer segments
+bind `i64`; literal integer patterns are checked against the same range. A sized
+`bytes` segment captures exactly that many bytes. Its size expression may use an
+in-scope value or a value bound by an earlier segment, but not one bound later.
+Insufficient input, a literal mismatch, or unconsumed input makes the pattern
+fail normally rather than causing an unrecoverable failure.
 
-Construction uses checked integer range semantics and never silently truncates
-high bits. V1 parses the same segment form but accepts only cases whose segment
-boundaries and total size are byte-aligned; the later version removes that
-restriction.
+`big` and `little` have target-independent meanings. `native` uses the
+compilation target's byte order and is an intentional source of target-dependent
+behavior. Duplicate, conflicting, unknown, or out-of-scope modifiers are
+compile-time errors. Empty `<<>>` constructs empty `bytes` and matches only empty
+`bytes`.
+
+Source segments of kind `float`, `utf8`, `utf16`, `utf32`, or `bits`; explicit
+`unit`; non-byte-aligned widths; and arbitrary-width integer segments are
+post-v1. Arbitrary-length `bits` values remain usable through `Bits.slice`,
+indexing, conversion, and concatenation without implying those source forms.
 
 ## 8. Expressions and control flow
 
@@ -745,6 +1391,24 @@ restriction.
 
 `do ... end` forms a lexical scope and evaluates to its final expression. An
 empty block evaluates to `unit`.
+
+#### 8.1.1 Evaluation order
+
+EL evaluates eagerly from left to right. This applies to a function target and
+its arguments, operator operands, tuple/list/array/map elements, struct field
+initializers in source order, and the value and index of an indexing expression.
+Every expression is evaluated exactly once. `and` and `or` are the exceptions to
+eager operand evaluation and short-circuit their right operand.
+
+A pipeline evaluates its left input before the explicit arguments written on
+its right. An assignment evaluates and type-checks its right-hand side before
+replacing the old binding value. A `match` evaluates its subject once and then
+tests arms from top to bottom; pattern tests themselves have no user-visible
+side effects.
+
+Map literal entries are evaluated and inserted from left to right. If two
+evaluated keys are equal, the later entry replaces the earlier value, but every
+key and value expression is still evaluated.
 
 ### 8.2 Conditionals
 
@@ -769,17 +1433,39 @@ Recoverable errors are tagged tuple values, normally `{:ok, value}` or
 
 ```el
 match Parser.parse_int(input) do
-  {:ok, value} -> value
+  {:ok, value} -> IO.println(value)
   {:error, reason} -> IO.report(reason)
 end
 ```
 
 `match` is an expression. All reachable arms must return the same type when its
-result is used, subject to the same expected-union injection rule as `if`. The
-type checker verifies exhaustiveness for every closed structural union, `bool`,
-and other finite types it understands. Tagged alternatives use structural
-patterns, while general union alternatives may use `name: Type` typed binding
-patterns. A wildcard `_` arm makes a match exhaustive.
+result is used, subject to the same expected-union injection rule as `if`. Every
+match must be exhaustive. Infinite types such as integers and strings normally
+require a wildcard or binding catch-all; closed structural unions, `bool`,
+tuples, lists, and structs receive structural exhaustiveness checking.
+
+V1 patterns are:
+
+- `_`, which matches without binding;
+- an identifier, which always introduces a new immutable binding;
+- literal patterns;
+- tuple and tagged-tuple patterns;
+- `[]` and `[head | tail]` list patterns;
+- struct patterns such as `%Point{x: x}`, where omitted fields are ignored;
+- byte-aligned bitstring patterns from section 7.4; and
+- `name: Type`, which selects exactly one normalized structural-union member.
+
+Patterns compose recursively. A binding introduced by a pattern is visible only
+in that match arm. It may shadow an outer binding under the usual shadow-warning
+rule, but one pattern may not bind the same name more than once; repeated names
+do not express equality constraints. Typed binding patterns are available only
+for structural-union elimination, and the named type must be exactly one
+normalized member.
+
+Arms are tested from top to bottom. An arm that is provably unreachable because
+an earlier arm subsumes it is a compile-time error. At minimum, the compiler
+detects arms after a wildcard or general binding and repeated identical literal
+arms. V1 has no match guards, alternative patterns, pinning, or map patterns.
 
 Unrecoverable runtime failures such as an internal invariant violation may abort
 the process. They are not catchable and must not be used for ordinary errors.
@@ -798,9 +1484,12 @@ end
 ```
 
 V1 has exactly two loop forms: `while` and `for pattern in iterable`. Both return
-`unit`. A `for` loop obtains values through the `Iterable` protocol and may use a
-pattern as its loop binding. C-style loops, `loop`, comprehensions, and implicit
-recursion syntax are not supported. `break` and `continue` are deferred.
+`unit`. A `for` loop obtains values through the `Iterable` protocol. Its binding
+pattern must be irrefutable for the selected implementation's `Item` type, so
+iteration never silently skips a mismatching item and never introduces a runtime
+pattern failure. Refutable processing uses an exhaustive `match` inside the loop.
+C-style loops, `loop`, comprehensions, and implicit recursion syntax are not
+supported. `break` and `continue` are deferred.
 
 ### 8.5 Early return
 
@@ -843,22 +1532,60 @@ targets are deferred.
 
 ### 8.7 Operators
 
-The first compiler slice supports:
+From highest to lowest precedence, v1 operators are:
 
 ```text
-unary:          - !
-multiplicative: * / %
-additive:       + -
-concatenation:  ++
-comparison:     < <= > >=
-equality:       == !=
-logical:        and or
-pipeline:       |>
+postfix:         call, field access, indexing
+unary:           - ! ~
+multiplicative:  * / %
+additive:        + -
+shift:           << >>
+bitwise and:     &
+bitwise xor:     ^
+bitwise or:      |
+concatenation:   ++
+comparison:      < <= > >=
+equality:        == !=
+logical and:     and
+logical or:      or
+ascription:      ::
+pipeline:        |>
 ```
 
-Operators do not implicitly coerce values. Short-circuit semantics are required
-for `and` and `or`. `++` resolves through `Concat.concat`, while `|>` is compile-
-time syntax sugar and performs no protocol dispatch.
+Arithmetic, shifts, and bitwise operators associate left. `++` associates
+right, and pipelines associate left. Comparison and equality operators are
+non-associative, so forms such as `a < b < c` and `a == b == c` are rejected.
+Unary operators associate right. An ascription applies to the complete
+expression on its left at all higher precedence levels and does not chain.
+
+Operators do not implicitly coerce values. `%` is integer-only. `and` and `or`
+require `bool` operands and short-circuit. `++` resolves through
+`Concat.concat`, while `|>` is compile-time syntax sugar and performs no
+protocol dispatch. In expression position `|` is integer bitwise OR; in type
+position it remains structural-union syntax.
+
+### 8.8 Unrecoverable runtime failures
+
+An unrecoverable runtime failure terminates the process immediately with a
+nonzero status. It is not a value, cannot be caught, and does not unwind lexical
+scopes or run any pending `defer` actions. A failure raised while executing a
+deferred action likewise prevents all remaining actions from running.
+
+For a source-mandated runtime check, the runtime makes a best-effort write to
+standard error containing a stable category identifier and the package-relative
+source file, line, and column of the operation that failed. The v1 categories
+are `integer_overflow`, `division_by_zero`, `invalid_shift`,
+`invalid_conversion`, `index_out_of_bounds`, `allocation_exhausted`, and
+`console_output_failed`, plus `bitstring_size_mismatch`. Exact prose and the
+numeric nonzero exit status are implementation-defined. If standard error itself
+cannot be written, termination still occurs.
+
+Debug and release builds report the same category for the same operation. V1
+does not provide stack traces, custom panic values, a user-callable panic
+operation, or any recovery mechanism for these failures. Compiler and runtime
+invariant violations are implementation defects rather than language failures;
+they may terminate with additional internal diagnostics and are not assigned a
+source-level category.
 
 ## 9. Modules, packages, and physical layout
 
@@ -871,15 +1598,61 @@ time syntax sugar and performs no protocol dispatch.
 - `def` exports a function from its module; `defp` does not.
 - The executable entry point is `Main.main() -> i32` for a target whose root
   module is the package-relative `Main`.
-- The return value of `main` becomes the process exit code.
+- The return value of `main` is forwarded to the host operating system as the
+  process exit code. A platform may expose fewer bits to a waiting process; for
+  example, POSIX environments commonly expose only the low eight bits.
 - Top-level executable statements are not allowed.
 - One module may span only one file in v1.
+
+V1 has no imports, opened modules, user-defined preludes, or module aliases.
+Names resolve as follows:
+
+- A bare value name first resolves to a lexical local or parameter, then to a
+  declaration in the current module, and finally to the fixed core prelude.
+- Bare type and protocol names resolve in the current module and then in the
+  core prelude.
+- A module outside the current module is referenced with a qualified name such
+  as `Http.Client.get`.
+- Modules in the current package use package-relative names. A dependency module
+  name begins with that dependency's declared root namespace. Core modules such
+  as `IO`, `List`, and `String` use their prelude names.
+- If a source name has more than one possible module resolution, compilation
+  fails rather than selecting one by priority.
+
+The core prelude contains no unqualified functions. Its type names are the
+primitive types plus `Buffer`, `Hasher`, `List`, `Map`, `Option`, and `Slice`.
+Its protocol names are `Eq`, `Ord`, `Show`, `Hash`, `Iterable`, `Reader`,
+`Writer`, and `Concat`. Its root modules are:
+
+```text
+Array Bits Buffer Bytes Enum File IO List Map Process Rune Slice String
+I8 I16 I32 I64 Isize U8 U16 U32 U64 Usize
+```
+
+Protocol names also qualify their operations, as in `Show.show(value)`. Ordinary
+functions are never imported implicitly.
+
+Prelude declarations and root modules are reserved. A package declaration may
+not redefine one, and a package or dependency root namespace may not collide
+with a prelude root. The prelude defines the single canonical optional-value
+alias `Option(a) = {:some, a} | :none`; user code does not redeclare it.
+
+`defstruct`, `@type`, and `defprotocol` declarations are public in v1. Struct
+fields are public for construction and reading. A `defimpl` participates
+globally in protocol resolution for the complete dependency graph. Only
+functions distinguish public `def` from module-private `defp`.
+
+A module may declare at most one function with a given name, regardless of
+arity. EL does not use Elixir-style `name/arity` identities in v1; this keeps a
+bare named function value unambiguous. Visibility controls whether source code
+may name a function, not whether an already-obtained function value may be
+called; an owning module may therefore return or pass a private function value.
 
 ### 9.2 Project manifest
 
 An EL project is a directory containing an `el.toml` manifest. The manifest
-declares the package ID, root namespace, package version, dependencies, and build
-targets. An illustrative manifest is:
+declares the package ID, root namespace, package version, dependencies, and an
+optional executable target. An illustrative executable package is:
 
 ```toml
 [package]
@@ -889,14 +1662,23 @@ version = "0.1.0"
 
 [deps]
 
-[targets.app]
-kind = "executable"
+[target]
 main = "Main"
 ```
 
 `package.name` is the package ID used by dependency and tooling metadata;
 `package.namespace` is the root namespace used by source modules. V1
 dependencies are EL packages; the manifest cannot declare native FFI libraries.
+Package IDs use lowercase `snake_case`, and a root namespace is one `PascalCase`
+component. Unknown manifest keys are errors.
+
+Every package is automatically an importable collection of EL source modules;
+there is no separate library target or stable compiled library artifact. A
+package may declare at most one `[target]`. Its `main` value is package-relative,
+must name a module owned by that package, and must expose `main() -> i32`. The
+output executable uses `package.name`. Omitting `[target]` makes the package
+library-only. Multiple executable targets and additional target kinds are
+deferred beyond v1.
 
 V1 supports local path dependencies and Git dependencies pinned to a full
 commit hash:
@@ -922,12 +1704,19 @@ V1 performs no compatible-version search. Across the complete transitive graph,
 every occurrence of one package ID must resolve to the same source, exact
 version, and Git revision where applicable. A disagreement is a dependency
 conflict; multiple simultaneous versions of one package are not supported.
+Every package root namespace in that graph must also be unique. Duplicate root
+namespaces are rejected even when the package IDs differ.
+Dependency cycles are rejected.
 
 `el.lock` records the complete resolved graph, package versions, Git commits,
 and source metadata. Executable projects commit it. A path dependency remains a
 live development input, so the lockfile records its identity and declared
 version but does not make its contents reproducible. Registry sources, version
 ranges, and a compatibility solver are deferred beyond v1.
+
+Ordinary `el check` and `el build` create or refresh `el.lock` when resolution
+changes. With `--locked`, a missing or stale lockfile is an error and the tool
+does not modify it.
 
 ### 9.3 Physical layout
 
@@ -939,8 +1728,14 @@ project/
   src/
     main.el
     parser.el
-  test/
 ```
+
+V1 has no language-integrated test declarations, test discovery, special
+semantics for a `test/` directory, or `el test` command. Repositories may keep
+ordinary scripts or separate executable packages under `test/`, but the EL tool
+does not discover them. EL programs can be exercised through executable targets
+and external scripts; the compiler's conformance suite is an implementation
+facility rather than part of the package format.
 
 Every source file under `src/` contains one `defmodule`. The manifest's root
 namespace prefixes every project module. Module names are derived strictly from
@@ -959,7 +1754,7 @@ The compiler strips the source extension, requires every path component to be
 lowercase `snake_case`, converts each component mechanically to `PascalCase`,
 and joins components with dots. Acronyms receive no special casing, and
 `index.el` has no special meaning. The declared `defmodule` must exactly match
-the derived package-relative name. Manifest target module names are also
+the derived package-relative name. The manifest target module name is also
 package-relative; external package modules use their declared root namespace.
 
 Invalid path components, path/declaration mismatches, duplicate modules, and
@@ -985,9 +1780,26 @@ programs.
 
 Boehm GC discovers roots conservatively from machine registers, stacks, globals,
 and reachable heap memory. V1 therefore does not emit precise stack maps, a
-shadow stack, or per-type tracing functions. Generated code must keep live
-managed references visible as valid machine pointers across any operation that
-may allocate; GC-safety tests must cover optimized builds as well as debug builds.
+shadow stack, or per-type tracing functions. Every EL function call is treated
+as a possible collection point because the callee may allocate; private runtime
+calls are classified explicitly as allocating or non-allocating. V1 performs no
+interprocedural allocation-effect inference.
+
+At every possible collection point, each live managed reference must remain
+discoverable as an unmodified, aligned native pointer in a scanned register,
+stack slot, global, or reachable managed object. It must not exist solely as an
+integer, tagged pointer, compressed value, or interior pointer. Slices, string
+views, and other managed views retain the base pointer of their backing
+allocation even if lowering also computes a derived data pointer. Union payloads,
+deferred captures, saved block results, call arguments, and runtime temporaries
+obey the same rule.
+
+Objects that may contain managed references use scanned allocation; raw byte,
+bit, and numeric payload storage uses pointer-free allocation. A pointer-free
+allocation must never later receive a managed reference. Managed global values
+reside in collector-visible scanned storage registered during runtime startup.
+Allocation failure is an unrecoverable runtime failure rather than a tagged
+result.
 
 Conservative scanning may retain an otherwise unreachable object when non-pointer
 data happens to resemble its address. The collector cannot move or compact live
@@ -995,7 +1807,9 @@ objects, but stable addresses simplify the initial runtime. EL's private
 allocation API preserves the option to replace Boehm with a precise collector in
 a later version without changing source-language semantics.
 
-V1 has no user-visible finalizers or weak references.
+V1 has no user-visible finalizers or weak references. A compiler/runtime stress
+mode attempts collection at every managed allocation site and is exercised in
+both debug and optimized builds.
 
 Reference: [Boehm GC overview](https://hboehm.info/gc/) and
 [algorithm description](https://hboehm.info/gc/gcdescr.html).
@@ -1007,7 +1821,7 @@ V1 uses an explicit, lexically scoped `defer` statement for deterministic
 cleanup:
 
 ```el
-match File.open(path) do
+match File.open_read(path) do
   {:ok, file} ->
     defer do
       match File.close(file) do
@@ -1023,17 +1837,66 @@ match File.open(path) do
 end
 ```
 
-A `defer` registers its call or block when execution reaches the statement.
-Referenced binding values are captured at registration, and deferred actions run
-once in last-in, first-out order on every normal control-flow exit from the
-innermost enclosing lexical block. The deferred action must evaluate to `unit`,
-so a fallible cleanup operation must explicitly handle its tagged result.
-`return` is not permitted within a deferred call or block.
+Opaque OS resource values are the deliberate exception to ordinary value-backed
+data semantics. Copying a resource handle creates another alias to the same
+external resource; it does not duplicate that resource. Reads advance shared
+external state, closing through one alias closes the resource for all aliases,
+and operations through a closed alias return tagged errors. Closing an already
+closed handle also returns a tagged error. Resource handles implement neither
+`Eq` nor `Hash`, and user-defined structs do not acquire resource identity.
 
-Deferred actions are not guaranteed to run after an unrecoverable runtime
-failure, process abort, or external termination. Garbage collection remains
-responsible only for memory and is never the semantic mechanism for releasing a
-file, stream, socket, or other non-memory resource.
+V1 has no affine ownership system, so programs are responsible for avoiding
+unintended aliases and double close. This external identity exception is limited
+to opaque standard-library resource types and must be documented on every such
+type.
+
+A `defer` is a statement of type `unit` and registers an action only when
+execution reaches it. It belongs to the innermost enclosing lexical `do ... end`
+block, including a function body, conditional branch, match arm, or loop body.
+Actions run once in last-in, first-out order on normal fallthrough and early
+`return`. A loop-body action therefore runs at the end of each reached
+iteration, rather than accumulating until the enclosing function returns.
+
+A deferred call evaluates its call target and arguments immediately, exactly
+once and left to right, then stores the resulting values and delays only the
+invocation:
+
+```el
+defer close(open_temporary())  # open_temporary runs at registration
+```
+
+The deferred function must return `unit`. A fallible cleanup operation therefore
+uses a block and handles its tagged result explicitly.
+
+A deferred block delays its body expressions until exit. At registration it
+captures by value the current values of every referenced outer binding:
+
+```el
+defer do
+  release(make_handle())       # make_handle runs at scope exit
+end
+```
+
+Captured bindings are immutable snapshots inside the deferred action, even when
+the original binding was mutable. The action cannot assign to a captured
+binding, but it may declare and update its own local mutable bindings. This
+compiler-generated capture environment is not a first-class closure and does
+not add anonymous functions to v1.
+
+On fallthrough, a block first evaluates and saves its final result, then runs its
+deferred actions, and finally yields the saved result. The saved result and all
+captured managed values remain GC roots during cleanup. `return` routes through
+the same cleanup sequence for every exited lexical scope.
+
+A deferred action must evaluate to `unit` and may contain neither `return` nor
+another `defer`. If an action encounters an unrecoverable failure, the process
+terminates immediately and no remaining actions run.
+
+Deferred actions do not run after an unrecoverable runtime failure. They are
+also not guaranteed after an implementation abort or external termination.
+Garbage collection remains responsible only for memory and is never the
+semantic mechanism for releasing a file, stream, socket, or other non-memory
+resource.
 
 ### 10.3 V2 resource ergonomics
 
@@ -1049,7 +1912,7 @@ fallible finalization, and interaction with `Reader` and `Writer`. V1's explicit
 
 ## 11. Compiler architecture
 
-The compiler executable is named `elc`.
+The unified compiler and package tool is named `el`.
 
 ```text
 .el source
@@ -1116,9 +1979,15 @@ span into a source file. Line and column numbers are derived for display.
 
 ### 11.3 Initial lowering strategy
 
+- Core IR preserves the language's left-to-right, exactly-once evaluation order;
+  LLVM optimizations may reorder operations only when the change is unobservable.
 - Immutable scalar locals become LLVM SSA values where practical.
 - Mutable locals may initially lower to entry-block `alloca` instructions plus
   loads/stores; LLVM's `mem2reg` pass can promote safe cases to SSA.
+- A direct struct-field update evaluates its right-hand side using the old
+  struct value, constructs the updated shallow value, and stores that value into
+  the mutable root. Lowering may use an in-place field store only when no EL
+  program can observe a difference.
 - `if` expressions lower to control-flow blocks and a `phi` value.
 - `while` lowers to condition, body, and exit basic blocks.
 - `for pattern in value` lowers through the statically selected `Iterable`
@@ -1127,60 +1996,202 @@ span into a source file. Line and column numbers are derived for display.
 - A concrete structural union lowers to a hidden discriminant plus an aligned
   payload; typed injections construct a member and exhaustive matches switch on
   the discriminant before lowering the selected member pattern.
-- `defer` lowers by threading a scope's registered cleanup actions through its
-  normal exit blocks in reverse registration order.
+- Every EL call is conservatively a possible collection point. Live managed
+  values remain raw base pointers in collector-visible locations across it;
+  optimization must not leave the only live representation as an integer,
+  tagged value, or interior pointer. Runtime calls carry an internal
+  allocating/non-allocating classification.
+- A deferred call evaluates into hidden target/argument slots at registration;
+  a deferred block captures referenced values into a compiler-generated
+  immutable environment. Cleanup blocks preserve the scope result and thread
+  registered actions through normal exits in reverse registration order. Saved
+  results, call values, and capture environments remain visible to the GC.
 - `return` lowers to the function exit only after routing control through the
   cleanup blocks for every exited lexical scope.
 - `left ++ right` lowers to the selected `Concat.concat(left, right)` call.
 - `left |> call(args)` is rewritten to `call(left, args)` before Core IR.
+- Each reachable named function value lowers to a concrete monomorphized code
+  target with no environment. Indirect calls use its exact function type;
+  representation and calling convention remain private runtime ABI details.
+- Integer arithmetic, shifts, and conversions emit the required overflow, range,
+  zero-divisor, and shift-count checks. Float lowering does not enable LLVM
+  fast-math flags that weaken EL's IEEE semantics.
 - Monomorphization starts from concrete entry points, specializes reachable
   generic functions and named types, resolves their constrained protocol calls,
   and reuses an existing specialization for an identical type substitution.
 - Runtime operations are called through a small, versioned internal ABI.
 
-## 12. PEG grammar sketch
+The runtime ABI is private to a matching compiler distribution. V1 packages are
+compiled from EL source as part of the resolved build and do not exchange stable
+object files. Compiler versions need not preserve object-file compatibility,
+symbol names, aggregate layouts, or calling conventions.
 
-This is explanatory pseudogrammar, not the final parser grammar:
+Build output records the LLVM target triple, pointer width, and pinned Unicode
+data version for diagnostics and reproducibility. Intentional target-dependent
+source behavior is limited to
+`isize`/`usize` width, `native` bitstring byte order, operating-system APIs and
+error values, process-exit-code observation, and practical allocation or
+collection limits.
+
+## 12. Normative v1 grammar
+
+This section, together with the lexical rules in section 4, is the normative v1
+source grammar. Compiler recovery productions may accept incomplete input only
+to issue diagnostics; they must never make an otherwise rejected program valid.
+The compiler's checked-in `pest` grammar must implement this contract; it is not
+a second source of language syntax. A disagreement is a compiler bug or
+requires an accepted decision that updates this section.
+
+The notation below uses `/` for ordered choice and postfix `?`, `*`, and `+` for
+optionality and repetition. Lowercase lexical names are defined immediately
+after the syntactic productions. Horizontal
+space and comments may occur between tokens. `NL` is one physical newline that
+remains significant under section 4.3; newlines treated as
+continuation whitespace do not produce `NL`. `body(item)` means zero or more
+`item` forms separated by `NL`, with optional leading and trailing `NL`. There
+is no other statement separator.
 
 ```text
-program       <- SOI module EOI
-module        <- "defmodule" module_name "do" module_item* "end"
-module_name   <- type_name ("." type_name)*
-module_item   <- derive_attr? struct_decl / type_alias / function
-               / protocol_decl / protocol_impl
-struct_decl   <- "defstruct" type_name type_params? when_clause?
-                 "do" field* "end"
-type_alias    <- "@type" type_name type_params? "=" type
-function      <- ("def" / "defp") ident "(" params? ")"
-                 return_type? when_clause? "do" block "end"
-protocol_decl <- "defprotocol" type_name "do" protocol_sig* "end"
-protocol_impl <- "defimpl" type_name "," "for" ":" type when_clause?
-                 "do" function* "end"
-type_params   <- "(" type_var ("," type_var)* ")"
-type_apply    <- type_name "(" type ("," type)* ")"
-type          <- union_type
-union_type    <- primary_type ("|" primary_type)*
-when_clause   <- "when" constraint ("," constraint)*
-constraint    <- type_var ":" type_name
-params        <- param ("," param)*
-param         <- ident ":" type
-return_type   <- "->" type
-binding       <- "mut"? ident (":" type)? "=" expression
-assignment    <- ident ":=" expression
-ascription    <- expression "::" type
-return_stmt   <- "return" expression
-if_expr       <- "if" expression "do" block ("else" block)? "end"
-match_expr    <- "match" expression "do" match_arm+ "end"
-typed_pattern <- ident ":" type
-while_stmt    <- "while" expression "do" block "end"
-for_stmt      <- "for" pattern "in" expression "do" block "end"
-defer_stmt    <- "defer" (call_expr / ("do" block "end"))
+program          <- SOI NL* module NL* EOI
+module           <- "defmodule" module_name "do" body(module_item) "end"
+module_item      <- derive_attr NL+ struct_decl
+                  / struct_decl / type_alias / function_decl
+                  / protocol_decl / protocol_impl
+
+derive_attr      <- "@derive" "[" type_path ("," type_path)* "]"
+struct_decl      <- "defstruct" type_name type_params? when_clause?
+                    "do" body(field_decl) "end"
+field_decl       <- ident ":" type
+type_alias       <- "@type" type_name type_params? "=" type
+function_decl    <- ("def" / "defp") function_head "do"
+                    body(block_item) "end"
+function_head    <- ident "(" params? ")" return_type? when_clause?
+protocol_decl    <- "defprotocol" type_name "do"
+                    body(protocol_item) "end"
+protocol_item    <- assoc_type_decl / protocol_signature
+protocol_signature <- "def" function_head
+protocol_impl    <- "defimpl" type_path "," "for" ":" type when_clause?
+                    "do" body(implementation_item) "end"
+implementation_item <- assoc_type_def / function_decl
+assoc_type_decl  <- "type" type_name
+assoc_type_def   <- "type" type_name "=" type
+
+type_params      <- "(" type_var ("," type_var)* ")"
+params           <- param ("," param)*
+param            <- ident ":" type
+return_type      <- "->" type
+when_clause      <- "when" constraint ("," constraint)*
+constraint       <- type_var ":" type_path
+
+type             <- union_type
+union_type       <- primary_type ("|" primary_type)*
+primary_type     <- function_type / tuple_type / list_or_array_type
+                  / atom / primitive_type / named_type / type_var
+function_type    <- "(" (type ("," type)*)? ")" "->" type
+tuple_type       <- "{" type "," type ("," type)* "}"
+list_or_array_type <- "[" type (";" array_length)? "]"
+named_type       <- type_path ("(" type ("," type)* ")")?
+type_path        <- type_name ("." type_name)*
+
+block_item       <- binding / assignment / return_expr / defer_expr
+                  / while_expr / for_expr / expression
+binding          <- "mut"? ident (":" type)? "=" expression
+assignment       <- ident ("." ident)? ":=" expression
+return_expr      <- "return" expression
+defer_expr       <- "defer" (call_expression / ("do" body(block_item) "end"))
+while_expr       <- "while" expression "do" body(block_item) "end"
+for_expr         <- "for" pattern "in" expression
+                    "do" body(block_item) "end"
+
+expression       <- pipeline_expr
+pipeline_expr    <- ascription_expr ("|>" ascription_expr)*
+ascription_expr  <- logical_or_expr ("::" type)?
+logical_or_expr  <- logical_and_expr ("or" logical_and_expr)*
+logical_and_expr <- equality_expr ("and" equality_expr)*
+equality_expr    <- comparison_expr (("==" / "!=") comparison_expr)?
+comparison_expr  <- concat_expr (("<=" / ">=" / "<" / ">") concat_expr)?
+concat_expr      <- bit_or_expr ("++" concat_expr)?
+bit_or_expr      <- bit_xor_expr ("|" bit_xor_expr)*
+bit_xor_expr     <- bit_and_expr ("^" bit_and_expr)*
+bit_and_expr     <- shift_expr ("&" shift_expr)*
+shift_expr       <- additive_expr (("<<" / ">>") additive_expr)*
+additive_expr    <- multiplicative_expr (("+" / "-") multiplicative_expr)*
+multiplicative_expr <- unary_expr (("*" / "/" / "%") unary_expr)*
+unary_expr       <- ("-" / "!" / "~") unary_expr / postfix_expr
+postfix_expr     <- primary_expr postfix_part*
+postfix_part     <- call_arguments / ("." ident) / ("[" expression "]")
+call_expression  <- primary_expr non_call_postfix* call_arguments postfix_part*
+non_call_postfix <- "." ident / "[" expression "]"
+call_arguments   <- "(" (expression ("," expression)*)? ")"
+
+primary_expr     <- if_expr / match_expr / bitstring_expr / struct_literal
+                  / map_literal / array_literal / list_literal / tuple_literal
+                  / literal / qualified_value / "(" expression ")"
+qualified_value  <- ident / (type_name ".")+ ident
+if_expr          <- "if" expression "do" body(block_item)
+                    ("else" body(block_item))? "end"
+match_expr       <- "match" expression "do" NL* match_arm
+                    (NL+ match_arm)* NL* "end"
+match_arm        <- pattern "->" arm_body
+tuple_literal    <- "{" expression "," expression
+                    ("," expression)* "}"
+list_literal     <- "[" (expression ("," expression)*
+                    ("|" expression)?)? "]"
+array_literal    <- "#[" (expression ("," expression)*)? "]"
+map_literal      <- "%{" (map_entry ("," map_entry)*)? "}"
+map_entry        <- expression "=>" expression
+struct_literal   <- "%" type_path "{" (field_value ("," field_value)*)? "}"
+field_value      <- ident ":" expression
+
+pattern          <- typed_pattern / bitstring_pattern / struct_pattern
+                  / tuple_pattern / list_pattern / pattern_literal / "_" / ident
+typed_pattern    <- ident ":" type
+pattern_literal  <- "-"? (float / integer) / string / rune / atom
+                  / "true" / "false" / "unit"
+tuple_pattern    <- "{" pattern "," pattern ("," pattern)* "}"
+list_pattern     <- "[]" / "[" pattern "|" pattern "]"
+struct_pattern   <- "%" type_path "{" (field_pattern
+                    ("," field_pattern)*)? "}"
+field_pattern    <- ident ":" pattern
+
+bitstring_expr   <- "<<" (bit_expr_segment ("," bit_expr_segment)*)? ">>"
+bit_expr_segment <- segment_expression "::" bit_modifiers
+segment_expression <- logical_or_expr ("|>" logical_or_expr)*
+bitstring_pattern <- "<<" (bit_pattern_segment
+                    ("," bit_pattern_segment)*)? ">>"
+bit_pattern_segment <- pattern "::" bit_modifiers
+bit_modifiers    <- bit_modifier ("-" bit_modifier)*
+bit_modifier     <- "integer" / "signed" / "unsigned" / "big" / "little"
+                  / "native" / "bytes" / ("size" "(" expression ")")
+
+literal          <- float / integer / string / rune / atom
+                  / "true" / "false" / "unit"
+primitive_type   <- "bool" / "i8" / "i16" / "i32" / "i64" / "isize"
+                  / "u8" / "u16" / "u32" / "u64" / "usize"
+                  / "f32" / "f64" / "rune" / "string" / "bytes"
+                  / "bits" / "unit"
 ```
 
-The real grammar must implement the newline and statement-boundary rules from
-section 4.3 and resolve operator precedence, attributes, tagged and bitstring
-patterns, struct literals, recovery behavior, and the ambiguity between a final
-block expression and an expression statement.
+`ident` matches `[a-z][a-z0-9]*(?:_[a-z0-9]+)*`, and `type_name` matches
+`[A-Z][A-Za-z0-9]*`; both are ASCII. `type_var` is an `ident` that is not a
+keyword or primitive type. `module_name` is a `type_path`. `array_length` is a
+decimal integer token satisfying the literal-length restriction in section 6.4.
+`integer`, `float`, `string`, `rune`, and `atom` are exactly the tokens defined
+in section 4.4; keyword tokens require an identifier boundary. The lexer uses
+longest-token matching for `::`, `:=`, `->`, `=>`, `==`, `!=`, `<=`, `>=`,
+`<<`, `>>`, `++`, `|>`, and `#[` before their one-character prefixes or the
+line-comment rule.
+
+`arm_body` is a `body(block_item)` terminated by `end` or by the next
+`pattern ->` header at the current match nesting depth. This boundary is
+syntactic, not indentation-sensitive. The restrictions on bitstring modifier
+combinations and widths are part of section 7.4; the restrictions on pipeline
+right operands, assignment targets, typed patterns, irrefutable `for` patterns,
+and protocol bodies are grammar-validation rules and must be diagnosed before
+type checking. A top-level bitstring segment expression excludes `::` so the
+following `::` unambiguously begins its modifiers; an ascribed segment operand
+can be parenthesized. Operator associativity and non-associativity are encoded
+above and match section 8.7.
 
 ## 13. Diagnostics
 
@@ -1205,22 +2216,64 @@ Parser, resolver, and type-checker errors must use source spans. The compiler
 should recover sufficiently to report several independent errors in one run,
 but correctness is more important than aggressive recovery in the first slice.
 
-## 14. CLI contract
+## 14. Normative v1 CLI contract
 
-Proposed initial commands:
+The executable is named `el`. The following invocations are the complete
+normative v1 command surface:
 
 ```text
-elc check
-elc build
-elc build --target app
-elc emit llvm-ir --module Main
+el --help
+el --version
+el check
+el check --locked
+el build
+el build --release
+el build --locked
+el build --release --locked
+el emit llvm-ir --module Main
 ```
 
-Commands locate `el.toml` in the current directory or an ancestor. `check` stops
-after semantic analysis. `build` builds the default or named manifest target.
-`emit llvm-ir` is a development and learning aid, not a stable language API. A
-single-file developer mode may exist during bootstrapping but is not the v1
-project interface.
+The project commands `check`, `build`, and `emit` use `el.toml` in the current
+directory when present; otherwise they walk toward the filesystem root and use
+the nearest ancestor containing one. Failure to find a manifest is a project
+error. `--help` and `--version` do not require a project. `check` stops after
+resolving dependencies and type-checking every source declaration in the
+current package. `build` performs the same checks, then emits reachable code for
+the package's single executable target. A library-only package uses `check`;
+`build` reports that no executable target exists.
+
+Development builds include debug information and use low optimization.
+`--release` enables optimization without changing language semantics. V1 builds
+only for the compiler host; cross-compilation is deferred. Executables are
+written relative to the discovered manifest root beneath
+`build/<target-triple>/debug/` or `build/<target-triple>/release/`. The filename
+is `package.name` plus the host's required executable suffix: no suffix on
+Unix-like targets and `.exe` on Windows.
+
+`--release` and `--locked` may appear in either order after `build`; each may
+appear at most once. `--locked` applies the lockfile rules in section 9.2.
+`check` accepts only `--locked`; it has no release profile because it emits no
+machine code. `emit llvm-ir` requires exactly one `--module` followed by a
+package-relative module name, performs the same resolution and checking as
+`check`, and writes that module's textual LLVM IR to standard output. The LLVM
+text and symbol names are diagnostic output and are not a stable language API.
+
+`--help` prints usage covering every command above to standard output, and
+`--version` prints exactly `el <compiler-version>` plus one newline to standard
+output, where `<compiler-version>` is the compiler distribution's semantic
+version. A successful invocation exits with status 0. A
+reported source, manifest, dependency, lockfile, code-generation, or linker
+failure exits with status 1. An unknown command or option, a duplicate option,
+a missing option value, or an otherwise malformed invocation prints usage to
+standard error and exits with status 2. Diagnostics go to standard error;
+`check` and `build` need not print anything on standard output when successful.
+Internal compiler defects are outside this CLI exit-status contract.
+
+Options are command-local: v1 has no global project-directory, color, verbosity,
+target, or output-path flag. Command names and options are case-sensitive. A
+single-file developer mode may exist during bootstrapping but is not accepted by
+a conforming v1 distribution. V1 has no `el run` or `el test`; users execute the
+built native program directly and pass process arguments to that executable.
 
 ## 15. Implementation roadmap
 
@@ -1229,18 +2282,21 @@ all syntax before any program can run.
 
 ### Milestone 0: project skeleton
 
-- Rust workspace with `elc` compiler crate and runtime crate.
+- Rust workspace with the `el` compiler/package-tool binary and runtime crate.
 - One command-line entry point.
 - Minimal `el.toml` discovery and parsing.
 - Unit-test and snapshot-test conventions.
 - Pin the Rust toolchain, LLVM version, LLVM binding, and Boehm GC version.
 
-Exit test: `elc --help` runs and CI can build the workspace.
+Exit test: `el --help` runs and CI can build the workspace.
 
 ### Milestone 1: parser and AST
 
-- PEG grammar for `defmodule`, `def`/`defp`, bindings, literals, types, and
+- Implement the normative grammar in section 12 as a checked-in PEG grammar,
+  starting with `defmodule`, `def`/`defp`, bindings, literals, types, and
   arithmetic.
+- Parse the accepted scalar escapes and bases plus tuple, list, fixed-array,
+  map, struct, and read-index syntax.
 - Parse generic named declarations, `when` constraints, type applications, and
   `expression :: Type` ascriptions.
 - Parse structural union types and typed binding patterns.
@@ -1256,11 +2312,14 @@ Exit test: parse a typed `main` function and snapshot its AST.
 
 - Lexical scopes and unique symbol IDs.
 - Primitive types, function signatures, immutable bindings, and mutable locals.
+- Reject every transparent-alias cycle and every named-type containment cycle
+  not guarded by a built-in managed-indirection constructor.
 - Type-check arithmetic, calls, returns, and `:=`.
 - Infer implicit function type parameters, propagate expected types into calls,
   and type-check unconstrained generic bodies once.
 - Normalize structural unions, prove member disjointness for all generic
-  substitutions, and insert injections only from expected union types.
+  substitutions with occurs-checked unification, emit overlap witnesses, and
+  insert injections only from expected union types.
 - Produce a typed AST and lower it to a minimal Core IR.
 
 Exit test: accepted and rejected programs cover binding, mutation, calls, and
@@ -1273,6 +2332,8 @@ invoking LLVM.
 - Monomorphize reachable unconstrained generic functions and concrete generic
   type layouts before LLVM lowering.
 - Emit an object file and invoke the host linker.
+- Record the LLVM target triple and pointer width in build diagnostics and
+  reproducibility metadata.
 - Implement `Main.main() -> i32` as the entry point.
 
 Exit test: compile and run a program whose exit status is computed by EL code.
@@ -1296,9 +2357,11 @@ exhaustive `i64 | string` match.
 - Pin and vendor Boehm GC, then build and statically link it for each supported
   host target.
 - Route traceable and pointer-free allocations through private runtime wrappers.
-- Verify live references held in locals, arguments, returns, globals, nested
-  calls, recursion, and interior object graphs in debug and optimized builds.
-- Provide a GC stress mode that collects as frequently as practical.
+- Verify live base references held in locals, arguments, returns, globals,
+  unions, views, deferred captures, nested calls, recursion, and interior object
+  graphs in debug and optimized builds.
+- Provide a GC stress mode that attempts collection at every managed allocation.
+- Make allocation exhaustion an unrecoverable runtime failure.
 
 Exit test: a native optimized EL program retains a reachable heap graph while
 temporary allocations are reclaimed under GC stress mode.
@@ -1307,7 +2370,13 @@ temporary allocations are reclaimed under GC stress mode.
 
 - `defstruct`, construction, field access, and layout.
 - `string`, `rune`, `bytes`, byte-aligned `bits`, and `Buffer`.
+- Bundle Unicode 17.0.0 data and implement untailored UAX #29 revision 47
+  extended-grapheme segmentation.
 - Lists, maps, arrays, slices, and function values.
+- Implement canonical composite construction, immutable map operations,
+  array/slice/bytes read indexing, and function-based slice construction.
+- Implement the `Enum` traversal API and the minimal list, array, slice, and
+  byte-specific operations from section 6.4.1.
 - Implement immutable slices as managed backing-storage views.
 - Expand numeric primitives and explicit conversions.
 
@@ -1329,13 +2398,16 @@ types, and concatenate all standard `Concat` types.
 
 ### Milestone 8: packages, I/O, and standard library
 
-- Package ID, root namespace, module discovery, build targets, and EL dependency
-  entries from `el.toml`'s `[deps]` table.
+- Package ID, root namespace, module discovery, the optional single executable
+  `[target]`, and EL dependency entries from `el.toml`'s `[deps]` table.
 - Validate strict `src/` path-to-module mapping and namespace qualification.
 - Resolve exact path and commit-pinned Git dependency graphs, validate conflicts,
-  and read and write `el.lock`.
+  reject cycles, and read and write `el.lock` with `--locked` support.
 - `Reader` and `Writer` with tagged result values.
-- Standard modules for strings, collections, buffers, bits, and I/O.
+- Standard modules for strings, collections, buffers, bits, ergonomic console
+  output, recoverable console streams, and typed byte-oriented file handles.
+- Implement strict process-argument/environment decoding and the native path
+  conversion rules from section 6.8 on every supported target.
 - Use explicit `defer` for deterministic cleanup of standard I/O resources.
 
 Exit test: build a multi-module manifest target that reads, transforms, and
@@ -1344,8 +2416,9 @@ writes data while handling every recoverable error through `match`.
 ### Milestone 9: v1 stabilization
 
 - Conformance suite, reference examples, and language reference.
-- Stabilize diagnostics and CLI behavior.
-- Freeze the v1 grammar, manifest format, and internal runtime ABI version.
+- Stabilize diagnostic presentation and verify CLI conformance.
+- Verify the already normative v1 grammar and CLI contract, then freeze the
+  manifest format and internal runtime ABI version.
 - Document supported targets and binary distribution requirements.
 
 Exit test: all v1 examples and negative conformance programs behave identically
@@ -1354,20 +2427,106 @@ on every supported target, with GC stress mode enabled.
 ## 16. Testing strategy
 
 - **Grammar tests:** accepted/rejected syntax and precedence.
+- **Literal tests:** numeric bases and separators, escapes, Unicode validity,
+  atom spelling, and rejected deferred literal forms.
+- **Composite tests:** construction and inference for tuples, lists, arrays,
+  maps, and slices; map constraints; arrays, slices, bytes, and bits indexing;
+  bit-order semantics; and bounds failures.
+- **Fixed-array tests:** inferred literal lengths, literal-length annotations,
+  generic item types at fixed lengths, empty-array expected types, distinct
+  length types, rejection of symbolic lengths and length arithmetic, intrinsic
+  `Array.length`/`Slice.from_array`, and generated concrete protocol
+  implementations.
+- **Bitstring tests:** v1 modifier acceptance and rejection, every integer width
+  and byte order, signed and unsigned range checks, exact sized-byte
+  construction, dynamic pattern sizes, final remainder captures, empty values,
+  normal pattern failure, `bitstring_size_mismatch`, arbitrary `Bits.slice`
+  results, conversion alignment, and post-v1 form rejection.
+- **Type-layout tests:** direct, mutual, generic, and cross-module inline cycles;
+  acyclic aliases; rejected alias cycles; and accepted managed recursion.
+- **Target-model tests:** exact scalar widths, pointer-sized integers, array and
+  slice contiguity semantics, native bitstring byte order, private aggregate
+  layout, and recorded target metadata.
+- **Numeric tests:** checked and wrapping arithmetic, division and remainder edge
+  cases, shifts, conversions, IEEE comparisons, NaN behavior, and parity between
+  debug and optimized builds.
+- **Evaluation-order tests:** calls and arguments, operators, composite literals,
+  pipelines, indexing, assignment, short-circuiting, and duplicate map keys.
+- **Defer tests:** call-argument versus block-body timing, immutable snapshots,
+  LIFO ordering, branch and per-iteration scope, saved block results, early
+  return, GC roots, prohibited nested control flow, and skipped cleanup after an
+  unrecoverable failure.
+- **Runtime-failure tests:** every stable failure category, originating source
+  location, nonzero termination, best-effort standard-error diagnostics,
+  identical debug/release classification, and absence of unwinding or stack
+  traces.
 - **AST snapshots:** stable structure and source spans.
 - **Typed AST/Core IR snapshots:** resolved names, types, and desugaring.
 - **Semantic tests:** name and type errors with diagnostic snapshots.
+- **Resolution tests:** lexical/current-module/prelude lookup, package-relative
+  and dependency-qualified module names, the exact reserved prelude, ambiguity,
+  visibility, and package/dependency namespace collisions.
+- **Pattern tests:** binding scope, duplicate bindings, arm ordering,
+  unreachable arms, total exhaustiveness, and irrefutable `for` bindings.
 - **Generic tests:** inference, expected-type propagation, constraints,
   recursive calls, specialization reuse, and ambiguous-instantiation errors.
+- **Function-value tests:** bare and qualified references, exact function types,
+  local shadowing, private-function escape from its owning module, generic
+  specialization from surrounding inference, ambiguous references, indirect
+  calls, and rejection of protocol-operation values, closures, and partial
+  application.
 - **Union tests:** canonical normalization, disjointness, expected-type
-  injection, typed patterns, exhaustive matching, and concrete layouts.
+  injection, typed patterns, exhaustive matching, and concrete layouts. Cover
+  invariant concrete applications, generic overlap witnesses, occurs checks,
+  associated-type projections, and post-substitution invariant checks.
 - **IR tests:** verify LLVM modules; inspect small targeted IR fragments only.
 - **End-to-end tests:** compile, link, execute, and check output/exit status.
-- **GC stress tests:** frequent collection and heap graph survival.
+- **String API tests:** eager byte/codepoint/grapheme results, lazy view item
+  types and retention, UTF-8 conversion errors, byte-alignment conversion, and
+  permitted immutable storage sharing. Run the Unicode 17.0.0
+  `GraphemeBreakTest.txt` conformance data against `length`, `graphemes`, and
+  `grapheme_view`; verify identical results across hosts and locale settings.
+- **Buffer/I/O tests:** value snapshots, UTF-8 validation, console newline and
+  failure behavior, `Show`-constrained console dispatch, direct string output,
+  complete writes, EOF, typed file modes, shared handle state,
+  close-through-alias behavior, tagged closed-handle errors, portable error-kind
+  mappings, operation reporting, optional system codes, interrupted-call retry,
+  and error `Eq`/`Hash` laws.
+- **UTF-8 error tests:** first-invalid byte offsets including incomplete suffixes,
+  parity between `String.from_bytes` and `Buffer.to_string`, and documented
+  `Eq`/`Hash`/`Show` behavior.
+- **Process-boundary tests:** argument order and executable-name exclusion,
+  environment lookup and launch-time snapshots, invalid UTF-8/UTF-16 rejection,
+  invalid environment names, exact Unix UTF-8 paths, exact Windows UTF-16
+  transcoding, embedded-NUL rejection, and no locale-dependent conversion.
+- **GC stress tests:** collection at every managed allocation and heap graph
+  survival in debug and optimized builds. Cover locals, registers, stack slots,
+  arguments, returns, globals, unions, managed views retaining base pointers,
+  deferred captures, saved results, nested calls, recursion, scanned object
+  graphs, and pointer-free payloads.
 - **Protocol tests:** resolution, coherence, derive constraints, and dispatch.
-- **Manifest tests:** package ID, namespace, dependency, and target validation.
+  Cover explicit associated-type declarations and assignments, qualified
+  projections, orphan rejection, overlapping generic implementations, standard
+  `Eq`/`Ord`/`Hash` laws, structural derivation, and deliberately unlawful user
+  implementations without memory unsafety.
+- **Collection-order tests:** verify every standard `Iterable` order, cursor
+  immutability, map literal duplicate replacement, update-position stability,
+  remove-and-reinsert behavior, insertion-order-independent map equality, and
+  iteration stability across runtime hash seeds.
+- **Enum/collection API tests:** explicit declaration constraints, generic calls
+  without call-site constraints, deterministic traversal, list result types,
+  strict left reduction, short-circuiting, map tuple order, structural-size
+  complexity, byte conversions, shared immutable byte slices, and bounds
+  failures.
+- **Manifest tests:** package ID, namespace, strict keys, optional single target,
+  library-only packages, dependency cycles, and target validation.
 - **Dependency tests:** exact-version validation, lockfile stability, transitive
-  conflicts, path resolution, and commit-pinned Git metadata.
+  conflicts, path resolution, commit-pinned Git metadata, and `--locked`.
+- **CLI tests:** every accepted invocation and option order, help/version streams,
+  exit statuses 0/1/2, diagnostic streams, host debug/release output paths,
+  module-specific LLVM IR emission, missing executable diagnostics, duplicate
+  and unknown option rejection, consistent semantics across profiles, and
+  absence of run/multi-target/test modes.
 - **Negative tests:** invalid programs must fail without compiler crashes.
 - **Differential tests:** where semantics are simple, compare interpreted test
   evaluation in the compiler with compiled execution (optional later aid).
@@ -1379,7 +2538,8 @@ test at the narrowest useful level.
 
 Version 1 is ready when:
 
-- the accepted grammar and semantics are documented;
+- the normative grammar, CLI, and semantics are documented and covered by
+  conformance tests;
 - `el.toml` projects reliably compile to native host executables;
 - all supported language constructs are statically type-checked;
 - generic functions and named types infer, constrain, and monomorphize exactly
@@ -1391,13 +2551,27 @@ Version 1 is ready when:
   are enforced;
 - protocols, explicit implementations, deriving, `for ... in`, `++`, and `|>`
   work as specified;
+- `Enum` traversal and the fixed collection-specific size, slice, reversal, and
+  conversion APIs preserve their documented order and complexity;
+- fixed arrays infer literal lengths locally, use literal lengths in user-written
+  contracts, and route arbitrary-length algorithms through slices or iteration;
+- named monomorphic function values resolve, specialize, pass, return, and call
+  without closure environments;
 - `string`, `rune`, `bytes`, byte-aligned bit patterns, `bits`, and `Buffer` pass
-  their validity and bounds tests;
-- GC-managed programs survive stress testing;
+  their validity and bounds tests, including Unicode 17.0.0 UAX #29 grapheme
+  conformance;
+- GC-managed programs preserve every live base reference and survive
+  collection-at-every-allocation stress testing in debug and optimized builds;
 - compiler failures produce source-based diagnostics rather than panics;
 - `Reader` and `Writer` use tagged values and the standard resource pattern is
   deterministic;
 - ordinary failures use tagged values rather than exceptions;
+- recoverable I/O and UTF-8 errors expose stable inspectable fields without
+  requiring diagnostic-string parsing;
+- process arguments, environment lookup, and native file paths obey the strict
+  text-conversion and snapshot rules on every supported target;
+- unrecoverable checks use stable categories, terminate nonzero, and never
+  unwind pending deferred cleanup;
 - no `null`, concurrency feature, or user-facing FFI leaks into the language;
   and
 - the examples and conformance suite run on every supported platform.
@@ -1436,6 +2610,83 @@ These require explicit decisions before the affected implementation begins:
 14. Resolved by D-034: post-v1 bitstrings use Elixir-style hyphen-separated
     segment modifiers with `size`, `unit`, sign, endianness, and EL's canonical
     `bytes` and `bits` kinds.
+15. Resolved by D-038: v1 uses qualification without imports or aliases, a fixed
+    core prelude, package-relative own-module names, dependency root namespaces,
+    and one function declaration per name regardless of arity.
+16. Resolved by D-039: v1 defines a closed compositional pattern set, requires
+    every match to be exhaustive, and permits only irrefutable `for` patterns.
+17. Resolved by D-040: protocols declare associated types explicitly,
+    implementations assign them explicitly, qualified projections expose them
+    to generic code, and orphan plus non-overlap rules ensure coherence.
+18. Resolved by D-041: v1 fixes scalar literal forms, gives tuples, lists,
+    arrays, maps, and structs distinct canonical construction syntax and
+    constructs slices through explicit functions. D-057 later extends read
+    indexing from arrays, slices, and bytes to `bits`.
+19. Resolved by D-042: evaluation is left-to-right and exactly once, integer
+    arithmetic and conversions have checked semantics with explicit wrapping
+    APIs, v1 includes bitwise operators, and floats preserve IEEE behavior
+    without implementing `Eq`, `Ord`, or `Hash`.
+20. Resolved by D-043: transparent aliases are acyclic, and recursive nominal
+    data is accepted only when every containment cycle crosses a built-in
+    managed-indirection constructor.
+21. Resolved by D-044: union alternatives are disjoint exactly when no permitted
+    finite substitution can make their normalized types equal; the compiler
+    decides this with occurs-checked first-order unification.
+22. Resolved by D-045: deferred calls evaluate their targets and arguments at
+    registration, deferred blocks capture immutable value snapshots, and both
+    run in lexical LIFO cleanup after preserving the block result.
+23. Resolved by D-046: v1 guarantees exact scalar representations and contiguous
+    array/slice semantics but keeps aggregate layout, calling conventions, and
+    object-file compatibility private to a matching compiler/runtime.
+24. Resolved by D-047: the unified tool is `el`; every package is source-
+    importable and may declare one optional executable `[target]`; multi-target,
+    cross-compilation, and language-integrated testing are deferred.
+25. Resolved by D-048: the core prelude is closed and reserved, string plural
+    inspection functions return standard eager collections, and explicitly
+    named codepoint/grapheme views provide lazy traversal.
+26. Resolved by D-049: `Buffer` uses explicit byte/string append operations,
+    console conveniences fail unrecoverably, recoverable I/O uses protocol
+    handles, and opaque resources have documented external identity and alias
+    behavior. D-051 later broadens the console input type.
+27. Resolved by D-050: core equality, ordering, hashing, display, and iteration
+    laws have fixed standard implementations; maps iterate deterministically in
+    insertion order while equality ignores that order.
+28. Resolved by D-051: console conveniences accept any value implementing
+    `Show`, allowing direct diagnostic output without a general implicit string
+    conversion.
+29. Resolved by D-052: every EL call is a possible GC collection point, live
+    references remain discoverable raw base pointers, allocation scan classes
+    are immutable, and allocation exhaustion is unrecoverable.
+30. Resolved by D-053: unrecoverable runtime failures terminate nonzero without
+    unwinding, report a stable category and source location when possible, and
+    expose no v1 panic or stack-trace facility.
+31. Resolved by D-054: named functions form exact monomorphic function values,
+    generic references specialize through inference, private values may escape
+    their owning module, and closures plus protocol-operation values are
+    deferred.
+32. Resolved by D-055: v1 pins Unicode 17.0.0 and untailored UAX #29 revision
+    47 extended-grapheme segmentation, using bundled data independent of the
+    host locale and Unicode libraries.
+33. Resolved by D-056: recoverable standard errors are opaque immutable values
+    with stable kind, operation, code, or UTF-8 offset accessors and documented
+    `Eq`, `Hash`, and `Show` behavior.
+34. Resolved by D-057: v1 source bitstrings are a byte-aligned `bytes` subset,
+    arbitrary `bits` use a minimal library API and direct boolean indexing, and
+    non-byte-aligned source segments remain post-v1.
+35. Resolved by D-058: generic traversal lives in the `Enum` module with explicit
+    declaration constraints, list-producing transformations, deterministic
+    order, and a small set of collection-specific size and conversion APIs.
+36. Resolved by D-059: fixed-array literals infer their concrete length, user
+    type annotations use literal lengths only, and arbitrary-length algorithms
+    use slices or iteration rather than const generics.
+37. Resolved by D-060: `Process` exposes launch-time arguments and environment
+    lookup through strict tagged UTF conversion, while `string` file paths use
+    exact target-specific native conversion with documented limitations.
+38. Resolved by D-061: section 12 is the normative v1 grammar; the checked-in
+    PEG grammar and parser recovery must conform to it rather than define a
+    competing syntax.
+39. Resolved by D-062: section 14 fixes the complete v1 `el` command surface,
+    option placement, output destinations, and exit-status classes.
 
 ## 19. Decision process
 
@@ -1528,7 +2779,7 @@ These require explicit decisions before the affected implementation begins:
 - Status: accepted
 - Decision: Use LLVM 22.1.0 through Inkwell 0.9.0 with the
   `llvm22-1-prefer-dynamic` feature. Pin Inkwell exactly in the Rust lockfile and
-  distribute the matching LLVM shared library with `elc`.
+  distribute the matching LLVM shared library with `el`.
 - Reason: Its safer, higher-level API reduces incidental unsafe Rust while we
   learn LLVM construction and verification. Inkwell 0.9.0 supports LLVM 22.1
   target setup, object emission, module verification, and debug information.
@@ -1542,7 +2793,7 @@ These require explicit decisions before the affected implementation begins:
 ### D-009 — Mutability is initially local rebinding only
 
 - Date: 2026-07-26
-- Status: accepted
+- Status: superseded by D-037
 - Decision: In the initial v1 core, `mut` permits rebinding a local name but does
   not grant transitive, field, or indexed mutation.
 - Reason: This gives the requested explicit mutation without prematurely
@@ -1625,7 +2876,8 @@ These require explicit decisions before the affected implementation begins:
 - Status: accepted
 - Decision: An EL project is a directory containing `el.toml`, which declares
   its package ID as `package.name`, root namespace, version, EL dependencies in
-  `[deps]`, and build targets.
+  `[deps]`, and its build configuration. The target shape and tool contract are
+  refined by D-047.
 
 ### D-019 — Precise stop-the-world mark-sweep GC
 
@@ -1741,8 +2993,9 @@ These require explicit decisions before the affected implementation begins:
   v1's type system.
 - Consequence: Referenced values are captured when the action is registered. A
   deferred action must return `unit`, so tagged cleanup failures must be handled
-  explicitly. Cleanup is not guaranteed after an unrecoverable process abort or
-  external termination, and GC never substitutes for resource release.
+  explicitly. Cleanup is not guaranteed after an implementation abort or
+  external termination, and GC never substitutes for resource release. D-053
+  later specifies that language-defined unrecoverable failures skip cleanup.
 - Future: V2 should evaluate a structured `using` scope that automates
   acquisition and cleanup while preserving `defer` as the underlying primitive.
 
@@ -1872,6 +3125,7 @@ These require explicit decisions before the affected implementation begins:
   canonical vocabulary is `bytes` and `bits`, matching EL's distinct types.
 - Compatibility: V1 accepts only the byte-aligned subset of this syntax; the
   post-v1 feature removes that restriction without introducing a second form.
+  D-057 fixes the exact v1 subset and its separate arbitrary-runtime-`bits` API.
 - Reference: [Elixir bitstring special form](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#%3C%3C%3E%3E/1).
 
 ### D-035 — EL name and `.el` source extension
@@ -1912,8 +3166,644 @@ These require explicit decisions before the affected implementation begins:
   generic tagged results while disjointness and expected-type injection avoid
   ambiguous runtime membership and accidental type widening.
 
+### D-037 — Direct struct-field update rebinds the mutable root
+
+- Date: 2026-07-26
+- Status: accepted
+- Supersedes: D-009
+- Decision: V1 permits `name.field := expression` when `name` is a mutable local
+  struct binding. The operation evaluates the right-hand side, creates the
+  shallow fieldwise updated struct value, and rebinds `name`. It evaluates to
+  `unit`.
+- Value semantics: The operation does not create mutable fields, reference
+  identity, or shared mutation. Values previously copied from `name` remain
+  unchanged. An in-place backend store is permitted only as an unobservable
+  optimization.
+- Scope: Only one direct field rooted at a mutable local is accepted. Immutable
+  locals, parameters, temporaries, call results, nested field paths, and indexed
+  targets are rejected.
+- Typing: The field must exist on the statically known struct type, and the
+  right-hand side must have exactly the declared field type.
+- Reason: Direct field-update syntax makes value-semantic structs practical in
+  stateful local algorithms while keeping mutation explicit through `:=` and
+  avoiding general place, aliasing, or reference-mutation rules.
+
+### D-038 — Qualified v1 module and name resolution
+
+- Date: 2026-07-26
+- Status: accepted
+- Decision: V1 has no imports, opened modules, user-defined preludes, or module
+  aliases. Bare names resolve through lexical scope, the current module, and a
+  fixed core prelude. Other modules use qualified names; own-package modules use
+  package-relative names, while dependency modules begin with their declared
+  root namespace.
+- Visibility: `defstruct`, `@type`, `defprotocol`, struct fields, and protocol
+  implementations are public. Functions alone distinguish public `def` from
+  module-private `defp`.
+- Uniqueness: Ambiguous module references and duplicate package root namespaces
+  are errors. A module may declare only one function with a given name,
+  regardless of arity.
+- Reason: Qualification and deterministic lookup avoid an import-precedence
+  system in v1 and keep named function values unambiguous. Aliases can be added
+  later without changing existing source meaning.
+
+### D-039 — Exhaustive matching and irrefutable iteration patterns
+
+- Date: 2026-07-26
+- Status: accepted
+- Decision: V1 patterns consist of wildcards, immutable bindings, literals,
+  tuples, lists, structs, byte-aligned bitstrings, and typed structural-union
+  member bindings. Patterns compose recursively, bind only within their arm,
+  and may not bind one name more than once.
+- Matching: Arms are tried top to bottom, provably unreachable arms are errors,
+  and every `match` must be exhaustive. V1 excludes guards, alternative
+  patterns, pinning, and map patterns.
+- Iteration: A `for` binding must be irrefutable for its iterable's `Item` type.
+  Refutable processing uses an exhaustive `match` in the loop body rather than
+  skipping items or failing at runtime.
+- Reason: Total matching prevents hidden runtime failures, while irrefutable
+  loop bindings give every iterated value one predictable execution path.
+
+### D-040 — Explicit associated types and coherent protocol implementations
+
+- Date: 2026-07-26
+- Status: accepted
+- Associated types: A protocol declares every associated type with `type Name`,
+  and each implementation assigns every declaration exactly once with
+  `type Name = ConcreteType`. Associated types are not inferred, have no
+  defaults or parameters in v1, and bare `type` is a reserved keyword.
+- Projection: Generic code refers to an associated type with a qualified form
+  such as `Iterable.Item(a)`. The projection stays abstract while the generic
+  body is checked and resolves statically during concrete monomorphization.
+- Coherence: A `defimpl` is legal only in the package owning the protocol or the
+  target type. Exactly one implementation may exist for each protocol/type pair,
+  generic implementation heads may not overlap, and constraints do not provide
+  specialization. Transparent aliases and structural unions are not targets.
+- Completeness: Implementation methods must exactly match the protocol after
+  substituting `Self` and associated types. Missing, duplicate, or undeclared
+  associated-type assignments are errors, as is a derived implementation that
+  conflicts with an explicit implementation.
+- Exclusions: V1 has no default protocol methods, protocol inheritance, negative
+  implementations, specialization, runtime protocol values, or implicit
+  conformance.
+- Reason: Explicit declarations keep protocol contracts readable and prevent an
+  unresolved or misspelled type name from silently becoming a new associated
+  type. The ownership and overlap rules make static dispatch deterministic
+  across dependency graphs.
+
+### D-041 — Canonical literals and composite construction
+
+- Date: 2026-07-26
+- Status: accepted
+- Scalars: Integers support decimal, binary, octal, and hexadecimal digits with
+  restricted underscore separators and no suffixes. Floats use decimal points
+  or exponents. Strings are double-quoted UTF-8, runes are single-quoted Unicode
+  scalar values, atoms are colon-prefixed ASCII `snake_case`, and `unit` is the
+  sole unit value. V1 excludes raw and multiline strings, interpolation,
+  hexadecimal floats, and literal NaN or infinity.
+- Composites: Tuples use `{...}` and contain at least two elements, lists use
+  `[...]` and `[head | tail]`, fixed arrays use `#[...]`, maps use
+  `%{key => value}`, and structs retain `%Type{field: value}`. Empty list and map
+  literals require enough expected-type information for inference.
+- Collections: Immutable map key operations require `Eq` and `Hash` and expose
+  absence through `Option`. Arrays, slices, and bytes support read indexing by
+  `usize`; bounds failure is unrecoverable and indexed update is deferred. D-057
+  later extends read indexing to `bits`, returning `bool`.
+- Slices: `Slice.from_array`, `Slice.subslice`, and `Slice.copy` construct,
+  share, and explicitly copy managed backing storage. V1 has no slice literal or
+  range expression.
+- Reason: Distinct literal forms avoid context-dependent collection meaning,
+  while explicit absence, bounds behavior, and slice sharing preserve the
+  language's predictable value semantics.
+
+### D-042 — Deterministic evaluation and numeric semantics
+
+- Date: 2026-07-26
+- Status: accepted
+- Evaluation: Expressions evaluate eagerly, exactly once, and left to right,
+  including calls, operators, composite literals, struct initializers,
+  pipelines, indexing, and assignment right-hand sides. Boolean operators
+  short-circuit. Map entries insert left to right, with a later equal key
+  replacing the earlier value after all expressions are evaluated.
+- Integers: Ordinary arithmetic, division edge cases, left shifts, shift counts,
+  and conversions are checked in every build. Signed division truncates toward
+  zero and remainder follows the dividend. Per-type PascalCase modules expose
+  explicit wrapping arithmetic and shifts.
+- Bit operations: V1 includes `~`, `&`, `|`, `^`, `<<`, and `>>`. Binary bitwise
+  operands match types, shift counts are `usize`, signed right shift is
+  arithmetic, and unsigned right shift is logical.
+- Floats: `f32` and `f64` follow IEEE 754 round-to-nearest, ties-to-even behavior
+  without unsafe fast-math transformations. Primitive comparisons follow IEEE
+  NaN and signed-zero rules, but floats do not implement `Eq`, `Ord`, or `Hash`
+  and cannot be map keys in v1.
+- Operators: Precedence is fixed from postfix and unary through arithmetic,
+  shifts, bitwise operations, concatenation, comparisons, boolean operations,
+  ascription, and pipeline. Arithmetic and bitwise forms associate left, `++`
+  associates right, pipelines associate left, and comparisons do not chain.
+- Reason: A fixed evaluation order makes effects and failures predictable.
+  Checked numeric behavior is stable across build modes, while explicit wrapping
+  and bitwise operations retain the control expected from a systems language.
+
+### D-043 — Finite layouts and managed recursive data
+
+- Date: 2026-07-26
+- Status: accepted
+- Struct recursion: A nominal struct may participate in recursive data only when
+  every containment cycle crosses a built-in managed-indirection constructor.
+  Direct, mutual, generic, and cross-module cycles through inline storage are
+  rejected.
+- Classification: Structs, tuples, arrays, structural unions, aliases, and
+  user-defined generic value structs are inline. Lists, maps, slices, and
+  designated opaque managed standard-library types break containment cycles.
+  Zero-length arrays receive no special exemption.
+- Aliases: Every direct or indirect transparent-alias cycle is rejected, even
+  beneath managed storage. Recursive structural data instead uses a nominal
+  struct whose recursion crosses a managed constructor.
+- Generics: Constructor cycles are checked without relying on changing type
+  arguments to terminate. Layout-affecting associated-type projections are
+  checked again after concrete protocol resolution, with diagnostics at the
+  declaration and invalid instantiation.
+- Reason: One inline-containment graph detects every infinite value layout,
+  while acyclic aliases keep expansion and normalization finite. Existing GC-
+  managed containers still support practical trees and graphs without adding a
+  general-purpose reference type to v1.
+
+### D-044 — Union disjointness by finite non-unifiability
+
+- Date: 2026-07-26
+- Status: accepted
+- Definition: Two normalized alternatives are disjoint exactly when no
+  permitted finite substitution of their type variables can make the types
+  equal. Disjointness concerns static types, not identical or overlapping
+  physical representations; injection records an unobservable discriminant.
+- Concrete types: Unequal primitives, atoms, nominal constructors, invariant
+  generic applications, tuples, arrays, and function signatures are disjoint
+  according to their recursively compared type structure.
+- Algorithm: Expand acyclic aliases, flatten unions, recursively normalize,
+  remove exact duplicates, establish a stable member order, and test each pair
+  with first-order unification and an occurs check. Positive protocol
+  constraints do not prove separation, and unresolved associated-type
+  projections are conservatively capable of overlap.
+- Diagnostics: A rejected generic union reports a witness substitution where
+  possible. Accepted declarations are normalized and checked again after
+  concrete substitution as a compiler invariant before layout.
+- Clarifies: D-036.
+- Reason: Non-unifiability gives `provably disjoint` one implementable meaning,
+  accepts useful concrete unions such as `List(i64) | List(string)`, and rejects
+  generic alternatives exactly when a finite instantiation can collapse them.
+
+### D-045 — Registration-time values and lexical deferred cleanup
+
+- Date: 2026-07-26
+- Status: accepted
+- Syntax: `defer` is a reserved keyword and a statement of type `unit`. A
+  deferred action belongs to the innermost lexical block and registers only
+  when execution reaches it.
+- Calls: A deferred call evaluates its target and arguments immediately, once
+  and left to right, stores those values, and delays only the invocation. The
+  invoked function must return `unit`.
+- Blocks: A deferred block captures referenced outer values as immutable
+  snapshots at registration and executes its body at scope exit. It cannot
+  update captured bindings, use `return`, or register another `defer`, but may
+  use ordinary control flow and its own mutable locals. It must yield `unit`.
+- Exit: Actions run once in LIFO order on fallthrough and early return. The
+  block's final result is evaluated and saved before cleanup and yielded after
+  cleanup. Saved results and captured values stay rooted during cleanup. A loop
+  body's actions run at the end of each reached iteration.
+- Failure: Cleanup is not guaranteed after an unrecoverable failure, abort, or
+  external termination. If one action fails unrecoverably, remaining actions are
+  likewise not guaranteed to run. D-053 supersedes this uncertainty for
+  language-defined unrecoverable failures: they run no pending actions.
+- Reason: Separating immediate call-argument evaluation from delayed block-body
+  evaluation makes timing explicit, while immutable value captures avoid adding
+  general closure or shared-mutation semantics to v1.
+
+### D-046 — Stable scalar model and private aggregate ABI
+
+- Date: 2026-07-26
+- Status: accepted
+- Stable model: Fixed-width integers have their named widths, signed integers
+  are two's complement, floats are IEEE binary32/binary64, and `isize`/`usize`
+  match a 32-bit or 64-bit target pointer width. Arrays contain exactly `N`
+  source-ordered elements; arrays and slices are semantically contiguous and
+  provide O(1) indexing.
+- Target dependence: `native` bitstrings use target byte order. Pointer-sized
+  integers, OS APIs and errors, exit-status observation, and practical runtime
+  limits may also vary by target. Build output records the LLVM target triple
+  and pointer width.
+- Private layout: V1 does not stabilize aggregate field offsets, padding,
+  alignment, discriminants, runtime object headers, function representation,
+  symbol mangling, or calling conventions. Unobservable scalarization, sharing,
+  copying, inlining, and managed allocation remain compiler choices.
+- ABI: Dependencies compile from EL source as one resolved build. Object files
+  are not portable across compiler versions, and the versioned compiler/runtime
+  ABI is private to a matching distribution.
+- Scope: V1 is a systems-oriented native foundation, not yet a platform for
+  layout-sensitive FFI, memory-mapped hardware, kernel code, or interoperable
+  binary libraries.
+- Reason: Exact scalar and sequence guarantees support predictable native code
+  without freezing aggregate representations that EL programs cannot observe in
+  the absence of FFI, unsafe memory access, or a public binary ABI.
+
+### D-047 — Single executable target and unified `el` tool
+
+- Date: 2026-07-26
+- Status: accepted
+- Package: Every package is importable from EL source without a separate library
+  target or stable compiled artifact. Package IDs are lowercase `snake_case`,
+  root namespaces are one `PascalCase` component, unknown manifest keys are
+  errors, and dependency cycles are rejected.
+- Target: A package may contain one optional `[target]` with a package-relative
+  `main` module owned by that package and exposing `main() -> i32`. The output
+  name is `package.name`; omission makes the package library-only. Multiple
+  executables and other target kinds are deferred.
+- Tool: The unified compiler and package command is `el`. `check` analyzes every
+  source declaration, `build` emits the single executable, `--release` changes
+  optimization but not semantics, `--locked` forbids lockfile changes, and
+  `emit llvm-ir` remains diagnostic. V1 targets only the host.
+- Output: Debug and release executables are written under target-triple-specific
+  build directories. The package name plus the host-required suffix determines
+  the executable filename.
+- Testing: V1 has no test declaration, discovery rule, special `test/` semantics,
+  or `el test`. Projects use executable targets and external scripts; the
+  compiler conformance suite is not part of the package format.
+- Clarifies: D-018.
+- Reason: One optional target eliminates target naming, kinds, and default
+  selection. `el` accurately names a tool that resolves, checks, builds, and
+  inspects projects rather than only invoking code generation.
+
+### D-048 — Closed prelude and eager string inspection
+
+- Date: 2026-07-26
+- Status: accepted
+- Prelude: V1 fixes the primitive and core container types, eight core
+  protocols, standard root modules, and per-integer modules listed in section
+  9.1. It imports no bare functions. Prelude declarations and roots are reserved
+  against package declarations and dependency namespaces.
+- Option: The prelude supplies the sole `Option(a) = {:some, a} | :none` alias;
+  user code does not redeclare it.
+- Common string API: `String.bytes` returns `bytes`, `String.codepoints` returns
+  `[rune]`, and `String.graphemes` returns `[string]`. The latter two eagerly
+  traverse and allocate lists; returned storage remains immutable and may share
+  the source string.
+- Views: `String.codepoint_view` returns `String.CodepointView`, and
+  `String.grapheme_view` returns `String.GraphemeView`. Both implement `Iterable`,
+  retain the source string, and traverse lazily.
+- Conversions: `String.from_bytes` validates UTF-8, `Rune.to_string` constructs
+  one-rune text, `Bytes.to_bits` is lossless, and `Bits.to_bytes` returns
+  `Option(bytes)` based on byte alignment. Immutable storage may be shared.
+- Reason: A closed prelude makes resolution reproducible. Eager plural functions
+  optimize for common developer experience, while explicitly named views retain
+  predictable allocation-sensitive traversal without requiring every caller to
+  know `Enum.to_list`.
+
+### D-049 — Explicit buffers and opaque resource handles
+
+- Date: 2026-07-26
+- Status: accepted
+- Buffer: `Buffer` is a value-semantic byte builder with distinct append-byte,
+  append-bytes, and append-string operations. Conversion to `bytes` always
+  succeeds; conversion to `string` validates UTF-8. Returned values are immutable
+  snapshots despite unobservable storage reuse or copy-on-write.
+- Console: `IO.print`, `IO.println`, and `IO.report` accept `string`, return
+  `unit`, and treat console failure as unrecoverable. Recoverable access uses
+  process-owned `IO.Stdin`, `IO.Stdout`, and `IO.Stderr` implementations of
+  `Reader` and `Writer`; programs do not close them. This input restriction is
+  superseded by D-051.
+- Files: `File.open_read` returns `File.Reader`; `File.create` and `File.append`
+  return `File.Writer`; and `File.close` accepts their `File.Stream` union. Files
+  are byte-oriented, expose tagged `File.Error`, and omit combined read/write,
+  seeking, permissions, and text modes in v1.
+- Resources: Opaque standard-library resource values may carry external identity
+  and mutable OS state. Copies alias one resource, reads advance shared state,
+  close invalidates every alias, and closed or repeated-close operations return
+  tagged errors. Resource handles implement neither `Eq` nor `Hash`.
+- Scope: External resource identity is an explicit standard-library exception;
+  it does not give user structs reference identity or shared mutation. Without
+  affine ownership, v1 programs remain responsible for alias and close discipline.
+- Reason: Explicit Buffer operations avoid overloading, common console output
+  stays ergonomic, protocol handles preserve recoverable I/O, and documenting
+  unavoidable OS identity prevents the ordinary value model from making false
+  promises about resources.
+
+### D-050 — Protocol laws and deterministic collection order
+
+- Date: 2026-07-26
+- Status: accepted
+- Laws: `Eq` is an equivalence relation, `Ord` is a total order consistent with
+  `Eq`, and equal values feed equivalent data into `Hash`. Violating these laws
+  is erroneous user behavior but does not permit memory unsafety.
+- Numeric scope: Equality and ordering require matching operand types. V1 has
+  no cross-numeric comparison, and floats implement none of `Eq`, `Ord`, or
+  `Hash` because IEEE NaN behavior violates their laws.
+- Standard implementations: Scalars and structurally lawful tuples, sequences,
+  and derived structs receive `Eq`, `Ord`, and `Hash` as specified in section
+  6.7. Maps implement structural `Eq` independent of insertion order, but not
+  `Ord` or `Hash`. Functions, buffers, floats, resources, and structural unions
+  do not gain these protocols automatically.
+- Text: String ordering compares Unicode scalar values without normalization or
+  case folding; hashing uses exact UTF-8 bytes. `Show` is human-readable and is
+  not a stable serialization format.
+- Iteration: Standard list, array, slice, byte, and string-view traversal has a
+  fixed source order. Map iteration is deterministic insertion order; replacing
+  a value preserves position, removal deletes it, reinsertion appends it, and
+  seeded hashing never affects iteration.
+- Reason: Protocol-backed operators and hashed collections need explicit laws
+  to remain predictable. Fixing traversal order removes runtime-dependent output
+  and test behavior without making maps ordered by key or exposing hash-table
+  internals.
+
+### D-051 — Show-constrained console conveniences
+
+- Date: 2026-07-26
+- Status: accepted
+- Decision: `IO.print`, `IO.println`, and `IO.report` are generic functions over
+  values implementing `Show`. They statically call the selected `Show.show`
+  implementation and return `unit`; output failure remains unrecoverable. The
+  standard `Show` implementation for `string` returns its contents unchanged,
+  so existing text output gains no quoting or escaping.
+- Errors: Standard `IO.Error` and `File.Error` values implement `Show`, so an
+  error branch may write `IO.report(reason)` directly.
+- Boundary: This does not introduce general implicit conversion to `string`.
+  APIs requiring text still require `string`, and recoverable byte output still
+  uses `Writer.write`.
+- Supersedes: The string-only console input clause of D-049.
+- Reason: Directly printing values and reporting errors removes repetitive
+  `Show.show` calls at the most common diagnostic boundary while retaining a
+  visible protocol constraint and predictable formatting dispatch.
+
+### D-052 — Conservative-GC lowering contract
+
+- Date: 2026-07-26
+- Status: accepted
+- Collection points: Every EL function call is treated as potentially
+  collecting because its transitive body may allocate. Private runtime calls
+  are explicitly classified as allocating or non-allocating; v1 performs no
+  allocation-effect inference.
+- Roots: At every possible collection point, every live managed reference is
+  represented by an unmodified aligned native base pointer in a collector-
+  visible register, stack slot, global, or reachable scanned allocation. An
+  integer, tagged, compressed, or interior-only representation is insufficient.
+- Views and temporaries: Managed views retain their backing allocation's base
+  pointer. Union payloads, deferred captures, saved block results, arguments,
+  returns, and private runtime temporaries follow the same rooting contract.
+- Allocation classes: Objects that may contain references use scanned storage;
+  raw byte, bit, and numeric payloads use pointer-free storage and never later
+  receive a managed reference. Managed globals use registered scanned storage.
+- Failure and verification: Allocation exhaustion is unrecoverable. A stress
+  mode attempts collection at every managed allocation, and conformance tests
+  exercise the contract in both debug and optimized builds.
+- Reason: Boehm can remain a private implementation choice only if lowering has
+  a precise, testable discoverability rule. Base-pointer retention also avoids
+  depending on optional interior-pointer recognition or optimizer accidents.
+
+### D-053 — Unrecoverable runtime-failure contract
+
+- Date: 2026-07-26
+- Status: accepted
+- Termination: An unrecoverable runtime failure immediately terminates the
+  process with a nonzero status. It is not catchable and does not unwind scopes
+  or execute pending `defer` actions; failure within cleanup skips the rest.
+- Diagnostic: Source-mandated checks make a best-effort standard-error report
+  containing a stable failure category and package-relative source location.
+  Exact prose and numeric exit status are implementation-defined, and failure
+  to write standard error does not prevent termination.
+- Categories: V1 defines `integer_overflow`, `division_by_zero`,
+  `invalid_shift`, `invalid_conversion`, `index_out_of_bounds`,
+  `allocation_exhausted`, `console_output_failed`, and
+  `bitstring_size_mismatch`. Debug and release builds classify the same
+  operation identically.
+- Scope: V1 has no stack trace, custom panic value, user-callable panic, or
+  recovery mechanism. Compiler/runtime invariant failures are implementation
+  defects and may use separate internal diagnostics.
+- Reason: One failure boundary makes checked operations predictable without
+  introducing exception unwinding. Stable categories and source locations make
+  failures testable while leaving presentation and platform exit details free
+  to evolve.
+
+### D-054 — Monomorphic named function values
+
+- Date: 2026-07-26
+- Status: accepted
+- Formation and call: A bare or qualified ordinary named function reference
+  forms a function value; applying parentheses calls it. Its structural
+  function type has exact parameter and result types with no variance or
+  implicit coercion.
+- Representation: Every v1 function value denotes one concrete monomorphized
+  code target and carries no captured environment. Its physical representation
+  and calling convention remain private.
+- Inference: A generic function reference specializes using its expected
+  function type and surrounding inference. Function values are never
+  polymorphic, and an unresolved specialization is a compile-time error.
+- Names and visibility: A local binding shadows a bare function name.
+  Qualification may still select a visible public function. External source
+  cannot name `defp`, but its owning module may pass or return that function
+  value, which remains callable by its recipient.
+- Exclusions: Protocol operations are not function values in v1; an ordinary
+  named wrapper is required. Anonymous functions, closures, partial application,
+  and bound receiver methods are deferred. Function values implement none of
+  `Eq`, `Ord`, `Hash`, or `Show`.
+- Reason: Concrete code-pointer values support useful higher-order programming
+  while keeping monomorphization, visibility, and the runtime model explicit and
+  avoiding closure environments or captured protocol dispatch.
+
+### D-055 — Pinned Unicode and grapheme semantics
+
+- Date: 2026-07-26
+- Status: accepted
+- Version: EL v1 pins the Unicode Standard and Character Database version
+  17.0.0.
+- Segmentation: `String.length`, `String.graphemes`, and
+  `String.grapheme_view` use the default extended-grapheme-cluster rules from
+  UAX #29 revision 47 under conformance clause UAX29-C1-1, with no tailoring.
+- Reproducibility: Compiler distributions bundle generated tables from the
+  versioned Unicode data. Host locale, OS services, and installed ICU or Unicode
+  libraries never affect segmentation; build metadata records the data version.
+- Text identity: Segmentation performs no normalization or case folding and
+  preserves the source scalar sequence. Unassigned non-surrogate scalar values
+  remain valid UTF-8 text.
+- Verification: The standard Unicode 17.0.0 `GraphemeBreakTest.txt` data is part
+  of the conformance suite for eager, lazy, and length APIs.
+- Upgrade rule: Changing Unicode or UAX behavior requires a recorded language
+  semantic decision and cannot arrive as an untracked library update.
+- Reason: Grapheme boundaries evolve across Unicode versions and may be tailored
+  by host libraries. Pinning both data and the untailored algorithm makes text
+  behavior portable and reproducible.
+- References: [Unicode 17.0.0](https://www.unicode.org/versions/Unicode17.0.0/)
+  and [UAX #29 revision 47](https://www.unicode.org/reports/tr29/tr29-47.html).
+
+### D-056 — Inspectable recoverable standard errors
+
+- Date: 2026-07-26
+- Status: accepted
+- I/O values: `IO.Error` and `File.Error` are opaque immutable values exposing a
+  stable `IO.ErrorKind`, the `IO.Operation` that failed, and an optional `i64`
+  host error code through module accessors.
+- Kinds: V1 fixes `:not_found`, `:permission_denied`, `:already_exists`,
+  `:invalid_input`, `:is_directory`, `:not_directory`, `:closed`,
+  `:broken_pipe`, `:out_of_space`, and `:other`. Interrupted host operations are
+  retried internally. Extending the closed kind or operation union requires a
+  recorded language-version decision.
+- Portability: Programs branch on the stable kind. System codes and `Show`
+  diagnostics are target-dependent and are not portable control-flow inputs.
+- UTF-8: `String.Utf8Error` exposes the zero-based byte offset of the first
+  invalid sequence, including the start of an incomplete suffix. Both
+  `String.from_bytes` and `Buffer.to_string` use this definition.
+- Protocols: All three error types implement `Eq`, `Hash`, and `Show`, but not
+  `Ord`. I/O error equality and hashing use operation, kind, and optional code;
+  UTF-8 error equality and hashing use its offset. Hidden diagnostic text is
+  excluded.
+- Identity: Error copies have ordinary value semantics and are constructed only
+  by the standard library; they do not inherit resource identity.
+- Reason: Stable structured inspection supports recovery and testing without
+  parsing human-readable or platform-specific messages, while preserving useful
+  native diagnostic information.
+
+### D-057 — Byte-aligned source bitstrings and direct bit indexing
+
+- Date: 2026-07-26
+- Status: accepted
+- Source boundary: V1 `<<...>>` construction produces `bytes`, and bitstring
+  patterns consume `bytes`. Source segments support byte-aligned integers from
+  8 through 64 bits, fixed or dynamically sized `bytes`, and a final unsized
+  `bytes` pattern remainder.
+- Integers: Segment sign defaults to unsigned and byte order defaults to big;
+  `little` and target-dependent `native` are explicit alternatives. Pattern
+  captures use `u64` or `i64`. Construction is range-checked and never truncates
+  or pads.
+- Size behavior: Sized construction operands must match exactly. A static
+  mismatch is a compile-time error and a dynamic mismatch terminates with
+  `bitstring_size_mismatch`. Insufficient input, a literal mismatch, or leftover
+  pattern input is ordinary pattern failure.
+- Runtime bits: `Bits.bit_size`, bounds-checked `Bits.slice`, `Bits.to_bytes`,
+  `Bytes.to_bits`, and `Concat` form the minimal arbitrary-length API.
+  `Bits.slice` may create non-byte-aligned values.
+- Indexing: `bits[index]` takes `usize`, returns `bool`, and fails with
+  `index_out_of_bounds`. Index zero is the most-significant bit of the first
+  source byte. This supersedes D-041's exclusion of `bits` indexing.
+- Deferred forms: Float, UTF, and `bits` source segments, explicit units,
+  non-byte-aligned widths, and arbitrary-width integer segments remain post-v1
+  under D-034's broader syntax direction.
+- Reason: The byte-aligned subset supports practical packet work without
+  importing the full arbitrary-width type-checking surface. Direct indexing and
+  bounds-checked slicing keep common bit inspection consistent with other
+  indexed collections and avoid `Option(bool)` boilerplate.
+
+### D-058 — Enum-centered core collection API
+
+- Date: 2026-07-26
+- Status: accepted
+- Generic traversal: The reserved `Enum` module defines `count`, `to_list`,
+  `map`, `filter`, `reduce`, `each`, `any`, and `all` for every `Iterable`.
+  Actual declarations explicitly state `when i: Iterable`; documentation may
+  state the shared constraint once and omit its repetition from an API listing.
+- Results and order: Every function follows the implementation's deterministic
+  iteration order. `to_list`, `map`, and `filter` return lists because v1 has no
+  higher-kinded container reconstruction. Map items are insertion-ordered
+  `{key, value}` tuples.
+- Evaluation: `reduce` is strict and left-to-right, `each` visits every item,
+  and `any` plus `all` short-circuit. Function arguments are concrete named
+  function values under D-054.
+- Specific operations: V1 additionally fixes `List.reverse`, `Array.length`,
+  `Slice.length`, `Bytes.byte_size`, `Bytes.slice`, `Bytes.from_list`, and
+  `Bytes.to_list`. Structural array, slice, and byte sizes are O(1);
+  `Enum.count` traverses and is O(n).
+- Bounds and storage: `Bytes.slice` uses `index_out_of_bounds` and may share
+  immutable storage. List-producing traversal, list reversal, and byte/list
+  conversions take O(n) time and produce fresh logical values.
+- Empty lists: V1 omits redundant `List.new`; code writes `[]` under an expected
+  list type when inference otherwise lacks an item type.
+- Scope: Sorting, searching, zipping, chunking, and related conveniences may be
+  added as ordinary library evolution without expanding the language semantics.
+- Reason: `Enum` gives one protocol-backed traversal vocabulary across all
+  containers, while a deliberately small set of collection-specific operations
+  preserves O(1) size queries and necessary conversions without duplication.
+
+### D-059 — Literal fixed-array lengths with local inference
+
+- Date: 2026-07-26
+- Status: accepted
+- Inference: A nonempty `#[...]` literal infers both its homogeneous item type
+  and concrete element count. Local code normally omits the annotation, as in
+  `coordinates = #[10, 20, 30]`, whose type is `[i64; 3]`.
+- Written types: An array type contains a nonnegative integer literal length
+  representable as `usize`, such as `[a; 2]`. V1 has no symbolic length
+  variables, const generics, length arithmetic, or `[a; _]` inference syntax.
+- Empty values: `#[]` has length zero but needs an expected item type, for
+  example `empty: [u8; 0] = #[]`.
+- Generic boundary: Functions may be generic over the item type at a fixed
+  literal length. Algorithms abstracting over length accept `Slice(a)` or an
+  `Iterable`; arrays of different lengths remain distinct without coercion.
+- Intrinsics: `Array.length` and `Slice.from_array` are compiler-provided
+  standard operations instantiated for every concrete array length. The `N` in
+  their documentation is schematic and cannot be written as a user const
+  parameter.
+- Protocols: Standard array implementations are generated per concrete length
+  when their item constraints hold.
+- Reason: Literal inference keeps local array construction concise, while
+  literal-only contracts avoid introducing a second const-parameter system.
+  Slices already provide the runtime-length abstraction required by generic
+  contiguous algorithms.
+
+### D-060 — Strict process text and native path conversion
+
+- Date: 2026-07-26
+- Status: accepted
+- Process input: The reserved `Process` module exposes launch-order user
+  arguments and launch-time environment lookup. It excludes the executable name,
+  snapshots both inputs before `Main.main`, and has no v1 mutation or
+  enumeration API.
+- Text conversion: Unix argument and environment bytes require strict UTF-8;
+  Windows inputs require well-formed UTF-16. Invalid data produces tagged
+  results without partial lists, replacement characters, or locale conversion.
+- Paths: Existing `File` functions retain `string` paths. Unix passes their
+  UTF-8 bytes unchanged; Windows transcodes scalars exactly to UTF-16. Neither
+  target normalizes or canonicalizes, and embedded U+0000 is `:invalid_input`.
+- Limitation: V1 cannot address invalid-UTF-8 Unix names or Windows names with
+  unpaired surrogates. A future native path type may add that reach without
+  changing valid `string` path behavior.
+- Reason: Strict conversion gives ordinary programs a small portable process
+  boundary and makes every lossy or inaccessible native spelling explicit.
+
+### D-061 — Section 12 is the normative v1 grammar
+
+- Date: 2026-07-26
+- Status: accepted
+- Authority: The lexical contract in section 4 and grammar in section 12 define
+  accepted v1 source syntax. The compiler's checked-in `pest` file implements
+  that contract and cannot silently extend or narrow it.
+- Coverage: The grammar fixes declarations, types, blocks, patterns, bitstring
+  forms, literals, postfix syntax, and the complete operator precedence and
+  associativity ladder. Section 4.3 supplies significant-newline insertion.
+- Recovery: Parser recovery may recognize incomplete or erroneous forms only to
+  produce diagnostics; recovery nodes never make a program conforming.
+- Change rule: Any intentional accepted-language change updates section 12 and
+  records a decision before implementation or examples depend on it.
+- Reason: A normative grammar makes parser tests, examples, formatter behavior,
+  and independent implementations answer to one reviewable syntax contract.
+
+### D-062 — Normative unified-tool command surface
+
+- Date: 2026-07-26
+- Status: accepted
+- Commands: V1 accepts `el --help`, `el --version`, `el check [--locked]`,
+  `el build [--release] [--locked]`, and
+  `el emit llvm-ir --module Module`. Options are command-local,
+  case-sensitive, non-repeatable, and restricted to those positions.
+- Results: Success is status 0, reported project/build failure is status 1, and
+  malformed invocation is status 2. Diagnostics and usage errors use standard
+  error; help, version, and emitted LLVM IR use standard output.
+- Scope: Build products retain the target/profile paths from section 14.
+  Single-file, run, test, multi-target, output-selection, and cross-target modes
+  are outside the conforming v1 interface. LLVM IR text remains diagnostic and
+  unstable even though its command is supported.
+- Reason: Fixing commands and observable outcomes lets scripts and conformance
+  tests rely on the tool before v1 stabilization without treating every CLI
+  implementation choice as a language feature.
+
 ## 21. Next design checkpoint
 
-All questions originally listed in section 18 are settled. New design work must
+All questions currently listed in section 18 are settled. New design work must
 continue through stable decision-log entries before implementation depends on
-it. D-036 adds closed disjoint structural unions to the accepted v1 type model.
+it. D-060 through D-062 close the remaining process-boundary, grammar-authority,
+and CLI-authority gaps; implementation now has normative contracts to test.
