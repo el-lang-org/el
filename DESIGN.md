@@ -4,10 +4,20 @@ Status: living design document
 Language name: **EL**
 Last updated: 2026-07-26
 
-This document is the source of truth for EL's requirements, semantics, compiler
-architecture, open questions, and design decisions. When implementation and this
-document disagree, either the implementation is a bug or the difference must be
-recorded in the decision log.
+This document is the source of truth for EL's vision, observable runtime
+semantics, compiler architecture, roadmap, open questions, and design decisions.
+The specification set is divided by responsibility:
+
+- [GRAMMAR.md](GRAMMAR.md) is normative for lexical and concrete syntax;
+- [TYPES.md](TYPES.md) is normative for static semantics and well-formedness;
+- [IR.md](IR.md) defines the bootstrap compiler's representation contracts; and
+- [EXAMPLES.md](EXAMPLES.md) is an illustrative companion.
+
+The descriptive language tour and topic sections here explain those contracts
+and preserve their rationale. When overlapping prose disagrees, the document
+with explicit authority for that subject controls. An intentional behavior
+change must update its authoritative specification and be recorded in the
+decision log before implementation or examples depend on it.
 
 ## 1. Vision
 
@@ -101,7 +111,7 @@ libraries.
 ## 3. Language tour
 
 This example is illustrative, but every syntax form it uses conforms to the
-normative v1 grammar in section 12.
+normative v1 grammar in [GRAMMAR.md](GRAMMAR.md).
 
 ```el
 defmodule Main do
@@ -145,6 +155,9 @@ In this example:
 
 ## 4. Lexical structure
 
+The normative lexical contract is in [GRAMMAR.md](GRAMMAR.md). This section is
+an explanatory summary.
+
 ### 4.1 Source files
 
 - Source file extension: `.el`.
@@ -152,7 +165,8 @@ In this example:
 - UTF-8 BOMs are not accepted. A physical newline is either LF or CRLF; a bare
   carriage return is invalid. Outside literals, horizontal whitespace is ASCII
   space or tab. A line comment excludes its terminating newline.
-- V1 identifiers use ASCII letters, digits, and `_` as specified in section 12.
+- V1 identifiers use ASCII letters, digits, and `_` as specified in
+  [GRAMMAR.md](GRAMMAR.md).
 - Value and function names use `snake_case`.
 - Primitive type names are lower case.
 - Type variables are lower case; named type constructors, protocols, and modules
@@ -300,6 +314,11 @@ name.field := expression
 This rule is simple to parse, simple to type-check, and makes mutation visible.
 
 ## 6. Types
+
+The normative static semantics are defined in [TYPES.md](TYPES.md). This section
+is a design-oriented tour of the same type system and its standard-library
+contracts; if the descriptions diverge, `TYPES.md` controls type formation,
+equality, inference, checking, conformance, and static well-formedness.
 
 EL's type system is Go-inspired rather than Go-identical: it is small and
 static, uses explicit conversions, has no implicit numeric coercions, and favors
@@ -819,12 +838,12 @@ end
 
 - `def` declares a public module function.
 - `defp` declares a function visible only within its module.
-- Parameter and return types are mandatory.
+- Parameter types are mandatory. A written return type is exact; if omitted,
+  it defaults to `unit`.
 - The final expression is the normal return value.
 - `return expression` is allowed for early return and must match the function's
   declared return type.
 - Bare `return` is not supported; a unit-returning function uses `return unit`.
-- Omitting `-> type` means `-> unit`.
 - Overloading by parameter types is not supported.
 - A bare named function such as `square` produces a function value; a qualified
   reference such as `Math.square` does the same after ordinary visibility and
@@ -1912,6 +1931,10 @@ fallible finalization, and interaction with `Reader` and `Writer`. V1's explicit
 
 ## 11. Compiler architecture
 
+The representation boundaries and verifier invariants are specified in
+[IR.md](IR.md). This section records the architectural rationale and lowering
+overview.
+
 The unified compiler and package tool is named `el`.
 
 ```text
@@ -2033,165 +2056,22 @@ source behavior is limited to
 error values, process-exit-code observation, and practical allocation or
 collection limits.
 
-## 12. Normative v1 grammar
+## 12. Grammar overview
 
-This section, together with the lexical rules in section 4, is the normative v1
-source grammar. Compiler recovery productions may accept incomplete input only
-to issue diagnostics; they must never make an otherwise rejected program valid.
-The compiler's checked-in `pest` grammar must implement this contract; it is not
-a second source of language syntax. A disagreement is a compiler bug or
-requires an accepted decision that updates this section.
+[GRAMMAR.md](GRAMMAR.md) is the normative v1 lexical and concrete syntax
+specification. It defines source encoding, identifiers, keywords, literals,
+significant newlines, declarations, types, blocks, expressions, patterns,
+bitstrings, precedence, associativity, and the boundary between grammar
+validation and static checking.
 
-The notation below uses `/` for ordered choice and postfix `?`, `*`, and `+` for
-optionality and repetition. Lowercase lexical names are defined immediately
-after the syntactic productions. Horizontal
-space and comments may occur between tokens. `NL` is one physical newline that
-remains significant under section 4.3; newlines treated as
-continuation whitespace do not produce `NL`. `body(item)` means zero or more
-`item` forms separated by `NL`, with optional leading and trailing `NL`. There
-is no other statement separator.
+The checked-in `pest` grammar implements that specification and is not an
+independent authority. Parser recovery may accept incomplete input only to
+produce diagnostics; no recovery node may reach name resolution or make an
+otherwise rejected program conforming.
 
-```text
-program          <- SOI NL* module NL* EOI
-module           <- "defmodule" module_name "do" body(module_item) "end"
-module_item      <- derive_attr NL+ struct_decl
-                  / struct_decl / type_alias / function_decl
-                  / protocol_decl / protocol_impl
-
-derive_attr      <- "@derive" "[" type_path ("," type_path)* "]"
-struct_decl      <- "defstruct" type_name type_params? when_clause?
-                    "do" body(field_decl) "end"
-field_decl       <- ident ":" type
-type_alias       <- "@type" type_name type_params? "=" type
-function_decl    <- ("def" / "defp") function_head "do"
-                    body(block_item) "end"
-function_head    <- ident "(" params? ")" return_type? when_clause?
-protocol_decl    <- "defprotocol" type_name "do"
-                    body(protocol_item) "end"
-protocol_item    <- assoc_type_decl / protocol_signature
-protocol_signature <- "def" function_head
-protocol_impl    <- "defimpl" type_path "," "for" ":" type when_clause?
-                    "do" body(implementation_item) "end"
-implementation_item <- assoc_type_def / function_decl
-assoc_type_decl  <- "type" type_name
-assoc_type_def   <- "type" type_name "=" type
-
-type_params      <- "(" type_var ("," type_var)* ")"
-params           <- param ("," param)*
-param            <- ident ":" type
-return_type      <- "->" type
-when_clause      <- "when" constraint ("," constraint)*
-constraint       <- type_var ":" type_path
-
-type             <- union_type
-union_type       <- primary_type ("|" primary_type)*
-primary_type     <- function_type / tuple_type / list_or_array_type
-                  / atom / primitive_type / named_type / type_var
-function_type    <- "(" (type ("," type)*)? ")" "->" type
-tuple_type       <- "{" type "," type ("," type)* "}"
-list_or_array_type <- "[" type (";" array_length)? "]"
-named_type       <- type_path ("(" type ("," type)* ")")?
-type_path        <- type_name ("." type_name)*
-
-block_item       <- binding / assignment / return_expr / defer_expr
-                  / while_expr / for_expr / expression
-binding          <- "mut"? ident (":" type)? "=" expression
-assignment       <- ident ("." ident)? ":=" expression
-return_expr      <- "return" expression
-defer_expr       <- "defer" (call_expression / ("do" body(block_item) "end"))
-while_expr       <- "while" expression "do" body(block_item) "end"
-for_expr         <- "for" pattern "in" expression
-                    "do" body(block_item) "end"
-
-expression       <- pipeline_expr
-pipeline_expr    <- ascription_expr ("|>" ascription_expr)*
-ascription_expr  <- logical_or_expr ("::" type)?
-logical_or_expr  <- logical_and_expr ("or" logical_and_expr)*
-logical_and_expr <- equality_expr ("and" equality_expr)*
-equality_expr    <- comparison_expr (("==" / "!=") comparison_expr)?
-comparison_expr  <- concat_expr (("<=" / ">=" / "<" / ">") concat_expr)?
-concat_expr      <- bit_or_expr ("++" concat_expr)?
-bit_or_expr      <- bit_xor_expr ("|" bit_xor_expr)*
-bit_xor_expr     <- bit_and_expr ("^" bit_and_expr)*
-bit_and_expr     <- shift_expr ("&" shift_expr)*
-shift_expr       <- additive_expr (("<<" / ">>") additive_expr)*
-additive_expr    <- multiplicative_expr (("+" / "-") multiplicative_expr)*
-multiplicative_expr <- unary_expr (("*" / "/" / "%") unary_expr)*
-unary_expr       <- ("-" / "!" / "~") unary_expr / postfix_expr
-postfix_expr     <- primary_expr postfix_part*
-postfix_part     <- call_arguments / ("." ident) / ("[" expression "]")
-call_expression  <- primary_expr non_call_postfix* call_arguments postfix_part*
-non_call_postfix <- "." ident / "[" expression "]"
-call_arguments   <- "(" (expression ("," expression)*)? ")"
-
-primary_expr     <- if_expr / match_expr / bitstring_expr / struct_literal
-                  / map_literal / array_literal / list_literal / tuple_literal
-                  / literal / qualified_value / "(" expression ")"
-qualified_value  <- ident / (type_name ".")+ ident
-if_expr          <- "if" expression "do" body(block_item)
-                    ("else" body(block_item))? "end"
-match_expr       <- "match" expression "do" NL* match_arm
-                    (NL+ match_arm)* NL* "end"
-match_arm        <- pattern "->" arm_body
-tuple_literal    <- "{" expression "," expression
-                    ("," expression)* "}"
-list_literal     <- "[" (expression ("," expression)*
-                    ("|" expression)?)? "]"
-array_literal    <- "#[" (expression ("," expression)*)? "]"
-map_literal      <- "%{" (map_entry ("," map_entry)*)? "}"
-map_entry        <- expression "=>" expression
-struct_literal   <- "%" type_path "{" (field_value ("," field_value)*)? "}"
-field_value      <- ident ":" expression
-
-pattern          <- typed_pattern / bitstring_pattern / struct_pattern
-                  / tuple_pattern / list_pattern / pattern_literal / "_" / ident
-typed_pattern    <- ident ":" type
-pattern_literal  <- "-"? (float / integer) / string / rune / atom
-                  / "true" / "false" / "unit"
-tuple_pattern    <- "{" pattern "," pattern ("," pattern)* "}"
-list_pattern     <- "[]" / "[" pattern "|" pattern "]"
-struct_pattern   <- "%" type_path "{" (field_pattern
-                    ("," field_pattern)*)? "}"
-field_pattern    <- ident ":" pattern
-
-bitstring_expr   <- "<<" (bit_expr_segment ("," bit_expr_segment)*)? ">>"
-bit_expr_segment <- segment_expression "::" bit_modifiers
-segment_expression <- logical_or_expr ("|>" logical_or_expr)*
-bitstring_pattern <- "<<" (bit_pattern_segment
-                    ("," bit_pattern_segment)*)? ">>"
-bit_pattern_segment <- pattern "::" bit_modifiers
-bit_modifiers    <- bit_modifier ("-" bit_modifier)*
-bit_modifier     <- "integer" / "signed" / "unsigned" / "big" / "little"
-                  / "native" / "bytes" / ("size" "(" expression ")")
-
-literal          <- float / integer / string / rune / atom
-                  / "true" / "false" / "unit"
-primitive_type   <- "bool" / "i8" / "i16" / "i32" / "i64" / "isize"
-                  / "u8" / "u16" / "u32" / "u64" / "usize"
-                  / "f32" / "f64" / "rune" / "string" / "bytes"
-                  / "bits" / "unit"
-```
-
-`ident` matches `[a-z][a-z0-9]*(?:_[a-z0-9]+)*`, and `type_name` matches
-`[A-Z][A-Za-z0-9]*`; both are ASCII. `type_var` is an `ident` that is not a
-keyword or primitive type. `module_name` is a `type_path`. `array_length` is a
-decimal integer token satisfying the literal-length restriction in section 6.4.
-`integer`, `float`, `string`, `rune`, and `atom` are exactly the tokens defined
-in section 4.4; keyword tokens require an identifier boundary. The lexer uses
-longest-token matching for `::`, `:=`, `->`, `=>`, `==`, `!=`, `<=`, `>=`,
-`<<`, `>>`, `++`, `|>`, and `#[` before their one-character prefixes or the
-line-comment rule.
-
-`arm_body` is a `body(block_item)` terminated by `end` or by the next
-`pattern ->` header at the current match nesting depth. This boundary is
-syntactic, not indentation-sensitive. The restrictions on bitstring modifier
-combinations and widths are part of section 7.4; the restrictions on pipeline
-right operands, assignment targets, typed patterns, irrefutable `for` patterns,
-and protocol bodies are grammar-validation rules and must be diagnosed before
-type checking. A top-level bitstring segment expression excludes `::` so the
-following `::` unambiguously begins its modifiers; an ascribed segment operand
-can be parenthesized. Operator associativity and non-associativity are encoded
-above and match section 8.7.
+Syntax examples in this document are explanatory. Any intentional change to
+the accepted language updates `GRAMMAR.md` and records a decision before the
+parser, formatter, examples, or conformance tests depend on it.
 
 ## 13. Diagnostics
 
@@ -2292,7 +2172,7 @@ Exit test: `el --help` runs and CI can build the workspace.
 
 ### Milestone 1: parser and AST
 
-- Implement the normative grammar in section 12 as a checked-in PEG grammar,
+- Implement [GRAMMAR.md](GRAMMAR.md) as a checked-in PEG grammar,
   starting with `defmodule`, `def`/`defp`, bindings, literals, types, and
   arithmetic.
 - Parse the accepted scalar escapes and bases plus tuple, list, fixed-array,
@@ -2310,6 +2190,7 @@ Exit test: parse a typed `main` function and snapshot its AST.
 
 ### Milestone 2: names and types
 
+- Implement the static contracts and checking order in [TYPES.md](TYPES.md).
 - Lexical scopes and unique symbol IDs.
 - Primitive types, function signatures, immutable bindings, and mutable locals.
 - Reject every transparent-alias cycle and every named-type containment cycle
@@ -2320,7 +2201,8 @@ Exit test: parse a typed `main` function and snapshot its AST.
 - Normalize structural unions, prove member disjointness for all generic
   substitutions with occurs-checked unification, emit overlap witnesses, and
   insert injections only from expected union types.
-- Produce a typed AST and lower it to a minimal Core IR.
+- Produce a Typed AST and lower it to the initial verified Generic Core IR
+  specified by [IR.md](IR.md).
 
 Exit test: accepted and rejected programs cover binding, mutation, calls, and
 return types, including generic inference and ambiguous empty values, without
@@ -2328,7 +2210,8 @@ invoking LLVM.
 
 ### Milestone 3: first native executable
 
-- Lower `i32`, `i64`, arithmetic, calls, and returns to LLVM IR.
+- Monomorphize verified Generic Core IR and lower verified Concrete Core IR for
+  `i32`, `i64`, arithmetic, calls, and returns to LLVM IR.
 - Monomorphize reachable unconstrained generic functions and concrete generic
   type layouts before LLVM lowering.
 - Emit an object file and invoke the host linker.
@@ -2417,7 +2300,7 @@ writes data while handling every recoverable error through `match`.
 
 - Conformance suite, reference examples, and language reference.
 - Stabilize diagnostic presentation and verify CLI conformance.
-- Verify the already normative v1 grammar and CLI contract, then freeze the
+- Verify the normative grammar and CLI contract, then freeze the
   manifest format and internal runtime ABI version.
 - Document supported targets and binary distribution requirements.
 
@@ -2538,8 +2421,8 @@ test at the narrowest useful level.
 
 Version 1 is ready when:
 
-- the normative grammar, CLI, and semantics are documented and covered by
-  conformance tests;
+- [GRAMMAR.md](GRAMMAR.md), [TYPES.md](TYPES.md), the normative CLI, and
+  observable semantics are documented and covered by conformance tests;
 - `el.toml` projects reliably compile to native host executables;
 - all supported language constructs are statically type-checked;
 - generic functions and named types infer, constrain, and monomorphize exactly
@@ -2682,11 +2565,15 @@ These require explicit decisions before the affected implementation begins:
 37. Resolved by D-060: `Process` exposes launch-time arguments and environment
     lookup through strict tagged UTF conversion, while `string` file paths use
     exact target-specific native conversion with documented limitations.
-38. Resolved by D-061: section 12 is the normative v1 grammar; the checked-in
-    PEG grammar and parser recovery must conform to it rather than define a
-    competing syntax.
+38. Resolved by D-061: [GRAMMAR.md](GRAMMAR.md) is the normative v1 grammar; the
+    checked-in PEG grammar and parser recovery must conform to it rather than
+    define a competing syntax.
 39. Resolved by D-062: section 14 fixes the complete v1 `el` command surface,
     option placement, output destinations, and exit-status classes.
+40. Resolved by D-063: the specification is split by explicit authority among
+    `DESIGN.md`, `GRAMMAR.md`, `TYPES.md`, `IR.md`, and `EXAMPLES.md`.
+41. Resolved by D-064: Generic and Concrete Core IR share a typed control-flow
+    graph with SSA values, block parameters, and typed local slots.
 
 ## 19. Decision process
 
@@ -3765,19 +3652,19 @@ These require explicit decisions before the affected implementation begins:
 - Reason: Strict conversion gives ordinary programs a small portable process
   boundary and makes every lossy or inaccessible native spelling explicit.
 
-### D-061 — Section 12 is the normative v1 grammar
+### D-061 — `GRAMMAR.md` is the normative v1 grammar
 
 - Date: 2026-07-26
 - Status: accepted
-- Authority: The lexical contract in section 4 and grammar in section 12 define
-  accepted v1 source syntax. The compiler's checked-in `pest` file implements
-  that contract and cannot silently extend or narrow it.
+- Authority: [GRAMMAR.md](GRAMMAR.md) defines accepted v1 source syntax. The
+  compiler's checked-in `pest` file implements that contract and cannot silently
+  extend or narrow it.
 - Coverage: The grammar fixes declarations, types, blocks, patterns, bitstring
   forms, literals, postfix syntax, and the complete operator precedence and
-  associativity ladder. Section 4.3 supplies significant-newline insertion.
+  associativity ladder, including significant-newline insertion.
 - Recovery: Parser recovery may recognize incomplete or erroneous forms only to
   produce diagnostics; recovery nodes never make a program conforming.
-- Change rule: Any intentional accepted-language change updates section 12 and
+- Change rule: Any intentional accepted-language change updates `GRAMMAR.md` and
   records a decision before implementation or examples depend on it.
 - Reason: A normative grammar makes parser tests, examples, formatter behavior,
   and independent implementations answer to one reviewable syntax contract.
@@ -3801,9 +3688,55 @@ These require explicit decisions before the affected implementation begins:
   tests rely on the tool before v1 stabilization without treating every CLI
   implementation choice as a language feature.
 
+### D-063 — Specification ownership is split by subject
+
+- Date: 2026-07-26
+- Status: accepted
+- Decision: `DESIGN.md` owns vision, observable runtime semantics, architecture,
+  roadmap, and accepted decisions. `GRAMMAR.md` is normative for lexical and
+  concrete syntax. `TYPES.md` is normative for static semantics and
+  well-formedness. `IR.md` defines bootstrap-compiler representation contracts.
+  `EXAMPLES.md` is illustrative.
+- Precedence: When overlapping prose disagrees, the document with explicit
+  authority for that subject controls. An intentional source-language change
+  updates its authoritative document and this decision log before implementation
+  or examples depend on it.
+- Reason: Narrow sources of truth are easier to implement and test than one
+  monolithic design document, while keeping rationale and decisions together
+  preserves the history behind each contract.
+
+### D-064 — Core IR is a typed control-flow graph
+
+- Date: 2026-07-26
+- Status: accepted
+- Shape: Generic and Concrete Core IR use the same logical instruction set. A
+  function contains typed basic blocks; each block has typed operations followed
+  by one terminator. SSA `ValueId`s and block parameters carry ordinary value
+  flow, while typed `SlotId`s represent mutable locals and hidden addressable
+  compiler storage.
+- Stages: Generic Core IR may retain declared type parameters, associated-type
+  projections, and constrained protocol calls. Monomorphization produces
+  Concrete Core IR with only concrete types, implementations, calls, and layouts
+  before LLVM lowering.
+- Lowering: Pipelines, protocol-backed operators and iteration, source patterns,
+  deriving, field-update syntax, and `defer` registration are absent from Core
+  IR. Their behavior is explicit in operations and control-flow edges, including
+  LIFO cleanup routing for normal exits.
+- Verification: Every IR boundary checks identity ownership, block and value
+  typing, slot initialization, stage legality, exact calls, union operations,
+  cleanup routing, source origins for failures, and conservative-GC base-pointer
+  visibility.
+- Flexibility: Rust data structures and textual debug formats are not stable
+  interfaces and may evolve while these invariants and observable EL behavior
+  remain intact.
+- Reason: A small typed CFG makes evaluation order, joins, early return, pattern
+  decisions, cleanup, and backend verification explicit without forcing mutable
+  source bindings into SSA before the compiler is ready to promote them.
+
 ## 21. Next design checkpoint
 
 All questions currently listed in section 18 are settled. New design work must
 continue through stable decision-log entries before implementation depends on
-it. D-060 through D-062 close the remaining process-boundary, grammar-authority,
-and CLI-authority gaps; implementation now has normative contracts to test.
+it. D-060 through D-064 close the remaining process-boundary, grammar, CLI,
+specification-ownership, and Core IR gaps; implementation now has explicit
+contracts to test.
