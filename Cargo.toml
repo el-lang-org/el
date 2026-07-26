@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/el-cli",
+    "crates/el-driver",
+    "crates/el-runtime",
+    "crates/el-span",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+

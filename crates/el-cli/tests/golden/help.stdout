@@ -1,0 +1,13 @@
+EL compiler and package tool
+
+Usage:
+  el --help
+  el --version
+  el check [--locked]
+  el build [--release] [--locked]
+  el emit llvm-ir --module <Module>
+
+Options:
+  --locked    Require an up-to-date lockfile
+  --release   Build with optimizations
+  --module    Select a package-relative module

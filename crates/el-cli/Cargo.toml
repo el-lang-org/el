@@ -1,0 +1,17 @@
+[package]
+name = "el-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "el"
+path = "src/main.rs"
+
+[dependencies]
+el-driver = { path = "../el-driver", version = "=0.1.0" }
+
+[lints]
+workspace = true
+

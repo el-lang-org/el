@@ -281,32 +281,32 @@ shell without implementing the language.
 
 **Deliverables**
 
-- [ ] Pin the exact Rust toolchain.
-- [ ] Create the workspace plus `el-cli` (with binary name `el`), `el-driver`,
+- [x] Pin the exact Rust toolchain.
+- [x] Create the workspace plus `el-cli` (with binary name `el`), `el-driver`,
   `el-span`, and `el-runtime`; add the remaining stage crates with their first
   vertical slice instead of landing empty future scaffolding.
-- [ ] Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and
+- [x] Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and
   `pest_derive` only when the parser crate is introduced.
-- [ ] Record LLVM 22.1.0 and Inkwell 0.9.0 requirements without forcing ordinary
+- [x] Record LLVM 22.1.0 and Inkwell 0.9.0 requirements without forcing ordinary
   frontend-only tests to link LLVM.
-- [ ] Select, document, and prepare the exact vendored Boehm GC release without
+- [x] Select, document, and prepare the exact vendored Boehm GC release without
   exposing it through source-language APIs.
-- [ ] Implement exact `el --help` and `el --version` stream/exit behavior.
-- [ ] Build a strict command parser whose known-but-unimplemented project commands
+- [x] Implement exact `el --help` and `el --version` stream/exit behavior.
+- [x] Build a strict command parser whose known-but-unimplemented project commands
   fail as ordinary tool errors, not panics.
-- [ ] Discover the nearest ancestor `el.toml` for project commands.
-- [ ] Add structured error plumbing, temporary-directory test support, golden-file
+- [x] Discover the nearest ancestor `el.toml` for project commands.
+- [x] Add structured error plumbing, temporary-directory test support, golden-file
   conventions, and CI jobs for format, lint, unit tests, and license checks.
-- [ ] Document local prerequisites and keep frontend checks runnable without LLVM
+- [x] Document local prerequisites and keep frontend checks runnable without LLVM
   or Boehm GC.
 
 **Tests**
 
-- [ ] Help and version output, streams, and status 0.
-- [ ] Unknown commands, duplicate options, missing values, and status 2.
-- [ ] Manifest discovery from the project root, descendants, and missing-manifest
+- [x] Help and version output, streams, and status 0.
+- [x] Unknown commands, duplicate options, missing values, and status 2.
+- [x] Manifest discovery from the project root, descendants, and missing-manifest
   paths.
-- [ ] Workspace builds with no network access after dependencies are fetched.
+- [x] Workspace builds with no network access after dependencies are fetched.
 
 - [ ] **Exit gate:** `el --help` runs and CI builds the workspace. All standard Rust
   checks pass.
@@ -730,11 +730,11 @@ The first reviewable changes should be small enough to verify independently:
 1. [ ] **Workspace and pins:** toolchain, workspace manifests, license policy,
    initial `el-span`, `el-runtime`, `el-driver`, and `el-cli` crates, plus a CI
    build.
-2. [ ] **CLI shell:** exact help/version and strict command parsing with CLI
+2. [x] **CLI shell:** exact help/version and strict command parsing with CLI
    conformance fixtures.
-3. [ ] **Source foundation:** source database, `FileId`, `Span`, line mapping,
+3. [ ] **Source foundation (in progress):** source database, `FileId`, `Span`, line mapping,
    structured diagnostics, and renderer snapshots.
-4. [ ] **Project discovery:** ancestor manifest search and minimal project errors.
+4. [x] **Project discovery:** ancestor manifest search and minimal project errors.
 5. [ ] **Lexical grammar:** source encoding, whitespace/comments, identifiers,
    keywords, literal tokens, and newline model.
 6. [ ] **Declaration/type grammar:** module, functions, signatures, bindings, scalar
@@ -870,7 +870,8 @@ Use this checklist as the high-level implementation ledger. Check a milestone
 only after its exit gate and workspace checks pass. Leave incomplete work
 unchecked and add `(in progress)` after the item when useful.
 
-- [ ] **0 — Project skeleton:** `el --help`; CI workspace build.
+- [ ] **0 — Project skeleton (in progress):** local exit gate passes; CI workflow
+  awaits its first remote run.
 - [ ] **1 — Parser and AST:** typed-main AST snapshot.
 - [ ] **2 — Names and types:** accepted/rejected semantic suite without LLVM.
 - [ ] **3 — First native executable:** computed native process exit status.
@@ -893,11 +894,11 @@ Implementation can begin when all of the following are true:
 - [x] The initial crate and compiler-stage boundaries are proposed.
 - [x] Cross-cutting identity, span, diagnostic, determinism, and verifier rules
   are explicit.
-- [ ] Exact Rust toolchain is selected and pinned.
-- [ ] Exact Boehm GC release/source is selected and pinned.
+- [x] Exact Rust toolchain is selected and pinned.
+- [x] Exact Boehm GC release/source is selected and pinned.
 - [ ] LLVM 22.1.0 is installed or provisioned for backend CI and local backend
   work.
-- [ ] Milestone 0 workspace and CI are created.
+- [x] Milestone 0 workspace and CI are created.
 
 The first implementation action is therefore Milestone 0, change 1: create the
 workspace, make the two remaining version selections, record native prerequisites,
