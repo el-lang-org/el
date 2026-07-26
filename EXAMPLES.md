@@ -438,13 +438,17 @@ def add(total: i64, value: i64) -> i64 do
 end
 
 total = Enum.reduce([1, 2, 3], 0, add)
+second: Option(i64) = Enum.at([10, 20, 30], 1) # {:some, 20}
+missing: Option(i64) = Enum.at([10, 20, 30], 3) # :none
 ```
 
 The real `Enum` declarations explicitly include `when i: Iterable`; the API
 reference states that shared constraint once rather than repeating it on every
-signature. `map`, `filter`, and `to_list` always return lists. `any` and `all`
-short-circuit, maps enumerate `{key, value}` in insertion order, and function
-arguments are named function values because v1 has no closures.
+signature. `at` uses zero-based `usize` positions, returns an `Option`, and
+stops once it reaches the requested item. `map`, `filter`, and `to_list` always
+return lists. `any` and `all` short-circuit, maps enumerate `{key, value}` in
+insertion order, and function arguments are named function values because v1
+has no closures.
 
 Collection-specific operations remain where they expose structure or conversion:
 

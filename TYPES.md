@@ -466,6 +466,7 @@ mandatory in the actual EL declaration:
 
 ```el
 Enum.count(values: i) -> usize
+Enum.at(values: i, index: usize) -> Option(Iterable.Item(i))
 Enum.to_list(values: i) -> [Iterable.Item(i)]
 Enum.map(values: i, function: (Iterable.Item(i)) -> b) -> [b]
 Enum.filter(values: i, predicate: (Iterable.Item(i)) -> bool) ->
@@ -477,7 +478,9 @@ Enum.any(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
 Enum.all(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
 ```
 
-These functions follow the selected iterable's deterministic order.
+These functions follow the selected iterable's deterministic order. `at` uses a
+zero-based `usize` position, returns `{:some, item}` when that position exists,
+returns `:none` otherwise, and stops after finding the requested item.
 `to_list`, `map`, and `filter` return lists because v1 has no higher-kinded
 abstraction for reconstructing an arbitrary input container. `reduce` is strict
 and left-to-right. `each` visits every item, while `any` and `all` stop as soon
@@ -503,13 +506,14 @@ valid user generic syntax. `Array.length` and `Slice.from_array` are compiler-
 provided standard intrinsics instantiated for every concrete literal length.
 Standard array implementations of `Eq`, `Ord`, `Hash`, `Show`, and `Iterable`
 are generated on the same concrete-length basis when their item constraints
-hold. Array, slice, and byte sizes are O(1). `List.reverse`, byte/list
-conversion, and `Enum` list-producing operations are O(n) and allocate fresh
-logical values. `Bytes.slice` is bounds-checked with `index_out_of_bounds` and
-may share immutable backing storage. `List.new` is omitted: an empty list is
-written `[]` with an expected type when necessary. Sorting, searching, zipping,
-chunking, and similar conveniences are ordinary future library growth rather
-than v1 language surface.
+hold. Array, slice, and byte sizes are O(1). `Enum.at` traverses at most
+`min(index + 1, length)` items. `List.reverse`, byte/list conversion, and `Enum`
+list-producing operations are O(n) and allocate fresh logical values.
+`Bytes.slice` is bounds-checked with `index_out_of_bounds` and may share
+immutable backing storage. `List.new` is omitted: an empty list is written `[]`
+with an expected type when necessary. Sorting, searching, zipping, chunking,
+and similar conveniences are ordinary future library growth rather than v1
+language surface.
 
 ### 5.2 Representation boundary
 

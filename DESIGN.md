@@ -765,6 +765,7 @@ mandatory in the actual EL declaration:
 
 ```el
 Enum.count(values: i) -> usize
+Enum.at(values: i, index: usize) -> Option(Iterable.Item(i))
 Enum.to_list(values: i) -> [Iterable.Item(i)]
 Enum.map(values: i, function: (Iterable.Item(i)) -> b) -> [b]
 Enum.filter(values: i, predicate: (Iterable.Item(i)) -> bool) ->
@@ -776,7 +777,9 @@ Enum.any(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
 Enum.all(values: i, predicate: (Iterable.Item(i)) -> bool) -> bool
 ```
 
-These functions follow the selected iterable's deterministic order.
+These functions follow the selected iterable's deterministic order. `at` uses a
+zero-based `usize` position, returns `{:some, item}` when that position exists,
+returns `:none` otherwise, and stops after finding the requested item.
 `to_list`, `map`, and `filter` return lists because v1 has no higher-kinded
 abstraction for reconstructing an arbitrary input container. `reduce` is strict
 and left-to-right. `each` visits every item, while `any` and `all` stop as soon
@@ -802,13 +805,14 @@ valid user generic syntax. `Array.length` and `Slice.from_array` are compiler-
 provided standard intrinsics instantiated for every concrete literal length.
 Standard array implementations of `Eq`, `Ord`, `Hash`, `Show`, and `Iterable`
 are generated on the same concrete-length basis when their item constraints
-hold. Array, slice, and byte sizes are O(1). `List.reverse`, byte/list
-conversion, and `Enum` list-producing operations are O(n) and allocate fresh
-logical values. `Bytes.slice` is bounds-checked with `index_out_of_bounds` and
-may share immutable backing storage. `List.new` is omitted: an empty list is
-written `[]` with an expected type when necessary. Sorting, searching, zipping,
-chunking, and similar conveniences are ordinary future library growth rather
-than v1 language surface.
+hold. Array, slice, and byte sizes are O(1). `Enum.at` traverses at most
+`min(index + 1, length)` items. `List.reverse`, byte/list conversion, and `Enum`
+list-producing operations are O(n) and allocate fresh logical values.
+`Bytes.slice` is bounds-checked with `index_out_of_bounds` and may share
+immutable backing storage. `List.new` is omitted: an empty list is written `[]`
+with an expected type when necessary. Sorting, searching, zipping, chunking,
+and similar conveniences are ordinary future library growth rather than v1
+language surface.
 
 #### 6.4.2 Representation boundary
 
@@ -2397,10 +2401,10 @@ on every supported target, with GC stress mode enabled.
   remove-and-reinsert behavior, insertion-order-independent map equality, and
   iteration stability across runtime hash seeds.
 - **Enum/collection API tests:** explicit declaration constraints, generic calls
-  without call-site constraints, deterministic traversal, list result types,
-  strict left reduction, short-circuiting, map tuple order, structural-size
-  complexity, byte conversions, shared immutable byte slices, and bounds
-  failures.
+  without call-site constraints, deterministic traversal, zero-based optional
+  positional lookup, list result types, strict left reduction, short-circuiting,
+  map tuple order, structural-size complexity, byte conversions, shared
+  immutable byte slices, and bounds failures.
 - **Manifest tests:** package ID, namespace, strict keys, optional single target,
   library-only packages, dependency cycles, and target validation.
 - **Dependency tests:** exact-version validation, lockfile stability, transitive
@@ -2434,8 +2438,9 @@ Version 1 is ready when:
   are enforced;
 - protocols, explicit implementations, deriving, `for ... in`, `++`, and `|>`
   work as specified;
-- `Enum` traversal and the fixed collection-specific size, slice, reversal, and
-  conversion APIs preserve their documented order and complexity;
+- `Enum` traversal, optional positional lookup, and the fixed collection-specific
+  size, slice, reversal, and conversion APIs preserve their documented order
+  and complexity;
 - fixed arrays infer literal lengths locally, use literal lengths in user-written
   contracts, and route arbitrary-length algorithms through slices or iteration;
 - named monomorphic function values resolve, specialize, pass, return, and call
@@ -3580,8 +3585,9 @@ These require explicit decisions before the affected implementation begins:
 
 - Date: 2026-07-26
 - Status: accepted
-- Generic traversal: The reserved `Enum` module defines `count`, `to_list`,
-  `map`, `filter`, `reduce`, `each`, `any`, and `all` for every `Iterable`.
+- Generic traversal: The reserved `Enum` module defines `count`, `at`,
+  `to_list`, `map`, `filter`, `reduce`, `each`, `any`, and `all` for every
+  `Iterable`.
   Actual declarations explicitly state `when i: Iterable`; documentation may
   state the shared constraint once and omit its repetition from an API listing.
 - Results and order: Every function follows the implementation's deterministic
@@ -3591,6 +3597,10 @@ These require explicit decisions before the affected implementation begins:
 - Evaluation: `reduce` is strict and left-to-right, `each` visits every item,
   and `any` plus `all` short-circuit. Function arguments are concrete named
   function values under D-054.
+- Positional lookup: `Enum.at(values, index)` uses a zero-based `usize` index,
+  follows iteration order, and returns `Option(Iterable.Item(i))`. It returns
+  `:none` when the iterable ends before the position and stops immediately
+  after finding it; it traverses at most `min(index + 1, length)` items.
 - Specific operations: V1 additionally fixes `List.reverse`, `Array.length`,
   `Slice.length`, `Bytes.byte_size`, `Bytes.slice`, `Bytes.from_list`, and
   `Bytes.to_list`. Structural array, slice, and byte sizes are O(1);

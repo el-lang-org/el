@@ -597,7 +597,8 @@ operators, and generic traversal.
 - Derivation success/failure for generic and nested structs.
 - `Eq`/`Ord`/`Hash` law tests for standard implementations.
 - Every standard iteration order, map tuple order, cursor threading, and
-  irrefutable/refutable `for` patterns.
+  irrefutable/refutable `for` patterns, including zero-based `Enum.at` hits and
+  misses plus bounded traversal through the requested position.
 - Concatenation for `string`, `bytes`, `bits`, and lists.
 
 **Exit gate:** derive protocols for a generic struct, instantiate constrained
