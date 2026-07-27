@@ -1,11 +1,9 @@
 //! Shared Generic Core IR, initial lowering, and representation verification.
 
-use el_resolve::{DeclId, ImplId, SymbolId};
+use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
-use el_types::{
-    ArithmeticOperator, Type, TypeId, TypedExpr, TypedExprKind, TypedItem, TypedPatternKind,
-    TypedProgram,
-};
+pub use el_types::{ArithmeticOperator, Type, TypeId};
+use el_types::{TypedExpr, TypedExprKind, TypedItem, TypedPatternKind, TypedProgram};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -51,14 +49,28 @@ pub struct CoreStruct {
 pub struct CoreFunction {
     pub id: FunctionId,
     pub declaration: DeclId,
+    pub module_name: String,
     pub name: String,
+    pub visibility: Visibility,
     pub span: Span,
     pub parameters: Vec<CoreParameter>,
     pub type_parameters: Vec<TypeId>,
+    pub specialization_arguments: Vec<TypeId>,
     pub constraints: Vec<(TypeId, String)>,
     pub result: TypeId,
     pub slots: Vec<Slot>,
     pub blocks: Vec<Block>,
+}
+
+impl CoreFunction {
+    /// Whether source resolution marked this function as module-public.
+    ///
+    /// Later compiler stages can enforce an exported-entry invariant without
+    /// depending directly on resolver representation types.
+    #[must_use]
+    pub fn is_exported(&self) -> bool {
+        self.visibility == Visibility::Public
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,10 +426,13 @@ impl<'a> Lowerer<'a> {
         CoreFunction {
             id: self.id,
             declaration: self.function.id,
+            module_name: self.function.module_name.clone(),
             name: self.function.name.clone(),
+            visibility: self.function.visibility,
             span: self.function.span,
             parameters,
             type_parameters: self.function.type_parameters.clone(),
+            specialization_arguments: Vec::new(),
             constraints: self.function.constraints.clone(),
             result: self.function.result,
             slots: self.slots,
@@ -1002,6 +1017,968 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+/// The deterministic set of compiler roots for an executable target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReachabilityRoots {
+    pub functions: Vec<FunctionId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConcreteModule {
+    pub types: Vec<Type>,
+    pub structs: Vec<ConcreteStruct>,
+    pub functions: Vec<CoreFunction>,
+    pub roots: ReachabilityRoots,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConcreteStruct {
+    pub declaration: DeclId,
+    pub name: String,
+    pub arguments: Vec<TypeId>,
+    pub fields: Vec<(String, TypeId)>,
+    pub origin: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MonomorphizationError {
+    UnknownRoot(FunctionId),
+    UnknownFunction(FunctionId),
+    UnknownDeclaration(DeclId),
+    UnknownStruct(DeclId),
+    MissingSubstitution {
+        declaration: DeclId,
+        parameter: TypeId,
+    },
+    ConstrainedFunction(DeclId),
+    InvalidType(TypeId),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NormalizedType {
+    I32,
+    I64,
+    Bool,
+    Unit,
+    Atom(String),
+    List(Box<Self>),
+    Array {
+        item: Box<Self>,
+        length: u64,
+    },
+    Map {
+        key: Box<Self>,
+        value: Box<Self>,
+    },
+    Tuple(Vec<Self>),
+    Function {
+        parameters: Vec<Self>,
+        result: Box<Self>,
+    },
+    Struct {
+        declaration: DeclId,
+        arguments: Vec<Self>,
+    },
+    Union(Vec<Self>),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FunctionSpecializationKey {
+    declaration: DeclId,
+    substitution: Vec<(TypeId, NormalizedType)>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct LayoutSpecializationKey {
+    declaration: DeclId,
+    arguments: Vec<NormalizedType>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EntryPointError {
+    Missing,
+    Private { span: Span },
+    HasParameters { span: Span, count: usize },
+    WrongResult { span: Span, found: TypeId },
+    Generic { span: Span },
+}
+
+/// Selects the initial executable reachability root required by EL v1.
+///
+/// The input must already be verified Generic Core IR. Additional
+/// compiler-defined roots can be appended here as later runtime features need
+/// them; the returned function IDs are always in deterministic order.
+pub fn executable_reachability_roots(
+    module: &GenericModule,
+) -> Result<ReachabilityRoots, EntryPointError> {
+    let Some(entry) = module
+        .functions
+        .iter()
+        .find(|function| function.module_name == "Main" && function.name == "main")
+    else {
+        return Err(EntryPointError::Missing);
+    };
+    if entry.visibility != Visibility::Public {
+        return Err(EntryPointError::Private { span: entry.span });
+    }
+    if !entry.parameters.is_empty() {
+        return Err(EntryPointError::HasParameters {
+            span: entry.span,
+            count: entry.parameters.len(),
+        });
+    }
+    if !entry.type_parameters.is_empty() || !entry.constraints.is_empty() {
+        return Err(EntryPointError::Generic { span: entry.span });
+    }
+    if !matches!(module.types.get(entry.result.0 as usize), Some(Type::I32)) {
+        return Err(EntryPointError::WrongResult {
+            span: entry.span,
+            found: entry.result,
+        });
+    }
+
+    let mut functions = vec![entry.id];
+    functions.sort_unstable();
+    functions.dedup();
+    Ok(ReachabilityRoots { functions })
+}
+
+/// Specializes the reachable unconstrained Generic Core graph and its nominal
+/// layouts in deterministic declaration/substitution order.
+pub fn monomorphize(
+    module: &GenericModule,
+    roots: &ReachabilityRoots,
+) -> Result<ConcreteModule, MonomorphizationError> {
+    let concrete = Monomorphizer::new(module).run(roots)?;
+    if let Err(errors) = verify_concrete(&concrete) {
+        panic!("monomorphization produced invalid Concrete Core IR: {errors:?}");
+    }
+    Ok(concrete)
+}
+
+struct Monomorphizer<'a> {
+    module: &'a GenericModule,
+    functions_by_id: BTreeMap<FunctionId, &'a CoreFunction>,
+    functions_by_decl: BTreeMap<DeclId, &'a CoreFunction>,
+    structs_by_decl: BTreeMap<DeclId, &'a CoreStruct>,
+    layouts: BTreeSet<LayoutSpecializationKey>,
+    types: Vec<Type>,
+}
+
+impl<'a> Monomorphizer<'a> {
+    fn new(module: &'a GenericModule) -> Self {
+        Self {
+            module,
+            functions_by_id: module
+                .functions
+                .iter()
+                .map(|function| (function.id, function))
+                .collect(),
+            functions_by_decl: module
+                .functions
+                .iter()
+                .map(|function| (function.declaration, function))
+                .collect(),
+            structs_by_decl: module
+                .structs
+                .iter()
+                .map(|structure| (structure.declaration, structure))
+                .collect(),
+            layouts: BTreeSet::new(),
+            types: vec![Type::I32, Type::I64, Type::Bool, Type::Unit],
+        }
+    }
+
+    fn run(mut self, roots: &ReachabilityRoots) -> Result<ConcreteModule, MonomorphizationError> {
+        let mut pending = BTreeSet::new();
+        let mut root_keys = Vec::new();
+        for root in &roots.functions {
+            let function = self
+                .functions_by_id
+                .get(root)
+                .ok_or(MonomorphizationError::UnknownRoot(*root))?;
+            let key = FunctionSpecializationKey {
+                declaration: function.declaration,
+                substitution: Vec::new(),
+            };
+            pending.insert(key.clone());
+            root_keys.push(key);
+        }
+
+        let mut discovered = BTreeSet::new();
+        while let Some(key) = pending.pop_first() {
+            if !discovered.insert(key.clone()) {
+                continue;
+            }
+            let function = self.function_for_key(&key)?;
+            if !function.constraints.is_empty() {
+                return Err(MonomorphizationError::ConstrainedFunction(
+                    function.declaration,
+                ));
+            }
+            let substitution = key.substitution.iter().cloned().collect::<BTreeMap<_, _>>();
+            self.discover_function_layouts(function, &substitution)?;
+            for block in &function.blocks {
+                for operation in &block.operations {
+                    if let Operation::Call {
+                        function,
+                        substitutions,
+                        ..
+                    } = operation
+                    {
+                        let called = self
+                            .functions_by_id
+                            .get(function)
+                            .ok_or(MonomorphizationError::UnknownFunction(*function))?;
+                        pending.insert(self.call_key(called, substitutions, &substitution)?);
+                    }
+                }
+            }
+        }
+
+        let mut pending_layouts = self.layouts.clone();
+        let mut concrete_layout_keys = BTreeSet::new();
+        while let Some(key) = pending_layouts.pop_first() {
+            if !concrete_layout_keys.insert(key.clone()) {
+                continue;
+            }
+            let structure = self
+                .structs_by_decl
+                .get(&key.declaration)
+                .ok_or(MonomorphizationError::UnknownStruct(key.declaration))?;
+            let substitution = structure
+                .parameters
+                .iter()
+                .copied()
+                .zip(key.arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            for (_, field) in &structure.fields {
+                let normalized = self.normalize(*field, &substitution)?;
+                let mut found = BTreeSet::new();
+                collect_layout_keys(&normalized, &mut found);
+                for layout in found {
+                    if !concrete_layout_keys.contains(&layout) {
+                        pending_layouts.insert(layout);
+                    }
+                }
+            }
+        }
+
+        let ids = discovered
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), FunctionId(index as u32)))
+            .collect::<BTreeMap<_, _>>();
+        let mut functions = Vec::with_capacity(discovered.len());
+        for key in &discovered {
+            functions.push(self.specialize_function(key, &ids)?);
+        }
+        let concrete_roots = ReachabilityRoots {
+            functions: root_keys.iter().map(|key| ids[key]).collect::<Vec<_>>(),
+        };
+
+        let mut structs = Vec::with_capacity(concrete_layout_keys.len());
+        for key in concrete_layout_keys {
+            structs.push(self.specialize_struct(&key)?);
+        }
+        Ok(ConcreteModule {
+            types: self.types,
+            structs,
+            functions,
+            roots: concrete_roots,
+        })
+    }
+
+    fn function_for_key(
+        &self,
+        key: &FunctionSpecializationKey,
+    ) -> Result<&'a CoreFunction, MonomorphizationError> {
+        self.functions_by_decl
+            .get(&key.declaration)
+            .copied()
+            .ok_or(MonomorphizationError::UnknownDeclaration(key.declaration))
+    }
+
+    fn call_key(
+        &self,
+        called: &CoreFunction,
+        call_substitutions: &[(TypeId, TypeId)],
+        caller_substitution: &BTreeMap<TypeId, NormalizedType>,
+    ) -> Result<FunctionSpecializationKey, MonomorphizationError> {
+        let written = call_substitutions
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
+        let mut substitution = Vec::with_capacity(called.type_parameters.len());
+        for parameter in &called.type_parameters {
+            let value = written.get(parameter).copied().ok_or(
+                MonomorphizationError::MissingSubstitution {
+                    declaration: called.declaration,
+                    parameter: *parameter,
+                },
+            )?;
+            substitution.push((*parameter, self.normalize(value, caller_substitution)?));
+        }
+        Ok(FunctionSpecializationKey {
+            declaration: called.declaration,
+            substitution,
+        })
+    }
+
+    fn discover_function_layouts(
+        &mut self,
+        function: &CoreFunction,
+        substitution: &BTreeMap<TypeId, NormalizedType>,
+    ) -> Result<(), MonomorphizationError> {
+        let mut types = function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.ty)
+            .chain(std::iter::once(function.result))
+            .chain(function.slots.iter().map(|slot| slot.ty))
+            .collect::<Vec<_>>();
+        for block in &function.blocks {
+            types.extend(block.parameters.iter().map(|parameter| parameter.ty));
+            for operation in &block.operations {
+                operation_type_ids(operation, &mut types);
+            }
+            if let Terminator::Switch { cases, .. } = &block.terminator {
+                types.extend(cases.iter().filter_map(|(value, _)| match value {
+                    SwitchValue::UnionMember(ty) => Some(*ty),
+                    _ => None,
+                }));
+            }
+        }
+        for ty in types {
+            let normalized = self.normalize(ty, substitution)?;
+            collect_layout_keys(&normalized, &mut self.layouts);
+        }
+        Ok(())
+    }
+
+    fn normalize(
+        &self,
+        ty: TypeId,
+        substitution: &BTreeMap<TypeId, NormalizedType>,
+    ) -> Result<NormalizedType, MonomorphizationError> {
+        if let Some(replacement) = substitution.get(&ty) {
+            return Ok(replacement.clone());
+        }
+        let normalized = match self
+            .module
+            .types
+            .get(ty.0 as usize)
+            .ok_or(MonomorphizationError::InvalidType(ty))?
+        {
+            Type::I32 => NormalizedType::I32,
+            Type::I64 => NormalizedType::I64,
+            Type::Bool => NormalizedType::Bool,
+            Type::Unit => NormalizedType::Unit,
+            Type::Atom(name) => NormalizedType::Atom(name.clone()),
+            Type::List(item) => {
+                NormalizedType::List(Box::new(self.normalize(*item, substitution)?))
+            }
+            Type::Array { item, length } => NormalizedType::Array {
+                item: Box::new(self.normalize(*item, substitution)?),
+                length: *length,
+            },
+            Type::Map { key, value } => NormalizedType::Map {
+                key: Box::new(self.normalize(*key, substitution)?),
+                value: Box::new(self.normalize(*value, substitution)?),
+            },
+            Type::Tuple(elements) => NormalizedType::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.normalize(*element, substitution))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Type::Function { parameters, result } => NormalizedType::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.normalize(*parameter, substitution))
+                    .collect::<Result<_, _>>()?,
+                result: Box::new(self.normalize(*result, substitution)?),
+            },
+            Type::Struct {
+                declaration,
+                arguments,
+            } => NormalizedType::Struct {
+                declaration: *declaration,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.normalize(*argument, substitution))
+                    .collect::<Result<_, _>>()?,
+            },
+            Type::Union(members) => NormalizedType::Union(
+                members
+                    .iter()
+                    .map(|member| self.normalize(*member, substitution))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Type::Parameter { owner, .. } => {
+                return Err(MonomorphizationError::MissingSubstitution {
+                    declaration: *owner,
+                    parameter: ty,
+                });
+            }
+        };
+        Ok(normalized)
+    }
+
+    fn specialize_function(
+        &mut self,
+        key: &FunctionSpecializationKey,
+        ids: &BTreeMap<FunctionSpecializationKey, FunctionId>,
+    ) -> Result<CoreFunction, MonomorphizationError> {
+        let source = self.function_for_key(key)?.clone();
+        let substitution = key.substitution.iter().cloned().collect::<BTreeMap<_, _>>();
+        let parameters = source
+            .parameters
+            .iter()
+            .map(|parameter| {
+                Ok(CoreParameter {
+                    value: parameter.value,
+                    ty: self.materialize_type(parameter.ty, &substitution)?,
+                    origin: parameter.origin,
+                })
+            })
+            .collect::<Result<_, MonomorphizationError>>()?;
+        let slots = source
+            .slots
+            .iter()
+            .map(|slot| {
+                Ok(Slot {
+                    id: slot.id,
+                    ty: self.materialize_type(slot.ty, &substitution)?,
+                    origin: slot.origin,
+                })
+            })
+            .collect::<Result<_, MonomorphizationError>>()?;
+        let mut blocks = source.blocks.clone();
+        for block in &mut blocks {
+            for parameter in &mut block.parameters {
+                parameter.ty = self.materialize_type(parameter.ty, &substitution)?;
+            }
+            for operation in &mut block.operations {
+                self.specialize_operation(operation, &substitution, ids)?;
+            }
+            if let Terminator::Switch { cases, .. } = &mut block.terminator {
+                for (value, _) in cases {
+                    if let SwitchValue::UnionMember(ty) = value {
+                        *ty = self.materialize_type(*ty, &substitution)?;
+                    }
+                }
+            }
+        }
+        let specialization_arguments = key
+            .substitution
+            .iter()
+            .map(|(_, argument)| self.intern_normalized(argument))
+            .collect();
+        Ok(CoreFunction {
+            id: ids[key],
+            declaration: source.declaration,
+            module_name: source.module_name,
+            name: source.name,
+            visibility: source.visibility,
+            span: source.span,
+            parameters,
+            type_parameters: Vec::new(),
+            specialization_arguments,
+            constraints: Vec::new(),
+            result: self.materialize_type(source.result, &substitution)?,
+            slots,
+            blocks,
+        })
+    }
+
+    fn specialize_operation(
+        &mut self,
+        operation: &mut Operation,
+        substitution: &BTreeMap<TypeId, NormalizedType>,
+        ids: &BTreeMap<FunctionSpecializationKey, FunctionId>,
+    ) -> Result<(), MonomorphizationError> {
+        match operation {
+            Operation::Constant { ty, .. }
+            | Operation::List { ty, .. }
+            | Operation::Array { ty, .. }
+            | Operation::Map { ty, .. }
+            | Operation::Tuple { ty, .. }
+            | Operation::TupleProject { ty, .. }
+            | Operation::StructProject { ty, .. }
+            | Operation::ListHead { ty, .. }
+            | Operation::ListTail { ty, .. }
+            | Operation::CheckedArithmetic { ty, .. }
+            | Operation::Load { ty, .. } => {
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::Call {
+                function,
+                substitutions,
+                ty,
+                ..
+            } => {
+                let called = self
+                    .functions_by_id
+                    .get(function)
+                    .ok_or(MonomorphizationError::UnknownFunction(*function))?;
+                let key = self.call_key(called, substitutions, substitution)?;
+                *function = ids[&key];
+                substitutions.clear();
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::UnionInject { member, ty, .. }
+            | Operation::UnionProject { member, ty, .. } => {
+                *member = self.materialize_type(*member, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::Store { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn materialize_type(
+        &mut self,
+        ty: TypeId,
+        substitution: &BTreeMap<TypeId, NormalizedType>,
+    ) -> Result<TypeId, MonomorphizationError> {
+        let normalized = self.normalize(ty, substitution)?;
+        Ok(self.intern_normalized(&normalized))
+    }
+
+    fn intern_normalized(&mut self, ty: &NormalizedType) -> TypeId {
+        let materialized = match ty {
+            NormalizedType::I32 => return TypeId(0),
+            NormalizedType::I64 => return TypeId(1),
+            NormalizedType::Bool => return TypeId(2),
+            NormalizedType::Unit => return TypeId(3),
+            NormalizedType::Atom(name) => Type::Atom(name.clone()),
+            NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
+            NormalizedType::Array { item, length } => Type::Array {
+                item: self.intern_normalized(item),
+                length: *length,
+            },
+            NormalizedType::Map { key, value } => Type::Map {
+                key: self.intern_normalized(key),
+                value: self.intern_normalized(value),
+            },
+            NormalizedType::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.intern_normalized(element))
+                    .collect(),
+            ),
+            NormalizedType::Function { parameters, result } => Type::Function {
+                parameters: parameters
+                    .iter()
+                    .map(|parameter| self.intern_normalized(parameter))
+                    .collect(),
+                result: self.intern_normalized(result),
+            },
+            NormalizedType::Struct {
+                declaration,
+                arguments,
+            } => Type::Struct {
+                declaration: *declaration,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| self.intern_normalized(argument))
+                    .collect(),
+            },
+            NormalizedType::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|member| self.intern_normalized(member))
+                    .collect(),
+            ),
+        };
+        if let Some(index) = self
+            .types
+            .iter()
+            .position(|existing| existing == &materialized)
+        {
+            TypeId(index as u32)
+        } else {
+            let id = TypeId(self.types.len() as u32);
+            self.types.push(materialized);
+            id
+        }
+    }
+
+    fn specialize_struct(
+        &mut self,
+        key: &LayoutSpecializationKey,
+    ) -> Result<ConcreteStruct, MonomorphizationError> {
+        let source = self
+            .structs_by_decl
+            .get(&key.declaration)
+            .copied()
+            .ok_or(MonomorphizationError::UnknownStruct(key.declaration))?
+            .clone();
+        let substitution = source
+            .parameters
+            .iter()
+            .copied()
+            .zip(key.arguments.iter().cloned())
+            .collect::<BTreeMap<_, _>>();
+        Ok(ConcreteStruct {
+            declaration: source.declaration,
+            name: source.name,
+            arguments: key
+                .arguments
+                .iter()
+                .map(|argument| self.intern_normalized(argument))
+                .collect(),
+            fields: source
+                .fields
+                .iter()
+                .map(|(name, ty)| Ok((name.clone(), self.materialize_type(*ty, &substitution)?)))
+                .collect::<Result<_, MonomorphizationError>>()?,
+            origin: source.origin,
+        })
+    }
+}
+
+fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecializationKey>) {
+    match ty {
+        NormalizedType::List(item) | NormalizedType::Array { item, .. } => {
+            collect_layout_keys(item, layouts);
+        }
+        NormalizedType::Map { key, value } => {
+            collect_layout_keys(key, layouts);
+            collect_layout_keys(value, layouts);
+        }
+        NormalizedType::Tuple(elements) | NormalizedType::Union(elements) => {
+            for element in elements {
+                collect_layout_keys(element, layouts);
+            }
+        }
+        NormalizedType::Function { parameters, result } => {
+            for parameter in parameters {
+                collect_layout_keys(parameter, layouts);
+            }
+            collect_layout_keys(result, layouts);
+        }
+        NormalizedType::Struct {
+            declaration,
+            arguments,
+        } => {
+            layouts.insert(LayoutSpecializationKey {
+                declaration: *declaration,
+                arguments: arguments.clone(),
+            });
+            for argument in arguments {
+                collect_layout_keys(argument, layouts);
+            }
+        }
+        NormalizedType::I32
+        | NormalizedType::I64
+        | NormalizedType::Bool
+        | NormalizedType::Unit
+        | NormalizedType::Atom(_) => {}
+    }
+}
+
+fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
+    match operation {
+        Operation::Constant { ty, .. }
+        | Operation::List { ty, .. }
+        | Operation::Array { ty, .. }
+        | Operation::Map { ty, .. }
+        | Operation::Tuple { ty, .. }
+        | Operation::TupleProject { ty, .. }
+        | Operation::StructProject { ty, .. }
+        | Operation::ListHead { ty, .. }
+        | Operation::ListTail { ty, .. }
+        | Operation::CheckedArithmetic { ty, .. }
+        | Operation::Call { ty, .. }
+        | Operation::Load { ty, .. } => output.push(*ty),
+        Operation::UnionInject { member, ty, .. } | Operation::UnionProject { member, ty, .. } => {
+            output.push(*member);
+            output.push(*ty);
+        }
+        Operation::Store { .. } => {}
+    }
+}
+
+/// Verifies the fully concrete, reachable representation accepted by backends.
+pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let type_count = module.types.len() as u32;
+
+    for (index, ty) in module.types.iter().enumerate() {
+        if matches!(ty, Type::Parameter { .. }) {
+            errors.push(format!(
+                "Concrete Core type t{index} contains a residual type parameter"
+            ));
+        }
+    }
+
+    let mut layout_keys = BTreeSet::new();
+    for structure in &module.structs {
+        let key = (structure.declaration, structure.arguments.clone());
+        if !layout_keys.insert(key) {
+            errors.push(format!(
+                "concrete layout {:?} with arguments {:?} is emitted twice",
+                structure.declaration, structure.arguments
+            ));
+        }
+        for ty in structure
+            .arguments
+            .iter()
+            .chain(structure.fields.iter().map(|(_, ty)| ty))
+        {
+            if ty.0 >= type_count {
+                errors.push(format!(
+                    "concrete layout {:?} references unknown type {ty:?}",
+                    structure.declaration
+                ));
+            }
+        }
+    }
+    for (index, ty) in module.types.iter().enumerate() {
+        if let Type::Struct {
+            declaration,
+            arguments,
+        } = ty
+            && !layout_keys.contains(&(*declaration, arguments.clone()))
+        {
+            errors.push(format!(
+                "Concrete Core type t{index} has no concrete layout"
+            ));
+        }
+    }
+
+    let signatures = module
+        .functions
+        .iter()
+        .map(|function| {
+            (
+                function.id,
+                (
+                    function
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.ty)
+                        .collect::<Vec<_>>(),
+                    function.result,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if signatures.len() != module.functions.len() {
+        errors.push("Concrete Core defines a function ID more than once".to_owned());
+    }
+    let mut specialization_keys = BTreeSet::new();
+    for function in &module.functions {
+        if !function.type_parameters.is_empty() {
+            errors.push(format!(
+                "function {:?} contains residual type parameters",
+                function.id
+            ));
+        }
+        if !function.constraints.is_empty() {
+            errors.push(format!(
+                "function {:?} contains a residual constraint",
+                function.id
+            ));
+        }
+        if !specialization_keys.insert((
+            function.declaration,
+            function.specialization_arguments.clone(),
+        )) {
+            errors.push(format!(
+                "function {:?} duplicates an existing specialization",
+                function.id
+            ));
+        }
+        for argument in &function.specialization_arguments {
+            if argument.0 >= type_count {
+                errors.push(format!(
+                    "function {:?} has an unknown specialization argument",
+                    function.id
+                ));
+            }
+        }
+        let values = function_value_types(function);
+        for block in &function.blocks {
+            for operation in &block.operations {
+                if let Operation::Call {
+                    function: called,
+                    substitutions,
+                    arguments,
+                    ty,
+                    ..
+                } = operation
+                {
+                    if !substitutions.is_empty() {
+                        errors.push(format!(
+                            "call in {:?} contains a residual type substitution",
+                            function.id
+                        ));
+                    }
+                    if let Some((parameters, result)) = signatures.get(called)
+                        && (arguments.len() != parameters.len()
+                            || arguments
+                                .iter()
+                                .zip(parameters)
+                                .any(|(argument, expected)| values.get(argument) != Some(expected))
+                            || ty != result)
+                    {
+                        errors.push(format!(
+                            "call in {:?} does not have the exact concrete signature",
+                            function.id
+                        ));
+                    }
+                }
+                if let Operation::StructProject {
+                    structure,
+                    declaration,
+                    index,
+                    ty,
+                    ..
+                } = operation
+                {
+                    let layout = values
+                        .get(structure)
+                        .and_then(|source| module.types.get(source.0 as usize))
+                        .and_then(|source| match source {
+                            Type::Struct {
+                                declaration: found,
+                                arguments,
+                            } if found == declaration => module.structs.iter().find(|layout| {
+                                layout.declaration == *declaration && layout.arguments == *arguments
+                            }),
+                            _ => None,
+                        });
+                    if layout.and_then(|layout| layout.fields.get(*index).map(|field| field.1))
+                        != Some(*ty)
+                    {
+                        errors.push(format!(
+                            "struct projection in {:?} has no exact concrete layout field",
+                            function.id
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let root_set = module
+        .roots
+        .functions
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if root_set.len() != module.roots.functions.len()
+        || !module
+            .roots
+            .functions
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    {
+        errors.push("Concrete Core roots are not unique and sorted".to_owned());
+    }
+    for root in &root_set {
+        if !signatures.contains_key(root) {
+            errors.push(format!("Concrete Core references unknown root {root:?}"));
+        }
+    }
+    let mut reachable = root_set.clone();
+    let mut pending = root_set;
+    while let Some(function) = pending.pop_first() {
+        let Some(body) = module
+            .functions
+            .iter()
+            .find(|candidate| candidate.id == function)
+        else {
+            continue;
+        };
+        for called in body.blocks.iter().flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Call { function, .. } => Some(*function),
+                    _ => None,
+                })
+        }) {
+            if reachable.insert(called) {
+                pending.insert(called);
+            }
+        }
+    }
+    for function in &module.functions {
+        if !reachable.contains(&function.id) {
+            errors.push(format!(
+                "function {:?} is not reachable from a Concrete Core root",
+                function.id
+            ));
+        }
+    }
+
+    let mut shared_functions = module.functions.clone();
+    for function in &mut shared_functions {
+        function.specialization_arguments.clear();
+    }
+    let shared = GenericModule {
+        types: module.types.clone(),
+        structs: module
+            .structs
+            .iter()
+            .map(|structure| CoreStruct {
+                declaration: structure.declaration,
+                name: structure.name.clone(),
+                parameters: Vec::new(),
+                fields: structure.fields.clone(),
+                origin: structure.origin,
+            })
+            .collect(),
+        implementations: Vec::new(),
+        functions: shared_functions,
+    };
+    if let Err(mut shared_errors) = verify(&shared) {
+        errors.append(&mut shared_errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
+    function
+        .parameters
+        .iter()
+        .chain(function.blocks.iter().flat_map(|block| &block.parameters))
+        .map(|parameter| (parameter.value, parameter.ty))
+        .chain(function.blocks.iter().flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Constant { result, ty, .. }
+                    | Operation::List { result, ty, .. }
+                    | Operation::Array { result, ty, .. }
+                    | Operation::Map { result, ty, .. }
+                    | Operation::Tuple { result, ty, .. }
+                    | Operation::TupleProject { result, ty, .. }
+                    | Operation::StructProject { result, ty, .. }
+                    | Operation::ListHead { result, ty, .. }
+                    | Operation::ListTail { result, ty, .. }
+                    | Operation::CheckedArithmetic { result, ty, .. }
+                    | Operation::Call { result, ty, .. }
+                    | Operation::UnionInject { result, ty, .. }
+                    | Operation::UnionProject { result, ty, .. }
+                    | Operation::Load { result, ty, .. } => Some((*result, *ty)),
+                    Operation::Store { .. } => None,
+                })
+        }))
+        .collect()
+}
+
 /// Verifies ownership, definitions, operation typing, slot initialization, and returns.
 pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
@@ -1089,6 +2066,12 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
         }
     }
     for function in &module.functions {
+        if !function.specialization_arguments.is_empty() {
+            errors.push(format!(
+                "Generic Core function {:?} contains concrete specialization arguments",
+                function.id
+            ));
+        }
         let mut values = BTreeMap::new();
         for parameter in &function.parameters {
             if parameter.ty.0 >= type_count {

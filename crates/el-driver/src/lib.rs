@@ -1,5 +1,6 @@
 //! Project discovery and compiler pipeline orchestration.
 
+use el_codegen::{CodegenProfile, MetadataWriteError, TargetMetadata};
 use el_ir::GenericModule;
 use el_span::{Diagnostic, FileId};
 use std::error::Error;
@@ -7,6 +8,150 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_FILE_NAME: &str = "el.toml";
+
+/// The two native build profiles in the v1 CLI contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuildProfile {
+    Development,
+    Release,
+}
+
+impl BuildProfile {
+    #[must_use]
+    pub const fn from_release(release: bool) -> Self {
+        if release {
+            Self::Release
+        } else {
+            Self::Development
+        }
+    }
+
+    #[must_use]
+    pub const fn directory_name(self) -> &'static str {
+        match self {
+            Self::Development => "debug",
+            Self::Release => "release",
+        }
+    }
+
+    #[must_use]
+    pub const fn codegen_profile(self) -> CodegenProfile {
+        match self {
+            Self::Development => CodegenProfile::Development,
+            Self::Release => CodegenProfile::Release,
+        }
+    }
+}
+
+/// Deterministic locations for one host-native build.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildOutputPaths {
+    directory: PathBuf,
+    object: PathBuf,
+    executable: PathBuf,
+    metadata: PathBuf,
+}
+
+impl BuildOutputPaths {
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    #[must_use]
+    pub fn object(&self) -> &Path {
+        &self.object
+    }
+
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &Path {
+        &self.metadata
+    }
+}
+
+/// Creates the target/profile build directory and records its target metadata.
+pub fn prepare_build_output(
+    project_root: &Path,
+    package_name: &str,
+    target: &TargetMetadata,
+    profile: BuildProfile,
+) -> Result<BuildOutputPaths, BuildOutputError> {
+    if !is_package_id(package_name) {
+        return Err(BuildOutputError::InvalidPackageName(
+            package_name.to_owned(),
+        ));
+    }
+
+    let directory = project_root
+        .join("build")
+        .join(target.llvm_target_triple())
+        .join(profile.directory_name());
+    std::fs::create_dir_all(&directory).map_err(|source| BuildOutputError::CreateDirectory {
+        path: directory.clone(),
+        kind: source.kind(),
+        message: source.to_string(),
+    })?;
+
+    let executable_name = format!("{package_name}{}", std::env::consts::EXE_SUFFIX);
+    let paths = BuildOutputPaths {
+        object: directory.join(format!("{package_name}.o")),
+        executable: directory.join(executable_name),
+        metadata: directory.join("el-build-metadata.toml"),
+        directory,
+    };
+    target
+        .write_reproducibility_file(paths.metadata())
+        .map_err(BuildOutputError::WriteMetadata)?;
+    Ok(paths)
+}
+
+fn is_package_id(name: &str) -> bool {
+    let mut components = name.split('_');
+    components.next().is_some_and(is_package_component) && components.all(is_package_component)
+}
+
+fn is_package_component(component: &str) -> bool {
+    let mut bytes = component.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BuildOutputError {
+    InvalidPackageName(String),
+    CreateDirectory {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    WriteMetadata(MetadataWriteError),
+}
+
+impl fmt::Display for BuildOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPackageName(name) => {
+                write!(
+                    formatter,
+                    "invalid lowercase snake_case package name `{name}`"
+                )
+            }
+            Self::CreateDirectory { path, message, .. } => write!(
+                formatter,
+                "could not create build directory `{}`: {message}",
+                path.display()
+            ),
+            Self::WriteMetadata(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for BuildOutputError {}
 
 /// Runs the implemented, target-independent compiler stages for one source module.
 ///
@@ -164,6 +309,83 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).expect("remove temporary test directory");
         }
+    }
+
+    #[test]
+    fn prepares_target_specific_development_and_release_outputs() {
+        let temp = TempDir::new();
+        let target = TargetMetadata::new("arm64-apple-test", 64).unwrap();
+
+        let development = prepare_build_output(
+            temp.path(),
+            "sample_app",
+            &target,
+            BuildProfile::from_release(false),
+        )
+        .expect("prepare development output");
+        let release = prepare_build_output(
+            temp.path(),
+            "sample_app",
+            &target,
+            BuildProfile::from_release(true),
+        )
+        .expect("prepare release output");
+
+        assert_eq!(
+            development.directory(),
+            temp.path().join("build/arm64-apple-test/debug")
+        );
+        assert_eq!(
+            release.directory(),
+            temp.path().join("build/arm64-apple-test/release")
+        );
+        assert!(development.directory().is_dir());
+        assert!(release.directory().is_dir());
+        assert_eq!(
+            development.object(),
+            development.directory().join("sample_app.o")
+        );
+        assert_eq!(
+            development.executable(),
+            development
+                .directory()
+                .join(format!("sample_app{}", std::env::consts::EXE_SUFFIX))
+        );
+        assert_eq!(
+            fs::read_to_string(development.metadata()).unwrap(),
+            target.reproducibility_text()
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_package_output_names_before_creating_directories() {
+        let temp = TempDir::new();
+        let target = TargetMetadata::new("arm64-apple-test", 64).unwrap();
+
+        for name in ["", "Bad", "bad-name", "bad_", "_bad", "bad__name"] {
+            assert_eq!(
+                prepare_build_output(temp.path(), name, &target, BuildProfile::Development),
+                Err(BuildOutputError::InvalidPackageName(name.to_owned()))
+            );
+        }
+        assert!(!temp.path().join("build").exists());
+    }
+
+    #[test]
+    fn reports_build_directory_creation_failures_without_panicking() {
+        let temp = TempDir::new();
+        fs::write(temp.path().join("build"), "not a directory").unwrap();
+        let target = TargetMetadata::new("arm64-apple-test", 64).unwrap();
+
+        let error = prepare_build_output(temp.path(), "sample", &target, BuildProfile::Development)
+            .expect_err("directory failure must be structured");
+
+        assert!(matches!(error, BuildOutputError::CreateDirectory { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("could not create build directory")
+        );
     }
 
     #[test]

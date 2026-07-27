@@ -33,7 +33,7 @@ specification.
   disconnected scaffolding.
 - Bootstrap in Rust. The user-facing binary and unified package tool is `el`.
 - Use the pinned toolchain and dependency versions required by the design:
-  `pest`/`pest_derive` 2.8.7, LLVM 22.1.0, and Inkwell 0.9.0 with
+  `pest`/`pest_derive` 2.8.7, LLVM 22.1.8, and Inkwell 0.9.0 with
   `llvm22-1-prefer-dynamic`. Record exact Rust dependencies in the lockfile.
 - Keep the compiler stages distinct:
 

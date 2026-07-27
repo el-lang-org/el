@@ -1973,7 +1973,7 @@ while Core IR removes syntax sugar before backend code generation.
 - Expression precedence: encode explicit precedence levels in the grammar or
   use the parser library's Pratt parsing support; do not use left recursion.
 - Backend: LLVM through Rust bindings.
-- LLVM version: 22.1.0.
+- LLVM version: 22.1.8.
 - Rust binding: Inkwell 0.9.0 with the `llvm22-1-prefer-dynamic` feature. The
   exact crate version is pinned in the Rust lockfile, and compiler distributions
   provide the matching LLVM shared library.
@@ -2470,7 +2470,7 @@ These require explicit decisions before the affected implementation begins:
 
 1. Resolved by D-035: the language name is EL and source files use `.el`.
 2. Resolved by D-007: use `pest` 2.8.7 with `pest_derive` 2.8.7.
-3. Resolved by D-008: use LLVM 22.1.0 through Inkwell 0.9.0.
+3. Resolved by D-008: use LLVM 22.1.8 through Inkwell 0.9.0.
 4. Resolved by D-024: structs are immutable value types with no observable
    identity; physical storage is a compiler choice.
 5. Resolved by D-025: integer arithmetic is checked in all builds, with explicit
@@ -2668,8 +2668,9 @@ These require explicit decisions before the affected implementation begins:
 ### D-008 — Inkwell LLVM bindings
 
 - Date: 2026-07-26
+- Updated: 2026-07-27
 - Status: accepted
-- Decision: Use LLVM 22.1.0 through Inkwell 0.9.0 with the
+- Decision: Use LLVM 22.1.8 through Inkwell 0.9.0 with the
   `llvm22-1-prefer-dynamic` feature. Pin Inkwell exactly in the Rust lockfile and
   distribute the matching LLVM shared library with `el`.
 - Reason: Its safer, higher-level API reduces incidental unsafe Rust while we
@@ -2678,6 +2679,10 @@ These require explicit decisions before the affected implementation begins:
 - Consequence: Inkwell and `llvm-sys` types remain private to the LLVM backend;
   Core IR does not expose them. Because Inkwell is pre-1.0 and LLVM major
   upgrades may be disruptive, upgrades are explicit design and build changes.
+- Revision: The initial 22.1.0 selection was updated to the latest LLVM 22.1
+  patch release, 22.1.8, after validating the backend against the installed
+  Homebrew distribution. This does not change the Inkwell feature family or
+  source-language behavior.
 - Validation: The first backend slice must create and verify a module, emit an
   object for the host target, attach basic debug locations, and link a runnable
   executable.

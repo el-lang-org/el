@@ -17,6 +17,13 @@ impl FileId {
     fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Returns the stable compilation-local numeric identity used by private
+    /// compiler metadata and runtime source tables.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
 }
 
 /// A half-open byte range in one source file.

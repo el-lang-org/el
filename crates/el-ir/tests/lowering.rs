@@ -1,6 +1,9 @@
-use el_ir::{Terminator, ValueId, lower, verify};
+use el_ir::{
+    EntryPointError, FunctionId, Operation, Terminator, ValueId, executable_reachability_roots,
+    lower, monomorphize, verify, verify_concrete,
+};
 use el_parser::parse;
-use el_resolve::resolve;
+use el_resolve::{resolve, resolve_package};
 use el_span::SourceMap;
 use el_types::{Type, TypeId, check};
 
@@ -11,6 +14,245 @@ fn lowered(source: &str) -> el_ir::GenericModule {
     let resolved = resolve(&parsed).expect("fixture resolves");
     let typed = check(&resolved).expect("fixture type checks");
     lower(&typed)
+}
+
+fn lowered_package(sources: &[&str]) -> el_ir::GenericModule {
+    let mut source_map = SourceMap::new();
+    let parsed = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let file = source_map.add_file(format!("src/{index}.el"), *source);
+            parse(file, source).expect("fixture parses")
+        })
+        .collect::<Vec<_>>();
+    let resolved = resolve_package(&parsed).expect("fixture resolves");
+    let typed = el_types::check_package(&resolved).expect("fixture type checks");
+    lower(&typed)
+}
+
+#[test]
+fn selects_main_main_as_the_deterministic_executable_root() {
+    let module = lowered_package(&[
+        "defmodule Library do\n  def main() -> i32 do\n    1\n  end\n  def answer() -> i32 do\n    42\n  end\nend\n",
+        "defmodule Main do\n  def helper() -> i32 do\n    0\n  end\n  def main() -> i32 do\n    Library.answer()\n  end\nend\n",
+    ]);
+
+    let roots = executable_reachability_roots(&module).expect("valid executable entry");
+
+    assert_eq!(roots.functions, vec![FunctionId(3)]);
+    assert_eq!(module.functions[3].module_name, "Main");
+}
+
+#[test]
+fn rejects_missing_private_and_invalid_executable_entries() {
+    let missing = lowered("defmodule Library do\n  def main() -> i32 do\n    0\n  end\nend\n");
+    assert_eq!(
+        executable_reachability_roots(&missing),
+        Err(EntryPointError::Missing)
+    );
+
+    let private = lowered("defmodule Main do\n  defp main() -> i32 do\n    0\n  end\nend\n");
+    assert!(matches!(
+        executable_reachability_roots(&private),
+        Err(EntryPointError::Private { .. })
+    ));
+
+    let parameters = lowered(
+        "defmodule Main do\n  def main(argument: i32) -> i32 do\n    argument\n  end\nend\n",
+    );
+    assert!(matches!(
+        executable_reachability_roots(&parameters),
+        Err(EntryPointError::HasParameters { count: 1, .. })
+    ));
+
+    let result = lowered("defmodule Main do\n  def main() -> i64 do\n    0\n  end\nend\n");
+    assert!(matches!(
+        executable_reachability_roots(&result),
+        Err(EntryPointError::WrongResult { .. })
+    ));
+}
+
+#[test]
+fn monomorphizes_only_reachable_generic_functions_in_key_order() {
+    let module = lowered(
+        "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def dead() -> i64 do\n    99\n  end\n  def main() -> i32 do\n    identity(42)\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&module).expect("valid entry");
+
+    let concrete = monomorphize(&module, &roots).expect("reachable graph specializes");
+
+    assert_eq!(concrete.functions.len(), 2);
+    assert_eq!(concrete.functions[0].name, "identity");
+    assert_eq!(concrete.functions[0].parameters[0].ty, TypeId(0));
+    assert_eq!(concrete.functions[0].result, TypeId(0));
+    assert_eq!(concrete.functions[1].name, "main");
+    assert_eq!(concrete.roots.functions, vec![FunctionId(1)]);
+    let Operation::Call {
+        function,
+        substitutions,
+        ..
+    } = &concrete.functions[1].blocks[0].operations[1]
+    else {
+        panic!("main calls identity")
+    };
+    assert_eq!(*function, FunctionId(0));
+    assert!(substitutions.is_empty());
+}
+
+#[test]
+fn specializes_reachable_generic_nominal_layouts() {
+    let module = lowered(
+        "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  def loop() -> a do\n    loop()\n  end\n  def make() -> Box(i32) do\n    loop()\n  end\n  def main() -> i32 do\n    make()\n    0\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&module).expect("valid entry");
+
+    let concrete = monomorphize(&module, &roots).expect("generic layout specializes");
+
+    assert_eq!(concrete.structs.len(), 1);
+    assert_eq!(concrete.structs[0].name, "Box");
+    assert_eq!(concrete.structs[0].arguments, vec![TypeId(0)]);
+    assert_eq!(concrete.structs[0].fields[0].1, TypeId(0));
+    assert!(
+        concrete
+            .types
+            .iter()
+            .all(|ty| !matches!(ty, Type::Parameter { .. }))
+    );
+}
+
+#[test]
+fn reuses_identical_specializations_and_recursive_worklist_entries() {
+    let module = lowered(
+        "defmodule Main do\n  def recur(value: a) -> a do\n    if true do\n      value\n    else\n      recur(value)\n    end\n  end\n  def main() -> i32 do\n    recur(1 :: i32)\n    recur(2 :: i32)\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&module).expect("valid entry");
+
+    let concrete = monomorphize(&module, &roots).expect("recursive generic specializes");
+
+    assert_eq!(
+        concrete
+            .functions
+            .iter()
+            .filter(|function| function.name == "recur")
+            .count(),
+        1
+    );
+    let recursive = concrete
+        .functions
+        .iter()
+        .find(|function| function.name == "recur")
+        .expect("recur specialization");
+    assert!(recursive.blocks.iter().any(|block| block.operations.iter().any(
+        |operation| matches!(operation, Operation::Call { function, substitutions, .. } if *function == recursive.id && substitutions.is_empty())
+    )));
+    verify_concrete(&concrete).expect("reused recursive specialization verifies");
+}
+
+#[test]
+fn specialization_order_is_independent_of_call_discovery_order() {
+    let first = lowered(
+        "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    identity(1 :: i64)\n    identity(2 :: i32)\n  end\nend\n",
+    );
+    let second = lowered(
+        "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    identity(2 :: i32)\n    identity(1 :: i64)\n    2\n  end\nend\n",
+    );
+
+    let first = monomorphize(
+        &first,
+        &executable_reachability_roots(&first).expect("first entry"),
+    )
+    .expect("first graph");
+    let second = monomorphize(
+        &second,
+        &executable_reachability_roots(&second).expect("second entry"),
+    )
+    .expect("second graph");
+
+    let first_specializations = first
+        .functions
+        .iter()
+        .filter(|function| function.name == "identity")
+        .map(|function| function.specialization_arguments.clone())
+        .collect::<Vec<_>>();
+    let second_specializations = second
+        .functions
+        .iter()
+        .filter(|function| function.name == "identity")
+        .map(|function| function.specialization_arguments.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(first_specializations, second_specializations);
+}
+
+#[test]
+fn concrete_verifier_rejects_residuals_duplicates_and_abstract_layouts() {
+    let module = lowered(
+        "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    identity(1)\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&module).expect("valid entry");
+    let concrete = monomorphize(&module, &roots).expect("baseline concrete module");
+
+    let mut residual_type = concrete.clone();
+    residual_type.types.push(Type::Parameter {
+        owner: residual_type.functions[0].declaration,
+        name: "a".to_owned(),
+    });
+    assert!(
+        verify_concrete(&residual_type)
+            .expect_err("residual type parameter is rejected")
+            .iter()
+            .any(|error| error.contains("residual type parameter"))
+    );
+
+    let mut residual_call = concrete.clone();
+    let call = residual_call
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .and_then(|function| {
+            function.blocks[0]
+                .operations
+                .iter_mut()
+                .find_map(|operation| match operation {
+                    Operation::Call { substitutions, .. } => Some(substitutions),
+                    _ => None,
+                })
+        })
+        .expect("main call");
+    call.push((TypeId(0), TypeId(0)));
+    assert!(
+        verify_concrete(&residual_call)
+            .expect_err("residual call substitution is rejected")
+            .iter()
+            .any(|error| error.contains("residual type substitution"))
+    );
+
+    let mut duplicate = concrete.clone();
+    let mut repeated = duplicate.functions[0].clone();
+    repeated.id = FunctionId(99);
+    duplicate.functions.push(repeated);
+    assert!(
+        verify_concrete(&duplicate)
+            .expect_err("duplicate specialization is rejected")
+            .iter()
+            .any(|error| error.contains("duplicates an existing specialization"))
+    );
+
+    let layout_module = lowered(
+        "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  def loop() -> a do\n    loop()\n  end\n  def make() -> Box(i32) do\n    loop()\n  end\n  def main() -> i32 do\n    make()\n    0\n  end\nend\n",
+    );
+    let mut abstract_layout = monomorphize(
+        &layout_module,
+        &executable_reachability_roots(&layout_module).expect("layout entry"),
+    )
+    .expect("baseline layout module");
+    abstract_layout.structs.clear();
+    assert!(
+        verify_concrete(&abstract_layout)
+            .expect_err("abstract layout is rejected")
+            .iter()
+            .any(|error| error.contains("has no concrete layout"))
+    );
 }
 
 #[test]

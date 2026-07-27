@@ -58,7 +58,7 @@ while Core IR removes syntax sugar before backend code generation.
 - Expression precedence: encode explicit precedence levels in the grammar or
   use the parser library's Pratt parsing support; do not use left recursion.
 - Backend: LLVM through Rust bindings.
-- LLVM version: 22.1.0.
+- LLVM version: 22.1.8.
 - Rust binding: Inkwell 0.9.0 with the `llvm22-1-prefer-dynamic` feature. The
   exact crate version is pinned in the Rust lockfile, and compiler distributions
   provide the matching LLVM shared library.

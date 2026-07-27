@@ -3,6 +3,7 @@
 use el_ast::{Node, Value};
 use el_resolve::{
     DeclId, Function, ImplId, ModuleId, ResolvedProgram, Struct, SymbolId, TypeAlias, TypeSyntax,
+    Visibility,
 };
 use el_span::{Diagnostic, Span};
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,7 +81,9 @@ pub struct TypedField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedFunction {
     pub id: DeclId,
+    pub module_name: String,
     pub name: String,
+    pub visibility: Visibility,
     pub span: Span,
     pub parameters: Vec<TypedParameter>,
     pub type_parameters: Vec<TypeId>,
@@ -711,7 +714,9 @@ impl<'a> Checker<'a> {
         )?;
         Some(TypedFunction {
             id: function.id,
+            module_name: function.module_name.clone(),
             name: function.name.clone(),
+            visibility: function.visibility,
             span: function.span,
             parameters,
             type_parameters: signature.type_parameters,

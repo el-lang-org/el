@@ -2,6 +2,7 @@
 members = [
     "crates/el-ast",
     "crates/el-cli",
+    "crates/el-codegen",
     "crates/el-driver",
     "crates/el-ir",
     "crates/el-parser",

@@ -53,7 +53,7 @@ The following choices are already accepted and are not reopened by this plan:
 - Bootstrap language: Rust.
 - User-facing compiler and package tool: `el`.
 - Parser: PEG using exactly `pest` 2.8.7 and `pest_derive` 2.8.7.
-- Backend: LLVM 22.1.0 through exactly Inkwell 0.9.0 with
+- Backend: LLVM 22.1.8 through exactly Inkwell 0.9.0 with
   `llvm22-1-prefer-dynamic`.
 - Compilation: native AOT for the compiler host only.
 - Linking: initially invoke the installed platform C compiler driver.
@@ -79,10 +79,8 @@ language behavior:
    an environment observation, not yet the project pin.
 2. **Boehm GC pin.** Select an exact upstream release and source revision,
    record its license and checksum, and document the supported host build path.
-3. **LLVM discovery.** Document how LLVM 22.1.0 is located for local builds and
-   CI, including the environment expected by `llvm-sys`. The current workstation
-   does not expose `llvm-config`, so backend work is locally blocked until the
-   matching LLVM installation is made discoverable.
+3. **LLVM discovery.** Document how LLVM 22.1.8 is located for local builds and
+   CI, including the environment expected by `llvm-sys`.
 4. **Supported bootstrap host.** Start with the active host, but do not claim a
    supported target until compiler, linker, runtime, GC stress, and conformance
    tests pass there.
@@ -287,7 +285,7 @@ shell without implementing the language.
   vertical slice instead of landing empty future scaffolding.
 - [x] Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and
   `pest_derive` only when the parser crate is introduced.
-- [x] Record LLVM 22.1.0 and Inkwell 0.9.0 requirements without forcing ordinary
+- [x] Record LLVM 22.1.8 and Inkwell 0.9.0 requirements without forcing ordinary
   frontend-only tests to link LLVM.
 - [x] Select, document, and prepare the exact vendored Boehm GC release without
   exposing it through source-language APIs.
@@ -485,33 +483,86 @@ executable.
 
 **Deliverables**
 
-- [ ] Implement deterministic reachability roots beginning at `Main.main() -> i32`.
-- [ ] Monomorphize reachable unconstrained generic functions and concrete generic
+- [x] Implement deterministic reachability roots beginning at `Main.main() -> i32`.
+- [x] Monomorphize reachable unconstrained generic functions and concrete generic
   layouts using `(declaration identity, normalized substitution)` worklist keys.
-- [ ] Reuse identical specializations and reject any residual type parameter,
+- [x] Reuse identical specializations and reject any residual type parameter,
   projection, constraint call, derive request, or abstract layout.
-- [ ] Compute target layout for `i32`, `i64`, `bool`, and `unit`.
-- [ ] Lower Concrete Core IR arithmetic, direct calls, slots, blocks, and returns to
+- [x] Compute target layout for `i32`, `i64`, `bool`, and `unit`.
+- [x] Lower Concrete Core IR arithmetic, direct calls, slots, blocks, and returns to
   private Inkwell-backed LLVM code.
-- [ ] Emit mandatory integer checks with source origins and no debug/release semantic
+- [x] Emit mandatory integer checks with source origins and no debug/release semantic
   difference.
-- [ ] Initialize the host target, verify LLVM modules, emit object files, and invoke
+- [ ] Attach basic LLVM debug locations to generated functions and operations as
+  required by accepted decision D-008.
+- [x] Initialize the host target, verify LLVM modules, emit object files, and invoke
   the host compiler driver as linker.
-- [ ] Add the native process entry shim that calls EL `Main.main` and forwards its
+- [x] Add the native process entry shim that calls EL `Main.main` and forwards its
   `i32` result.
-- [ ] Record target triple and pointer width in reproducibility metadata.
-- [ ] Implement development and release output directories from the CLI contract.
+- [x] Record target triple and pointer width in reproducibility metadata.
+- [x] Implement development and release output directories from the CLI contract.
 
 **Tests**
 
-- [ ] Monomorphization reuse, recursion, deterministic order, and malformed
+- [x] Monomorphization reuse, recursion, deterministic order, and malformed
   Concrete Core IR rejection.
-- [ ] LLVM module verification and only narrowly targeted LLVM text assertions.
-- [ ] Linker failure diagnostics without panics.
-- [ ] Debug and release executable parity for arithmetic and exit status.
+- [x] LLVM module verification and only narrowly targeted LLVM text assertions.
+- [x] Linker failure diagnostics without panics.
+- [x] Debug and release executable parity for arithmetic and exit status.
 
 - [ ] **Exit gate:** compile and run a program whose process exit status is calculated
   by EL code.
+
+**Implementation progress (2026-07-27)**
+
+- [x] Preserved function module ownership and visibility through Typed AST and
+  Generic Core IR, and added deterministic executable-root selection that requires
+  an exported, nongeneric `Main.main() -> i32` with no parameters.
+- [x] Added deterministic declaration-and-normalized-substitution worklists that
+  emit only reachable unconstrained function specializations and instantiate the
+  concrete nominal layouts referenced by their signatures and operations.
+- [x] Added specialization identity metadata and a Concrete Core verifier covering
+  deduplication, recursive reachability, exact concrete calls and layouts, and all
+  residual generic constructs representable by the current Core instruction set.
+- [x] Added the stage-owned `el-codegen` crate and an explicit host primitive ABI
+  boundary that computes checked size/alignment facts for Concrete Core `i32`,
+  `i64`, `bool`, and `unit` types without assuming fixed `TypeId` positions.
+- [x] Added feature-gated Inkwell 0.9.0 lowering for primitive constants and
+  arithmetic, direct calls, mutable slots, block-parameter PHIs, branches, and
+  returns. The private boundary verifies every generated LLVM module and reports
+  unsupported later-milestone Core operations as structured backend errors. The
+  no-link API check passes locally; LLVM-linked tests pass against the installed
+  pinned Homebrew LLVM 22.1.8 environment.
+- [x] Added profile-independent signed overflow intrinsics for addition,
+  subtraction, and multiplication; guarded division/remainder zero and `MIN / -1`
+  cases before LLVM can observe undefined behavior; and routed failures to stable
+  `integer_overflow` or `division_by_zero` runtime categories with the operation's
+  file and byte-span origin. Pure debug/release tests and the no-link LLVM API check
+  pass locally, including LLVM-linked checks against pinned Homebrew LLVM 22.1.8.
+- [x] Added LLVM host-target initialization, target triple/data-layout assignment,
+  re-verification before object emission, and host object-file output. Added a
+  shell-free C compiler-driver linker boundary with a conventional `CC` override
+  and structured launch/status/stdout/stderr failures. Linker failure tests and the
+  no-link LLVM API check pass locally; production object emission passes against
+  the pinned Homebrew LLVM 22.1.8 environment.
+- [x] Added a verified native `main` shim that selects the rooted, public,
+  nongeneric `Main.main() -> i32` specialization, calls it without arguments, and
+  returns the exact `i32` result to the host process. Malformed executable roots
+  produce structured backend errors rather than an invalid native entry point.
+- [x] Added deterministic target metadata populated from LLVM's selected host
+  target machine, including its target triple and validated 32- or 64-bit pointer
+  width. The backend returns these facts with emitted objects and can record them
+  in a stable metadata file or display them in build diagnostics.
+- [x] Added driver-owned build output preparation beneath
+  `build/<target-triple>/debug/` and `build/<target-triple>/release/`, with the
+  package-named host executable, deterministic object and metadata locations,
+  safe package-ID validation, directory creation, and structured filesystem errors.
+- [x] Added distinct O1 development and O3 release optimization pipelines, support
+  for linking generated code with private runtime objects, and a native end-to-end
+  test. Both profiles execute EL multiplication with status 42 and classify checked
+  `i32` overflow identically. The computed process-exit portion of the exit gate now
+  passes on the pinned LLVM 22.1.8 host; basic LLVM debug locations from D-008 remain
+  before Milestone 3 can be closed.
 
 ### Milestone 4 — Core control flow and matching
 
@@ -886,7 +937,7 @@ output.
 **Mitigation:** intern normalized substitution keys, mark worklist states before
 descending, process roots/references in stable order, and test recursive reuse.
 
-### 11.6 LLVM 22.1.0 availability
+### 11.6 LLVM 22.1.8 availability
 
 **Risk:** frontend work could become coupled to a missing native toolchain.
 
@@ -947,7 +998,13 @@ unchecked and add `(in progress)` after the item when useful.
   scalar/union and structural pattern facts, package-wide resolution and frontend
   orchestration, and expanded verifier snapshots in verified Generic Core IR
   without LLVM.
-- [ ] **3 — First native executable:** computed native process exit status.
+- [ ] **3 — First native executable (in progress):** deterministic
+  `Main.main() -> i32` reachability and initial generic function/layout
+  monomorphization, host primitive target layouts, LLVM lowering with mandatory
+  integer failure paths, host object emission, C-driver linking, and the native
+  process entry shim, target reproducibility metadata, and profile output directories
+  are implemented, and debug/release native execution has parity; accepted D-008's
+  basic LLVM debug-location requirement remains before closing the milestone.
 - [ ] **4 — Core control and matching:** factorial, tagged parser, union match.
 - [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
 - [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
@@ -969,7 +1026,7 @@ Implementation can begin when all of the following are true:
   are explicit.
 - [x] Exact Rust toolchain is selected and pinned.
 - [x] Exact Boehm GC release/source is selected and pinned.
-- [ ] LLVM 22.1.0 is installed or provisioned for backend CI and local backend
+- [x] LLVM 22.1.8 is installed or provisioned for backend CI and local backend
   work.
 - [x] Milestone 0 workspace and CI are created.
 

@@ -22,7 +22,7 @@ third-party Rust dependencies.
 
 ## LLVM prerequisite for later backend work
 
-EL is pinned to LLVM 22.1.0 and Inkwell 0.9.0 with
+EL is pinned to LLVM 22.1.8 and Inkwell 0.9.0 with
 `llvm22-1-prefer-dynamic`. Inkwell is intentionally not a Milestone 0
 dependency, so frontend development does not require LLVM.
 
@@ -36,9 +36,20 @@ LLVM installations exist. Before enabling backend work, verify:
 "${LLVM_SYS_221_PREFIX}/bin/llvm-config" --shared-mode
 ```
 
-The first command must report `22.1.0`. The active Darwin arm64 workstation
-does not currently expose `llvm-config`, so LLVM-dependent checks remain
-blocked there. This does not block any Milestone 0 check.
+The first command must report `22.1.8`. The active Darwin arm64 workstation has
+the pinned Homebrew LLVM at `/opt/homebrew/opt/llvm`. Set `LLVM_SYS_221_PREFIX`
+to that prefix for local backend checks.
+
+Enable the production backend with `el-codegen`'s `llvm` feature. A host without
+LLVM can still type-check the private Inkwell API boundary without linking or
+executing it:
+
+```sh
+cargo check -p el-codegen --features llvm-api-check --tests
+```
+
+The `llvm-api-check` feature is a contributor check only; it does not produce a
+usable compiler backend.
 
 ## Boehm GC prerequisite for later runtime work
 
@@ -61,4 +72,3 @@ make check
 Runtime integration will encapsulate this native build behind `el-runtime` in
 Milestone 5. Passing the commands above alone does not make Darwin arm64 a
 supported EL target.
-
