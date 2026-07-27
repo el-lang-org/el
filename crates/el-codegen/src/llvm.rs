@@ -252,6 +252,34 @@ pub fn emit_host_object_with_profile(
     Ok(metadata)
 }
 
+/// Returns the selected compiler-host target facts without exposing LLVM types.
+pub fn host_target_metadata() -> Result<TargetMetadata, BackendError> {
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(BackendError::HostTargetInitialization)?;
+    let triple = TargetMachine::get_default_triple();
+    let target = Target::from_triple(&triple)
+        .map_err(|error| BackendError::HostTarget(error.to_string()))?;
+    let machine = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            OptimizationLevel::Less,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or(BackendError::HostTargetMachineUnavailable)?;
+    let triple_text = triple
+        .as_str()
+        .to_str()
+        .map_err(|_| BackendError::HostTripleNotUtf8)?;
+    TargetMetadata::new(
+        triple_text,
+        machine.get_target_data().get_pointer_byte_size(None) * 8,
+    )
+    .map_err(BackendError::InvalidTargetMetadata)
+}
+
 fn optimization_level(profile: CodegenProfile) -> OptimizationLevel {
     match profile {
         CodegenProfile::Development => OptimizationLevel::Less,

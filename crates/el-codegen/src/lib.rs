@@ -22,7 +22,8 @@ mod integer_checks;
 mod llvm;
 #[cfg(any(feature = "llvm", feature = "llvm-api-check"))]
 pub use llvm::{
-    BackendError, VerifiedLlvmIr, emit_host_object, emit_host_object_with_profile, lower_to_llvm_ir,
+    BackendError, VerifiedLlvmIr, emit_host_object, emit_host_object_with_profile,
+    host_target_metadata, lower_to_llvm_ir,
 };
 
 /// The allocation size and ABI alignment of a concrete value, in bytes.

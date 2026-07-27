@@ -17,5 +17,9 @@ el-types = { path = "../el-types", version = "=0.1.0" }
 default = []
 llvm = ["el-codegen/llvm"]
 
+[[example]]
+name = "compile_source"
+required-features = ["llvm"]
+
 [lints]
 workspace = true
