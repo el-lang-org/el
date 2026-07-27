@@ -1,0 +1,9 @@
+program @0..62
+  module @0..60
+    type_path @10..14
+      type_name @10..14 "Main"
+    function_decl @21..55
+      visibility @21..24 "public"
+      identifier @25..29 "text"
+      block @34..50
+        string @40..48 spelling="\"λ🙂\"" decoded="λ🙂"

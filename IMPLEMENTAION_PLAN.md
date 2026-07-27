@@ -318,42 +318,42 @@ spanned AST that later stages can trust.
 
 **Deliverables**
 
-1. [ ] Implement source decoding rules: UTF-8, BOM rejection, LF/CRLF handling,
+1. [x] Implement source decoding rules: UTF-8, BOM rejection, LF/CRLF handling,
    horizontal whitespace, comments, identifiers, keywords, and attributes.
-2. [ ] Implement literal tokens and decoding for integers, floats, strings, runes,
+2. [x] Implement literal tokens and decoding for integers, floats, strings, runes,
    atoms, booleans, and `unit`, preserving spelling and decoded value.
-3. [ ] Encode significant-newline behavior explicitly. Test delimiter depth,
+3. [x] Encode significant-newline behavior explicitly. Test delimiter depth,
    commas, trailing operators, comment-only lines, leading operators, and
    semicolon rejection.
-4. [ ] Add declarations and types: modules, functions, structs, aliases, protocols,
+4. [x] Add declarations and types: modules, functions, structs, aliases, protocols,
    implementations, generics, constraints, associated types, composites,
    functions, unions, and fixed literal array lengths.
-5. [ ] Add expressions and blocks with the exact precedence and associativity
+5. [x] Add expressions and blocks with the exact precedence and associativity
    ladder, including postfix forms, `::`, and `|>`.
-6. [ ] Add every collection constructor, control-flow form, pattern family,
+6. [x] Add every collection constructor, control-flow form, pattern family,
    `defer`, and byte-aligned bitstring form.
-7. [ ] Convert `pest` pairs into parser-independent AST types with byte spans.
-8. [ ] Run grammar validation before semantic analysis: pipeline target shape,
+7. [x] Convert `pest` pairs into parser-independent AST types with byte spans.
+8. [x] Run grammar validation before semantic analysis: pipeline target shape,
    assignment target shape, protocol body contents, chained non-associative
    operators, bitstring modifiers, semicolons, leading-operator continuation,
    and remaining recovery nodes.
-9. [ ] Add focused recovery at declaration and block boundaries. Recovered trees
+9. [x] Add focused recovery at declaration and block boundaries. Recovered trees
    may produce diagnostics but cannot become conforming ASTs.
-10. [ ] Add deterministic AST debug output.
+10. [x] Add deterministic AST debug output.
 
 **Tests**
 
-- [ ] Accepted and rejected fixture for every grammar production and validation
+- [x] Accepted and rejected fixture for every grammar production and validation
   rule.
-- [ ] Adjacent precedence-level snapshots and associativity cases.
-- [ ] Longest-token conflicts: `|`/`|>`, `:`/`::`/`:=`, `#`/`#[`, shifts, arrows,
+- [x] Adjacent precedence-level snapshots and associativity cases.
+- [x] Longest-token conflicts: `|`/`|>`, `:`/`::`/`:=`, `#`/`#[`, shifts, arrows,
   comparisons, and concatenation.
-- [ ] Literal boundaries, escapes, separators, overflow-independent tokenization,
+- [x] Literal boundaries, escapes, separators, overflow-independent tokenization,
   and invalid identifier forms.
-- [ ] Span snapshots including multibyte text and CRLF.
-- [ ] Recovery tests proving malformed input never reaches name resolution.
+- [x] Span snapshots including multibyte text and CRLF.
+- [x] Recovery tests proving malformed input never reaches name resolution.
 
-- [ ] **Exit gate:** parse a typed `Main.main() -> i32` and snapshot its complete AST.
+- [x] **Exit gate:** parse a typed `Main.main() -> i32` and snapshot its complete AST.
 
 ### Milestone 2 — Names, types, Typed AST, and initial Core IR
 
@@ -735,14 +735,14 @@ The first reviewable changes should be small enough to verify independently:
 3. [ ] **Source foundation (in progress):** source database, `FileId`, `Span`, line mapping,
    structured diagnostics, and renderer snapshots.
 4. [x] **Project discovery:** ancestor manifest search and minimal project errors.
-5. [ ] **Lexical grammar:** source encoding, whitespace/comments, identifiers,
+5. [x] **Lexical grammar:** source encoding, whitespace/comments, identifiers,
    keywords, literal tokens, and newline model.
-6. [ ] **Declaration/type grammar:** module, functions, signatures, bindings, scalar
+6. [x] **Declaration/type grammar:** module, functions, signatures, bindings, scalar
    types, and the first typed-main parse.
-7. [ ] **Expression grammar:** precedence, postfix forms, blocks, and arithmetic.
-8. [ ] **AST adapter:** parser-independent AST, span propagation, deterministic
+7. [x] **Expression grammar:** precedence, postfix forms, blocks, and arithmetic.
+8. [x] **AST adapter:** parser-independent AST, span propagation, deterministic
    snapshots, and the Milestone 1 starter exit test.
-9. [ ] **Remaining v1 grammar:** composites, generics, protocols, patterns,
+9. [x] **Remaining v1 grammar:** composites, generics, protocols, patterns,
    bitstrings, control flow, validation, and recovery conformance.
 10. [ ] **Semantic foundations:** typed IDs, declaration collection, namespaces,
     canonical type arena, and the first Typed AST slice.
@@ -872,7 +872,7 @@ unchecked and add `(in progress)` after the item when useful.
 
 - [ ] **0 — Project skeleton (in progress):** local exit gate passes; CI workflow
   awaits its first remote run.
-- [ ] **1 — Parser and AST:** typed-main AST snapshot.
+- [x] **1 — Parser and AST:** typed-main AST snapshot.
 - [ ] **2 — Names and types:** accepted/rejected semantic suite without LLVM.
 - [ ] **3 — First native executable:** computed native process exit status.
 - [ ] **4 — Core control and matching:** factorial, tagged parser, union match.

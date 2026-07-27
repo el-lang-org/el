@@ -1,0 +1,35 @@
+logical_or_expr @43..94 "or"
+  qualified_value @43..44
+    identifier @43..44 "a"
+  logical_and_expr @48..94 "and"
+    qualified_value @48..49
+      identifier @48..49 "b"
+    equality_expr @54..94 "=="
+      qualified_value @54..55
+        identifier @54..55 "c"
+      comparison_expr @59..94 "<"
+        qualified_value @59..60
+          identifier @59..60 "d"
+        concat_expr @63..94 "++"
+          qualified_value @63..64
+            identifier @63..64 "e"
+          bit_or_expr @68..94 "|"
+            qualified_value @68..69
+              identifier @68..69 "f"
+            bit_xor_expr @72..94 "^"
+              qualified_value @72..73
+                identifier @72..73 "g"
+              bit_and_expr @76..94 "&"
+                qualified_value @76..77
+                  identifier @76..77 "h"
+                shift_expr @80..94 "<<"
+                  qualified_value @80..81
+                    identifier @80..81 "i"
+                  additive_expr @85..94 "+"
+                    qualified_value @85..86
+                      identifier @85..86 "j"
+                    multiplicative_expr @89..94 "*"
+                      qualified_value @89..90
+                        identifier @89..90 "k"
+                      qualified_value @93..94
+                        identifier @93..94 "l"

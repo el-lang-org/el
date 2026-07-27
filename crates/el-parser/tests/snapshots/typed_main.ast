@@ -1,0 +1,13 @@
+program @0..62
+  module @0..61
+    type_path @10..14
+      type_name @10..14 "Main"
+    function_decl @20..57
+      visibility @20..23 "public"
+      identifier @24..28 "main"
+      return_type @31..38
+        primitive_type @34..37 "i32"
+      block @40..52
+        additive_expr @45..51 "+"
+          integer @45..47 spelling="40" radix=10 digits="40"
+          integer @50..51 spelling="2" radix=10 digits="2"

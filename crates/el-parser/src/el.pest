@@ -1,0 +1,214 @@
+program = { SOI ~ nl* ~ module ~ nl* ~ EOI }
+
+module = { kw_defmodule ~ module_name ~ kw_do ~ module_body ~ kw_end }
+module_body = { nl* ~ (module_item ~ (nl+ ~ module_item)*)? ~ nl* }
+module_item = { derived_struct | struct_decl | type_alias | function_decl | protocol_decl | protocol_impl | recovery_module_item }
+derived_struct = { derive_attr ~ nl+ ~ struct_decl }
+derive_attr = { attr_derive ~ soft* ~ "[" ~ soft* ~ type_path ~ (soft* ~ "," ~ soft* ~ type_path)* ~ soft* ~ "]" }
+
+struct_decl = { kw_defstruct ~ type_name ~ type_params? ~ when_clause? ~ kw_do ~ field_body ~ kw_end }
+field_body = { nl* ~ (field_decl ~ (nl+ ~ field_decl)*)? ~ nl* }
+field_decl = { identifier ~ ":" ~ type_expr }
+type_alias = { attr_type ~ type_name ~ type_params? ~ "=" ~ type_expr }
+
+function_decl = { visibility ~ function_head ~ kw_do ~ block ~ kw_end }
+visibility = { kw_defp | kw_def }
+function_head = { identifier ~ "(" ~ soft* ~ parameters? ~ soft* ~ ")" ~ return_type? ~ when_clause? }
+parameters = { parameter ~ (soft* ~ "," ~ soft* ~ parameter)* }
+parameter = { identifier ~ ":" ~ type_expr }
+return_type = { arrow ~ soft* ~ type_expr }
+
+protocol_decl = { kw_defprotocol ~ type_name ~ kw_do ~ protocol_body ~ kw_end }
+protocol_body = { nl* ~ (protocol_item ~ (nl+ ~ protocol_item)*)? ~ nl* }
+protocol_item = { assoc_type_decl | protocol_signature | recovery_protocol_item }
+protocol_signature = { kw_def ~ function_head }
+assoc_type_decl = { kw_type ~ type_name }
+
+protocol_impl = { kw_defimpl ~ type_path ~ "," ~ continuation* ~ kw_for ~ ":" ~ type_expr ~ when_clause? ~ kw_do ~ implementation_body ~ kw_end }
+implementation_body = { nl* ~ (implementation_item ~ (nl+ ~ implementation_item)*)? ~ nl* }
+implementation_item = { assoc_type_def | function_decl | recovery_implementation_item }
+assoc_type_def = { kw_type ~ type_name ~ "=" ~ type_expr }
+
+type_params = { "(" ~ soft* ~ type_variable ~ (soft* ~ "," ~ soft* ~ type_variable)* ~ soft* ~ ")" }
+when_clause = { kw_when ~ constraint ~ ("," ~ soft* ~ constraint)* }
+constraint = { type_variable ~ ":" ~ type_path }
+
+type_expr = { union_type }
+union_type = { primary_type ~ (soft* ~ "|" ~ soft* ~ primary_type)* }
+primary_type = { function_type | tuple_type | list_or_array_type | atom | primitive_type | named_type | type_variable }
+function_type = { "(" ~ soft* ~ (type_expr ~ (soft* ~ "," ~ soft* ~ type_expr)*)? ~ soft* ~ ")" ~ arrow ~ soft* ~ type_expr }
+tuple_type = { "{" ~ soft* ~ type_expr ~ soft* ~ "," ~ soft* ~ type_expr ~ (soft* ~ "," ~ soft* ~ type_expr)* ~ soft* ~ "}" }
+list_or_array_type = { "[" ~ soft* ~ type_expr ~ (soft* ~ ";" ~ soft* ~ array_length)? ~ soft* ~ "]" }
+named_type = { type_path ~ ("(" ~ soft* ~ type_expr ~ (soft* ~ "," ~ soft* ~ type_expr)* ~ soft* ~ ")")? }
+type_path = { type_name ~ ("." ~ type_name)* }
+module_name = { type_path }
+type_name = @{ ASCII_ALPHA_UPPER ~ ASCII_ALPHANUMERIC* }
+type_variable = @{ !primitive_type ~ identifier }
+array_length = @{ decimal_digits ~ !identifier_continue }
+primitive_type = @{ ("bool" | "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "f32" | "f64" | "rune" | "string" | "bytes" | "bits" | "unit") ~ !identifier_continue }
+
+block = { nl* ~ (block_item ~ (nl+ ~ block_item)*)? ~ nl* }
+block_item = { binding | assignment | return_expr | defer_expr | while_expr | for_expr | expression | recovery_block_item }
+binding = { kw_mut? ~ identifier ~ (":" ~ type_expr)? ~ "=" ~ continuation* ~ expression }
+assignment = { postfix_expr ~ ":=" ~ continuation* ~ expression }
+return_expr = { kw_return ~ expression }
+defer_expr = { kw_defer ~ (call_expression | defer_block) }
+defer_block = { kw_do ~ block ~ kw_end }
+while_expr = { kw_while ~ expression ~ kw_do ~ block ~ kw_end }
+for_expr = { kw_for ~ pattern ~ kw_in ~ expression ~ kw_do ~ block ~ kw_end }
+
+expression = { pipeline_expr }
+pipeline_expr = { ascription_expr ~ (pipeline_operator ~ continuation* ~ ascription_expr)* }
+pipeline_operator = { "|>" }
+ascription_expr = { logical_or_expr ~ (ascription_operator ~ soft* ~ type_expr)* }
+ascription_operator = { "::" }
+logical_or_expr = { logical_and_expr ~ (logical_or_operator ~ continuation* ~ logical_and_expr)* }
+logical_or_operator = { kw_or }
+logical_and_expr = { equality_expr ~ (logical_and_operator ~ continuation* ~ equality_expr)* }
+logical_and_operator = { kw_and }
+equality_expr = { comparison_expr ~ (equality_operator ~ continuation* ~ comparison_expr)* }
+equality_operator = { "==" | "!=" }
+comparison_expr = { concat_expr ~ (comparison_operator ~ continuation* ~ concat_expr)* }
+comparison_operator = { "<=" | ">=" | "<" | ">" }
+concat_expr = { bit_or_expr ~ (concat_operator ~ continuation* ~ concat_expr)? }
+concat_operator = { "++" }
+bit_or_expr = { bit_xor_expr ~ (bit_or_operator ~ continuation* ~ bit_xor_expr)* }
+bit_or_operator = { !"|>" ~ "|" }
+bit_xor_expr = { bit_and_expr ~ (bit_xor_operator ~ continuation* ~ bit_and_expr)* }
+bit_xor_operator = { "^" }
+bit_and_expr = { shift_expr ~ (bit_and_operator ~ continuation* ~ shift_expr)* }
+bit_and_operator = { "&" }
+shift_expr = { additive_expr ~ (shift_operator ~ continuation* ~ additive_expr)* }
+shift_operator = { "<<" | ">>" }
+additive_expr = { multiplicative_expr ~ (additive_operator ~ continuation* ~ multiplicative_expr)* }
+additive_operator = { "+" | "-" }
+multiplicative_expr = { unary_expr ~ (multiplicative_operator ~ continuation* ~ unary_expr)* }
+multiplicative_operator = { "*" | "/" | "%" }
+unary_expr = { (unary_operator ~ continuation* ~ unary_expr) | postfix_expr }
+unary_operator = { "-" | "!" | "~" }
+
+postfix_expr = { primary_expr ~ postfix_part* }
+postfix_part = { call_arguments | field_access | index_access }
+non_call_postfix = { field_access | index_access }
+field_access = { "." ~ identifier }
+index_access = { "[" ~ soft* ~ expression ~ soft* ~ "]" }
+call_expression = { primary_expr ~ non_call_postfix* ~ call_arguments ~ postfix_part* }
+call_arguments = { "(" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ ")" }
+
+primary_expr = { if_expr | match_expr | bitstring_expr | struct_literal | map_literal | array_literal | list_literal | tuple_literal | literal | qualified_value | grouped_expr }
+grouped_expr = { "(" ~ soft* ~ expression ~ soft* ~ ")" }
+qualified_value = { identifier | (type_name ~ ".")+ ~ identifier }
+if_expr = { kw_if ~ expression ~ kw_do ~ block ~ (kw_else ~ block)? ~ kw_end }
+match_expr = { kw_match ~ expression ~ kw_do ~ nl* ~ match_arm ~ (nl+ ~ match_arm)* ~ nl* ~ kw_end }
+match_arm = { pattern ~ arrow ~ arm_body }
+arm_body = { block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | nl+ ~ !(pattern ~ arrow) ~ block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | &(nl+ ~ (pattern ~ arrow | kw_end)) }
+
+tuple_literal = { "{" ~ soft* ~ expression ~ soft* ~ "," ~ soft* ~ expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ soft* ~ "}" }
+list_literal = { "[" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ (soft* ~ "|" ~ soft* ~ expression)?)? ~ soft* ~ "]" }
+array_literal = { array_open ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ "]" }
+map_literal = { "%{" ~ soft* ~ (map_entry ~ (soft* ~ "," ~ soft* ~ map_entry)*)? ~ soft* ~ "}" }
+map_entry = { expression ~ fat_arrow ~ continuation* ~ expression }
+struct_literal = { "%" ~ type_path ~ "{" ~ soft* ~ (field_value ~ (soft* ~ "," ~ soft* ~ field_value)*)? ~ soft* ~ "}" }
+field_value = { identifier ~ ":" ~ continuation* ~ expression }
+
+pattern = { typed_pattern | bitstring_pattern | struct_pattern | tuple_pattern | list_pattern | pattern_literal | wildcard_pattern | identifier }
+typed_pattern = { identifier ~ type_colon ~ type_expr }
+pattern_literal = { unary_minus? ~ (float | integer) | string | rune | atom | kw_true | kw_false | kw_unit }
+unary_minus = { "-" }
+wildcard_pattern = { "_" }
+tuple_pattern = { "{" ~ soft* ~ pattern ~ soft* ~ "," ~ soft* ~ pattern ~ (soft* ~ "," ~ soft* ~ pattern)* ~ soft* ~ "}" }
+list_pattern = { "[" ~ soft* ~ (pattern ~ soft* ~ "|" ~ soft* ~ pattern)? ~ soft* ~ "]" }
+struct_pattern = { "%" ~ type_path ~ "{" ~ soft* ~ (field_pattern ~ (soft* ~ "," ~ soft* ~ field_pattern)*)? ~ soft* ~ "}" }
+field_pattern = { identifier ~ ":" ~ pattern }
+
+bitstring_expr = { "<<" ~ soft* ~ (bit_expr_segment ~ (soft* ~ "," ~ soft* ~ bit_expr_segment)*)? ~ soft* ~ ">>" }
+bit_expr_segment = { segment_expression ~ "::" ~ bit_modifiers }
+segment_expression = { logical_or_expr ~ (pipeline_operator ~ continuation* ~ logical_or_expr)* }
+bitstring_pattern = { "<<" ~ soft* ~ (bit_pattern_segment ~ (soft* ~ "," ~ soft* ~ bit_pattern_segment)*)? ~ soft* ~ ">>" }
+bit_pattern_segment = { pattern ~ "::" ~ bit_modifiers }
+bit_modifiers = { bit_modifier ~ ("-" ~ bit_modifier)* }
+bit_modifier = { modifier_integer | modifier_signed | modifier_unsigned | modifier_big | modifier_little | modifier_native | modifier_bytes | size_modifier }
+modifier_integer = { kw_integer }
+modifier_signed = { kw_signed }
+modifier_unsigned = { kw_unsigned }
+modifier_big = { kw_big }
+modifier_little = { kw_little }
+modifier_native = { kw_native }
+modifier_bytes = { kw_bytes }
+size_modifier = { kw_size ~ "(" ~ soft* ~ expression ~ soft* ~ ")" }
+
+literal = { float | integer | string | rune | atom | kw_true | kw_false | kw_unit }
+float = @{ (decimal_digits ~ "." ~ decimal_digits ~ exponent? | decimal_digits ~ exponent) ~ !identifier_continue }
+exponent = { ("e" | "E") ~ ("+" | "-")? ~ decimal_digits }
+integer = @{ (binary_integer | octal_integer | hexadecimal_integer | decimal_integer) ~ !identifier_continue }
+binary_integer = { "0b" ~ binary_digits }
+octal_integer = { "0o" ~ octal_digits }
+hexadecimal_integer = { "0x" ~ hexadecimal_digits }
+decimal_integer = { decimal_digits }
+binary_digits = { ASCII_BIN_DIGIT ~ ("_"? ~ ASCII_BIN_DIGIT)* }
+octal_digits = { ASCII_OCT_DIGIT ~ ("_"? ~ ASCII_OCT_DIGIT)* }
+hexadecimal_digits = { ASCII_HEX_DIGIT ~ ("_"? ~ ASCII_HEX_DIGIT)* }
+decimal_digits = { ASCII_DIGIT ~ ("_"? ~ ASCII_DIGIT)* }
+string = @{ "\"" ~ string_character* ~ "\"" }
+string_character = { escape | !("\"" | "\\" | NEWLINE) ~ ANY }
+rune = @{ "'" ~ (escape | !("'" | "\\" | NEWLINE) ~ ANY) ~ "'" }
+escape = { "\\" ~ ("\\" | "\"" | "'" | "n" | "r" | "t" | "0" | hex_escape | unicode_escape) }
+hex_escape = { "x" ~ ASCII_HEX_DIGIT ~ ASCII_HEX_DIGIT }
+unicode_escape = { "u{" ~ ASCII_HEX_DIGIT ~ ASCII_HEX_DIGIT{0, 5} ~ "}" }
+atom = @{ ":" ~ atom_identifier }
+atom_identifier = { ASCII_ALPHA_LOWER ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)* ~ ("_" ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)+)* }
+
+identifier = @{ !keyword ~ ASCII_ALPHA_LOWER ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)* ~ ("_" ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)+)* }
+identifier_continue = _{ ASCII_ALPHA | ASCII_DIGIT | "_" }
+keyword = @{ ("defmodule" | "defprotocol" | "defstruct" | "defimpl" | "defp" | "def" | "defer" | "do" | "else" | "end" | "false" | "for" | "if" | "in" | "match" | "mut" | "return" | "true" | "type" | "when" | "while") ~ !identifier_continue }
+
+attr_derive = @{ "@derive" ~ !identifier_continue }
+attr_type = @{ "@type" ~ !identifier_continue }
+kw_defmodule = @{ "defmodule" ~ !identifier_continue }
+kw_defprotocol = @{ "defprotocol" ~ !identifier_continue }
+kw_defstruct = @{ "defstruct" ~ !identifier_continue }
+kw_defimpl = @{ "defimpl" ~ !identifier_continue }
+kw_defp = @{ "defp" ~ !identifier_continue }
+kw_def = @{ "def" ~ !identifier_continue }
+kw_defer = @{ "defer" ~ !identifier_continue }
+kw_do = @{ "do" ~ !identifier_continue }
+kw_else = @{ "else" ~ !identifier_continue }
+kw_end = @{ "end" ~ !identifier_continue }
+kw_for = @{ "for" ~ !identifier_continue }
+kw_if = @{ "if" ~ !identifier_continue }
+kw_in = @{ "in" ~ !identifier_continue }
+kw_match = @{ "match" ~ !identifier_continue }
+kw_mut = @{ "mut" ~ !identifier_continue }
+kw_return = @{ "return" ~ !identifier_continue }
+kw_type = @{ "type" ~ !identifier_continue }
+kw_when = @{ "when" ~ !identifier_continue }
+kw_while = @{ "while" ~ !identifier_continue }
+kw_true = @{ "true" ~ !identifier_continue }
+kw_false = @{ "false" ~ !identifier_continue }
+kw_unit = @{ "unit" ~ !identifier_continue }
+kw_and = @{ "and" ~ !identifier_continue }
+kw_or = @{ "or" ~ !identifier_continue }
+kw_integer = @{ "integer" ~ !identifier_continue }
+kw_signed = @{ "signed" ~ !identifier_continue }
+kw_unsigned = @{ "unsigned" ~ !identifier_continue }
+kw_big = @{ "big" ~ !identifier_continue }
+kw_little = @{ "little" ~ !identifier_continue }
+kw_native = @{ "native" ~ !identifier_continue }
+kw_bytes = @{ "bytes" ~ !identifier_continue }
+kw_size = @{ "size" ~ !identifier_continue }
+
+recovery_module_item = { !kw_end ~ (!newline ~ ANY)+ }
+recovery_block_item = { !kw_end ~ !kw_else ~ (!newline ~ ANY)+ }
+recovery_protocol_item = { !kw_end ~ (!newline ~ ANY)+ }
+recovery_implementation_item = { !kw_end ~ (!newline ~ ANY)+ }
+
+array_open = _{ "#[" }
+arrow = @{ "->" }
+fat_arrow = @{ "=>" }
+type_colon = _{ ":" ~ !":" }
+continuation = _{ newline }
+soft = _{ newline }
+nl = _{ newline }
+newline = _{ "\r\n" | "\n" }
+line_comment = _{ "#" ~ !"[" ~ (!NEWLINE ~ ANY)* }
+WHITESPACE = _{ " " | "\t" | line_comment }

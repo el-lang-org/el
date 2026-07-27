@@ -1,7 +1,9 @@
 [workspace]
 members = [
+    "crates/el-ast",
     "crates/el-cli",
     "crates/el-driver",
+    "crates/el-parser",
     "crates/el-runtime",
     "crates/el-span",
 ]
@@ -15,3 +17,6 @@ rust-version = "1.97.1"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.dependencies]
+pest = "=2.8.7"
+pest_derive = "=2.8.7"
