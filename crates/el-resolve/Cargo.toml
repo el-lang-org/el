@@ -1,0 +1,16 @@
+[package]
+name = "el-resolve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+el-ast = { path = "../el-ast", version = "=0.1.0" }
+el-span = { path = "../el-span", version = "=0.1.0" }
+
+[dev-dependencies]
+el-parser = { path = "../el-parser", version = "=0.1.0" }
+
+[lints]
+workspace = true

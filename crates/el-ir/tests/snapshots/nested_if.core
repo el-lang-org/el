@@ -1,0 +1,12 @@
+fn f0 choose -> t1 {
+  b0:
+    branch_if v0, b1, b2
+  b1:
+    v1 = const Integer(1): t1
+    branch b3(v1)
+  b2:
+    v2 = const Integer(2): t1
+    branch b3(v2)
+  b3(v3: t1):
+    return v3
+}

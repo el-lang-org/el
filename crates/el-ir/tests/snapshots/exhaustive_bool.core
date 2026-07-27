@@ -1,0 +1,16 @@
+fn f0 choose -> t1 {
+  b0:
+    switch v0 [Boolean(true) => b2] default b3
+  b1(v3: t1):
+    return v3
+  b2:
+    v1 = const Integer(1): t1
+    branch b1(v1)
+  b3:
+    switch v0 [Boolean(false) => b4] default b5
+  b4:
+    v2 = const Integer(2): t1
+    branch b1(v2)
+  b5:
+    unreachable
+}

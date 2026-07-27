@@ -423,7 +423,7 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
     if rule == Rule::unary_expr && pair.clone().into_inner().count() > 1 {
         return build_unary(file, pair);
     }
-    let value = build_value(file, &pair)?;
+    let mut value = build_value(file, &pair)?;
     let mut children = Vec::new();
     for child in pair.clone().into_inner() {
         if is_ast_punctuation(child.as_rule()) {
@@ -435,6 +435,23 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
             children.extend(node.children);
         } else {
             children.push(node);
+        }
+    }
+    if rule == Rule::list_literal
+        && value.is_none()
+        && children
+            .last()
+            .is_some_and(|node| node.kind.as_str() == "bit_or_expr")
+    {
+        let final_segment = children.pop().expect("checked final list segment");
+        let mut operands = Vec::new();
+        flatten_bit_or(final_segment, &mut operands);
+        if operands.len() >= 2 {
+            let first = operands.remove(0);
+            let tail = rebuild_bit_or(file, operands);
+            children.push(first);
+            children.push(tail);
+            value = Some(Value::Text("improper".to_owned()));
         }
     }
     if children.len() == 1 && is_transparent(rule) {
@@ -452,6 +469,34 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
         value,
         children,
     })
+}
+
+fn flatten_bit_or(node: Node, output: &mut Vec<Node>) {
+    if node.kind.as_str() == "bit_or_expr"
+        && matches!(node.value, Some(Value::Text(ref operator)) if operator == "|")
+        && node.children.len() == 2
+    {
+        let mut children = node.children.into_iter();
+        flatten_bit_or(children.next().expect("binary left operand"), output);
+        output.push(children.next().expect("binary right operand"));
+    } else {
+        output.push(node);
+    }
+}
+
+fn rebuild_bit_or(file: FileId, mut operands: Vec<Node>) -> Node {
+    let mut expression = operands.remove(0);
+    for right in operands {
+        let span = Span::new(file, expression.span.start(), right.span.end())
+            .expect("bit-or operands remain in source order");
+        expression = Node {
+            kind: SyntaxKind::new("bit_or_expr"),
+            span,
+            value: Some(Value::Text("|".to_owned())),
+            children: vec![expression, right],
+        };
+    }
+    expression
 }
 
 fn is_left_associative(rule: Rule) -> bool {
@@ -540,6 +585,7 @@ fn is_ast_punctuation(rule: Rule) -> bool {
             | Rule::multiplicative_operator
             | Rule::unary_operator
             | Rule::unary_minus
+            | Rule::list_tail_separator
     )
 }
 
@@ -641,6 +687,12 @@ fn build_value(file: FileId, pair: &Pair<'_, Rule>) -> Result<Option<Value>, Par
             }
             .to_owned(),
         )),
+        Rule::list_literal
+            if descendants(pair.clone())
+                .any(|node| node.as_rule() == Rule::list_tail_separator) =>
+        {
+            Some(Value::Text("improper".to_owned()))
+        }
         Rule::integer => {
             let (radix, digits) = if let Some(digits) = spelling.strip_prefix("0b") {
                 (2, digits)

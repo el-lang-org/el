@@ -4,7 +4,7 @@ Status: implementation-ready planning document
 
 Language: **EL**
 
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 > The filename `IMPLEMENTAION_PLAN.md` preserves the spelling requested when
 > this plan was created.
@@ -362,56 +362,121 @@ establish verified source-to-Core boundaries.
 
 **Pass order**
 
-1. [ ] Validate module paths and collect declarations in source order.
-2. [ ] Build separate module, type, protocol, function, local-value, and associated-
+1. [x] Validate module paths and collect declarations in source order.
+2. [x] Build separate module, type, protocol, function, local-value, and associated-
    type namespaces.
-3. [ ] Resolve visibility, package ownership, lexical scopes, and the closed core
+3. [x] Resolve visibility, package ownership, lexical scopes, and the closed core
    prelude using stable IDs.
-4. [ ] Expand transparent aliases and reject direct, mutual, generic, and cross-
+4. [x] Expand transparent aliases and reject direct, mutual, generic, and cross-
    module cycles.
-5. [ ] Form canonical types and collect implicit function type parameters and
+5. [x] Form canonical types and collect implicit function type parameters and
    explicit named-type parameters.
-6. [ ] Validate constraints and the subset of implementation metadata needed by the
+6. [x] Validate constraints and the subset of implementation metadata needed by the
    initial slice; complete protocol dispatch remains Milestone 7.
-7. [ ] Bidirectionally check expressions and patterns, using expected types only at
+7. [x] Bidirectionally check expressions and patterns, using expected types only at
    the locations allowed by `TYPES.md`.
-8. [ ] Normalize unions, remove duplicates, sort members canonically, and use
+8. [x] Normalize unions, remove duplicates, sort members canonically, and use
    occurs-checked first-order unification to reject overlap with witnesses.
-9. [ ] Reject infinite inline layouts; recognize only specified built-in managed
+9. [x] Reject infinite inline layouts; recognize only specified built-in managed
    indirection boundaries.
-10. [ ] Produce and verify a Typed AST with resolved identities, canonical `TypeId`s,
+10. [x] Produce and verify a Typed AST with resolved identities, canonical `TypeId`s,
     substitutions, value categories, pattern facts, and explicit union
     injections.
-11. [ ] Define the shared Core IR CFG: typed operations, block parameters,
+11. [x] Define the shared Core IR CFG: typed operations, block parameters,
     terminators, typed slots, source origins, and stage markers.
-12. [ ] Lower the milestone's supported source forms into Generic Core IR and verify
+12. [x] Lower the milestone's supported source forms into Generic Core IR and verify
     ID ownership, typing, slot initialization, exact control-flow signatures,
     and absence of forbidden sugar.
 
 **Initial semantic slice**
 
-- [ ] Primitive `i32`, `i64`, `bool`, and `unit` types.
-- [ ] Function signatures and direct calls.
-- [ ] Immutable and mutable bindings, exact `:=`, lexical scopes, and shadowing.
-- [ ] Checked arithmetic representation, returns, blocks, and initial generics.
-- [ ] Expected-type-directed literals, empty-value diagnostics, named function
+- [x] Primitive `i32`, `i64`, `bool`, and `unit` types.
+- [x] Function signatures and direct calls.
+- [x] Immutable and mutable bindings, exact `:=`, lexical scopes, and shadowing.
+- [x] Checked arithmetic representation, returns, blocks, and initial generics.
+- [x] Expected-type-directed literals, empty-value diagnostics, named function
   resolution, aliases, and structural union injection.
 
 **Tests**
 
-- [ ] Accepted/rejected pairs for each static rule in the initial slice.
-- [ ] Scope, shadowing, duplicate name, visibility, and stable-ID snapshots.
-- [ ] Generic inference from arguments and expected results, recursive generic
+- [x] Accepted/rejected pairs for each static rule in the initial slice.
+- [x] Scope, shadowing, duplicate name, visibility, and stable-ID snapshots.
+- [x] Generic inference from arguments and expected results, recursive generic
   calls, ambiguity, and unsatisfied constraints.
-- [ ] Alias-cycle, union normalization/overlap, occurs-check, witness, and finite-
+- [x] Alias-cycle, union normalization/overlap, occurs-check, witness, and finite-
   layout cases.
-- [ ] Typed AST snapshots and malformed Typed AST verifier tests.
-- [ ] Generic Core IR evaluation-order snapshots and malformed CFG tests.
-- [ ] Source spans on all negative cases; no invalid module reaches lowering.
+- [x] Typed AST snapshots and malformed Typed AST verifier tests.
+- [x] Generic Core IR evaluation-order snapshots and malformed CFG tests.
+- [x] Source spans on all negative cases; no invalid module reaches lowering.
 
-- [ ] **Exit gate:** accepted and rejected programs cover binding, mutation, calls,
+- [x] **Exit gate:** accepted and rejected programs cover binding, mutation, calls,
   return types, generic inference, and ambiguous empty values without invoking
   LLVM.
+
+**Implementation progress (2026-07-27)**
+
+- [x] Added stage-owned `el-resolve`, `el-types`, and `el-ir` crates and wired the
+  target-independent parse-to-Generic-Core path through `el-driver`.
+- [x] Added deterministic module, declaration, parameter, local, function, block,
+  value, and slot IDs for the initial single-module slice.
+- [x] Added source-spanned duplicate declaration/parameter/local, unknown-name,
+  immutability, arity, type-mismatch, literal-range, and ambiguous-generic
+  diagnostics.
+- [x] Added bidirectional checking for the four initial primitives, annotated and
+  inferred bindings, exact local assignment, checked arithmetic, direct calls,
+  declared/final returns, and unconstrained first-order generic inference from
+  arguments and expected results.
+- [x] Added deterministic Typed AST and Generic Core debug forms plus independent
+  verifier rejection tests. Initial lowering preserves left-to-right evaluation,
+  represents mutable locals as typed slots, and emits checked arithmetic.
+- [x] Added a separate alias namespace with source-order declaration IDs, generic
+  alias arity checks, direct/mutual/generic cycle diagnostics, transparent
+  expansion, canonical union flattening/deduplication/order, overlap witnesses for
+  the currently supported first-order forms, expected-type union injection, and
+  corresponding Typed AST/Core IR verifier coverage.
+- [x] Added canonical atom, list, tuple, and function types; recursive generic-call
+  substitution through those constructors; occurs-checked first-order union
+  overlap unification with deterministic witnesses; typed proper/improper lists
+  and tagged tuples; expected empty-list inference and a dedicated ambiguous-empty
+  diagnostic; and left-to-right composite construction in verified Generic Core
+  IR. The AST now preserves the improper-list boundary instead of confusing it
+  with bitwise `|`.
+- [x] Added nominal generic struct type formation and Core type declarations plus
+  finite-layout checks for direct, mutual, tuple/union-wrapped, alias-wrapped, and
+  managed-List-guarded recursion. Nominal applications participate in recursive
+  generic inference and union-overlap witnesses.
+- [x] Added the initial constraint subset: a separate protocol namespace, closed
+  core-prelude protocol lookup, constraint identities on Typed AST/Core functions,
+  recursive generic constraint justification, and concrete standard-protocol
+  satisfaction diagnostics. Same-module qualified calls, local/function shadowing,
+  and explicit type ascriptions now participate in bidirectional checking.
+- [x] Added nested lexical scopes for conditional branches, block-parameter Core
+  CFG lowering, exact branch signatures, conservative slot-initialization flow,
+  and malformed multi-block verifier coverage.
+- [x] Added fixed-array and map canonical types, contextual empty forms, homogeneous
+  inference, map key constraints, recursive substitution/unification, ordered Core
+  construction, and Typed AST/Core verifier coverage.
+- [x] Added explicit pattern reachability, irrefutability, and exhaustiveness facts
+  for boolean, scalar catch-all, and typed structural-union member patterns, plus
+  switch/projection Core lowering and unreachable/non-exhaustive diagnostics.
+- [x] Added source-ordered user implementation identities and complete metadata for
+  protocol members, implementation targets, associated type assignments, method
+  membership/completeness, and preservation through Typed AST and Generic Core IR.
+- [x] Added package-wide declaration identities, qualified cross-module type and
+  function resolution, visibility checks, duplicate module rejection, and cross-
+  module alias/layout-cycle validation.
+- [x] Expanded deterministic Core snapshots and malformed verifier tests for nested
+  conditional and match CFGs, edge arity/types, targets, duplicate blocks,
+  conditions, collections, unions, and implementation metadata.
+- [x] Completed the remaining Milestone 2 accepted/rejected matrix and span-sensitive
+  snapshots for structural tuple/list/struct patterns and package orchestration
+  before closing the exit gate.
+- [x] Added recursive structural-pattern usefulness/exhaustiveness checking,
+  duplicate-binding and field diagnostics, tuple/list/struct Core projections,
+  list-constructor switches, and verified binding flow through CFG block parameters.
+- [x] Added manifest-independent package frontend orchestration across parsing,
+  package-wide resolution, type checking, visibility enforcement, and Generic Core
+  lowering. Strict manifests, dependency graphs, and lockfiles remain Milestone 8.
 
 ### Milestone 3 — First native executable
 
@@ -873,7 +938,15 @@ unchecked and add `(in progress)` after the item when useful.
 - [ ] **0 — Project skeleton (in progress):** local exit gate passes; CI workflow
   awaits its first remote run.
 - [x] **1 — Parser and AST:** typed-main AST snapshot.
-- [ ] **2 — Names and types:** accepted/rejected semantic suite without LLVM.
+- [x] **2 — Names and types:** initial primitive/function/binding/
+  generic slice plus transparent scalar aliases and structural union injection
+  now includes atoms, lists, tuples, function types, occurs-checked composite union
+  overlap, tagged tuples, nominal generic structs, finite-layout checks, initial
+  protocol constraints, qualification/shadowing, ascriptions, arrays/maps and all
+  contextual empty forms, nested conditional CFGs, implementation metadata,
+  scalar/union and structural pattern facts, package-wide resolution and frontend
+  orchestration, and expanded verifier snapshots in verified Generic Core IR
+  without LLVM.
 - [ ] **3 — First native executable:** computed native process exit status.
 - [ ] **4 — Core control and matching:** factorial, tagged parser, union match.
 - [ ] **5 — Boehm GC:** optimized graph retention under GC stress.

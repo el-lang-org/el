@@ -3,9 +3,12 @@ members = [
     "crates/el-ast",
     "crates/el-cli",
     "crates/el-driver",
+    "crates/el-ir",
     "crates/el-parser",
+    "crates/el-resolve",
     "crates/el-runtime",
     "crates/el-span",
+    "crates/el-types",
 ]
 resolver = "3"
 

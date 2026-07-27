@@ -1,10 +1,43 @@
 //! Project discovery and compiler pipeline orchestration.
 
+use el_ir::GenericModule;
+use el_span::{Diagnostic, FileId};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_FILE_NAME: &str = "el.toml";
+
+/// Runs the implemented, target-independent compiler stages for one source module.
+///
+/// This is the Milestone 2 vertical slice. Project graph loading remains owned by
+/// the later manifest milestone, and this function never initializes LLVM.
+pub fn analyze_source(file: FileId, source: &str) -> Result<GenericModule, Vec<Diagnostic>> {
+    analyze_package_sources(&[(file, source)])
+}
+
+/// Runs the target-independent frontend for all modules in one source package.
+///
+/// Inputs must already be in deterministic package-relative path order. Manifest,
+/// dependency, and lockfile loading remain part of the later package milestone.
+pub fn analyze_package_sources(
+    sources: &[(FileId, &str)],
+) -> Result<GenericModule, Vec<Diagnostic>> {
+    let mut parsed = Vec::with_capacity(sources.len());
+    let mut diagnostics = Vec::new();
+    for (file, source) in sources {
+        match el_parser::parse(*file, source) {
+            Ok(program) => parsed.push(program),
+            Err(error) => diagnostics.push(Diagnostic::error("E1000", error.span, error.message)),
+        }
+    }
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+    let resolved = el_resolve::resolve_package(&parsed)?;
+    let typed = el_types::check_package(&resolved)?;
+    Ok(el_ir::lower(&typed))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectRoot {
@@ -105,6 +138,7 @@ impl Error for ProjectError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use el_span::SourceMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -177,5 +211,67 @@ mod tests {
             .expect_err("Milestone 0 command remains unavailable");
 
         assert!(matches!(error, ProjectError::CommandNotImplemented { .. }));
+    }
+
+    #[test]
+    fn analyzes_the_milestone_two_slice_without_a_backend() {
+        let source = "defmodule Main do\n  def main() -> i32 do\n    value: i32 = 40\n    value + 2\n  end\nend\n";
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("src/main.el", source);
+
+        let core = analyze_source(file, source).expect("source reaches verified Generic Core IR");
+
+        assert!(core.debug_text().contains("checked.Add"));
+    }
+
+    #[test]
+    fn invalid_source_never_reaches_lowering() {
+        let source = "defmodule Main do\n  def main() -> i32 do\n    value = true\n    value + 2\n  end\nend\n";
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("src/main.el", source);
+
+        let diagnostics = analyze_source(file, source).expect_err("type error stops the pipeline");
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.primary.file() == file)
+        );
+    }
+
+    #[test]
+    fn orchestrates_a_multi_module_package_through_generic_core() {
+        let library = "defmodule Library do\n  def answer() -> i32 do\n    42\n  end\nend\n";
+        let main = "defmodule Main do\n  def main() -> i32 do\n    Library.answer()\n  end\nend\n";
+        let mut sources = SourceMap::new();
+        let library_file = sources.add_file("src/library.el", library);
+        let main_file = sources.add_file("src/main.el", main);
+
+        let core = analyze_package_sources(&[(library_file, library), (main_file, main)])
+            .expect("package reaches Generic Core IR");
+
+        assert_eq!(core.functions.len(), 2);
+        assert!(core.debug_text().contains("call f0"));
+    }
+
+    #[test]
+    fn package_orchestration_preserves_cross_module_diagnostic_spans() {
+        let library = "defmodule Library do\n  defp hidden() -> i32 do\n    1\n  end\nend\n";
+        let main = "defmodule Main do\n  def main() -> i32 do\n    Library.hidden()\n  end\nend\n";
+        let mut sources = SourceMap::new();
+        let library_file = sources.add_file("src/library.el", library);
+        let main_file = sources.add_file("src/main.el", main);
+
+        let diagnostics = analyze_package_sources(&[(library_file, library), (main_file, main)])
+            .expect_err("private cross-module call is rejected");
+        let private = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "E2138")
+            .expect("private visibility diagnostic");
+        assert_eq!(private.primary.file(), main_file);
+        assert_eq!(
+            private.primary.start(),
+            main.find("Library.hidden").unwrap()
+        );
     }
 }

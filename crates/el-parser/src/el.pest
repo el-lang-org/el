@@ -104,7 +104,8 @@ match_arm = { pattern ~ arrow ~ arm_body }
 arm_body = { block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | nl+ ~ !(pattern ~ arrow) ~ block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | &(nl+ ~ (pattern ~ arrow | kw_end)) }
 
 tuple_literal = { "{" ~ soft* ~ expression ~ soft* ~ "," ~ soft* ~ expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ soft* ~ "}" }
-list_literal = { "[" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ (soft* ~ "|" ~ soft* ~ expression)?)? ~ soft* ~ "]" }
+list_literal = { "[" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ (soft* ~ list_tail_separator ~ soft* ~ expression)?)? ~ soft* ~ "]" }
+list_tail_separator = { "|" }
 array_literal = { array_open ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ "]" }
 map_literal = { "%{" ~ soft* ~ (map_entry ~ (soft* ~ "," ~ soft* ~ map_entry)*)? ~ soft* ~ "}" }
 map_entry = { expression ~ fat_arrow ~ continuation* ~ expression }

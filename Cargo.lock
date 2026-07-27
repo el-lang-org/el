@@ -20,7 +20,21 @@ dependencies = [
 name = "el-driver"
 version = "0.1.0"
 dependencies = [
+ "el-ir",
+ "el-parser",
+ "el-resolve",
  "el-span",
+ "el-types",
+]
+
+[[package]]
+name = "el-ir"
+version = "0.1.0"
+dependencies = [
+ "el-parser",
+ "el-resolve",
+ "el-span",
+ "el-types",
 ]
 
 [[package]]
@@ -34,12 +48,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "el-resolve"
+version = "0.1.0"
+dependencies = [
+ "el-ast",
+ "el-parser",
+ "el-span",
+]
+
+[[package]]
 name = "el-runtime"
 version = "0.1.0"
 
 [[package]]
 name = "el-span"
 version = "0.1.0"
+
+[[package]]
+name = "el-types"
+version = "0.1.0"
+dependencies = [
+ "el-ast",
+ "el-parser",
+ "el-resolve",
+ "el-span",
+]
 
 [[package]]
 name = "memchr"

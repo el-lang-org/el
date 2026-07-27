@@ -1,16 +1,17 @@
 [package]
-name = "el-driver"
+name = "el-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-el-ir = { path = "../el-ir", version = "=0.1.0" }
-el-parser = { path = "../el-parser", version = "=0.1.0" }
+el-ast = { path = "../el-ast", version = "=0.1.0" }
 el-resolve = { path = "../el-resolve", version = "=0.1.0" }
 el-span = { path = "../el-span", version = "=0.1.0" }
-el-types = { path = "../el-types", version = "=0.1.0" }
+
+[dev-dependencies]
+el-parser = { path = "../el-parser", version = "=0.1.0" }
 
 [lints]
 workspace = true
