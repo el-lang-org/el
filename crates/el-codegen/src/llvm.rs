@@ -3,8 +3,8 @@
 use crate::integer_checks::{FailureOrigin, failure_categories};
 use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
-    ArithmeticOperator, Block, BlockId, ConcreteModule, Constant, CoreFunction, FunctionId,
-    Operation, SlotId, Terminator, Type, TypeId, ValueId, verify_concrete,
+    ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant, CoreFunction,
+    FunctionId, Operation, SlotId, SwitchValue, Terminator, Type, TypeId, ValueId, verify_concrete,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
 use el_span::Span;
@@ -21,7 +21,8 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PhiValue, PointerValue,
+    AggregateValueEnum, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PhiValue,
+    PointerValue, StructValue,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,6 +66,10 @@ pub enum BackendError {
     MissingBlock(BlockId),
     MissingValue(ValueId),
     MissingSlot(SlotId),
+    InvalidUnionMember {
+        union: TypeId,
+        member: TypeId,
+    },
     IntegerOutOfRange {
         value: i128,
         ty: TypeId,
@@ -116,6 +121,9 @@ impl fmt::Display for BackendError {
             Self::MissingBlock(block) => write!(formatter, "missing LLVM block {block:?}"),
             Self::MissingValue(value) => write!(formatter, "missing LLVM value {value:?}"),
             Self::MissingSlot(slot) => write!(formatter, "missing LLVM slot {slot:?}"),
+            Self::InvalidUnionMember { union, member } => {
+                write!(formatter, "{member:?} is not a member of union {union:?}")
+            }
             Self::IntegerOutOfRange { value, ty } => {
                 write!(formatter, "integer {value} is out of range for {ty:?}")
             }
@@ -174,8 +182,8 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
-/// Lowers the currently supported primitive Concrete Core slice and verifies
-/// the resulting LLVM module before returning deterministic textual IR.
+/// Lowers the supported Concrete Core scalar, control-flow, and aggregate slice
+/// and verifies the resulting LLVM module before returning deterministic text.
 pub fn lower_to_llvm_ir(core: &ConcreteModule) -> Result<VerifiedLlvmIr, BackendError> {
     let context = Context::create();
     let module = lower_verified_module(&context, core)?;
@@ -413,8 +421,35 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             Some(Type::I64) => Ok(self.context.i64_type().into()),
             Some(Type::Bool) => Ok(self.context.bool_type().into()),
             Some(Type::Unit) => Ok(self.context.struct_type(&[], false).into()),
+            Some(Type::Atom(_)) => Ok(self.context.i8_type().into()),
+            Some(Type::Tuple(elements)) => {
+                let fields = elements
+                    .iter()
+                    .map(|element| self.basic_type(*element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(self.context.struct_type(&fields, false).into())
+            }
+            Some(Type::Union(members)) => {
+                let mut fields = Vec::with_capacity(members.len() + 1);
+                fields.push(self.context.i32_type().into());
+                for member in members {
+                    fields.push(self.basic_type(*member)?);
+                }
+                Ok(self.context.struct_type(&fields, false).into())
+            }
             _ => Err(BackendError::UnsupportedType(ty)),
         }
+    }
+
+    fn union_tag(&self, union: TypeId, member: TypeId) -> Result<u32, BackendError> {
+        let Some(Type::Union(members)) = self.core.types.get(union.0 as usize) else {
+            return Err(BackendError::UnsupportedType(union));
+        };
+        members
+            .iter()
+            .position(|candidate| *candidate == member)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or(BackendError::InvalidUnionMember { union, member })
     }
 
     fn lower_function(&self, function: &CoreFunction) -> Result<(), BackendError> {
@@ -502,6 +537,38 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let value = self.constant(constant, *ty)?;
                 values.insert(*result, value);
             }
+            Operation::Tuple {
+                result,
+                elements,
+                ty,
+                ..
+            } => {
+                let mut aggregate = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                for (index, element) in elements.iter().enumerate() {
+                    aggregate = built(builder.build_insert_value(
+                        aggregate,
+                        value(values, *element)?,
+                        index as u32,
+                        &format!("v{}.field{index}", result.0),
+                    ))?;
+                }
+                values.insert(*result, aggregate.into_struct_value().into());
+            }
+            Operation::TupleProject {
+                result,
+                tuple,
+                index,
+                ..
+            } => {
+                let projected = built(builder.build_extract_value(
+                    struct_value(values, *tuple)?,
+                    *index as u32,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, projected);
+            }
             Operation::CheckedArithmetic {
                 result,
                 operator,
@@ -516,6 +583,69 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     function, *result, *operator, left, right, *ty, *origin, builder,
                 )?;
                 values.insert(*result, value.into());
+            }
+            Operation::Compare {
+                result,
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let predicate = match operator {
+                    ComparisonOperator::Equal => IntPredicate::EQ,
+                    ComparisonOperator::NotEqual => IntPredicate::NE,
+                    ComparisonOperator::Less => IntPredicate::SLT,
+                    ComparisonOperator::LessEqual => IntPredicate::SLE,
+                    ComparisonOperator::Greater => IntPredicate::SGT,
+                    ComparisonOperator::GreaterEqual => IntPredicate::SGE,
+                };
+                let compared = built(builder.build_int_compare(
+                    predicate,
+                    integer_value(values, *left)?,
+                    integer_value(values, *right)?,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, compared.into());
+            }
+            Operation::UnionInject {
+                result,
+                member,
+                value: payload,
+                ty,
+                ..
+            } => {
+                let tag = self.union_tag(*ty, *member)?;
+                let mut aggregate = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                aggregate = built(builder.build_insert_value(
+                    aggregate,
+                    self.context.i32_type().const_int(u64::from(tag), false),
+                    0,
+                    &format!("v{}.tag", result.0),
+                ))?;
+                aggregate = built(builder.build_insert_value(
+                    aggregate,
+                    value(values, *payload)?,
+                    tag + 1,
+                    &format!("v{}.payload", result.0),
+                ))?;
+                values.insert(*result, aggregate.into_struct_value().into());
+            }
+            Operation::UnionProject {
+                result,
+                member,
+                value: union,
+                union_ty,
+                ..
+            } => {
+                let tag = self.union_tag(*union_ty, *member)?;
+                let projected = built(builder.build_extract_value(
+                    struct_value(values, *union)?,
+                    tag + 1,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, projected);
             }
             Operation::Call {
                 result,
@@ -613,12 +743,73 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             Terminator::Unreachable { .. } => {
                 built(builder.build_unreachable())?;
             }
-            Terminator::Switch { .. } => {
-                return Err(BackendError::UnsupportedTerminator {
-                    function: function.id,
-                    block: block.id,
-                    terminator: "switch",
-                });
+            Terminator::Switch {
+                subject,
+                subject_ty,
+                cases,
+                default,
+                ..
+            } => {
+                let source = value(values, *subject)?;
+                let discriminant = if matches!(
+                    self.core.types.get(subject_ty.0 as usize),
+                    Some(Type::Union(_))
+                ) {
+                    match built(builder.build_extract_value(
+                        struct_value(values, *subject)?,
+                        0,
+                        &format!("v{}.tag", subject.0),
+                    ))? {
+                        BasicValueEnum::IntValue(value) => value,
+                        _ => return Err(BackendError::UnsupportedType(*subject_ty)),
+                    }
+                } else {
+                    match source {
+                        BasicValueEnum::IntValue(value) => value,
+                        _ => return Err(BackendError::UnsupportedType(*subject_ty)),
+                    }
+                };
+                let mut lowered_cases = Vec::with_capacity(cases.len());
+                for (case, target) in cases {
+                    let value = match case {
+                        SwitchValue::Boolean(value) => {
+                            discriminant.get_type().const_int(u64::from(*value), false)
+                        }
+                        SwitchValue::Integer(value) => {
+                            discriminant.get_type().const_int(*value as u64, true)
+                        }
+                        SwitchValue::Atom(_) => discriminant.get_type().const_zero(),
+                        SwitchValue::UnionMember(member) => discriminant
+                            .get_type()
+                            .const_int(u64::from(self.union_tag(*subject_ty, *member)?), false),
+                        SwitchValue::ListEmpty | SwitchValue::ListCons => {
+                            return Err(BackendError::UnsupportedTerminator {
+                                function: function.id,
+                                block: block.id,
+                                terminator: "list switch",
+                            });
+                        }
+                    };
+                    lowered_cases.push((value, self.block(blocks, *target)?));
+                }
+                let default = if let Some(default) = default {
+                    self.block(blocks, *default)?
+                } else {
+                    let llvm_function = self
+                        .functions
+                        .get(&function.id)
+                        .copied()
+                        .ok_or(BackendError::MissingFunction(function.id))?;
+                    let unreachable = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("b{}.switch_unreachable", block.id.0),
+                    );
+                    let unreachable_builder = self.context.create_builder();
+                    unreachable_builder.position_at_end(unreachable);
+                    built(unreachable_builder.build_unreachable())?;
+                    unreachable
+                };
+                built(builder.build_switch(discriminant, default, &lowered_cases))?;
             }
         }
         Ok(())
@@ -855,6 +1046,9 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 .const_int(u64::from(*value), false)
                 .into()),
             (Constant::Unit, Some(Type::Unit)) => Ok(self.basic_type(ty)?.const_zero()),
+            (Constant::Atom(_), Some(Type::Atom(_))) => {
+                Ok(self.context.i8_type().const_zero().into())
+            }
             _ => Err(BackendError::UnsupportedType(ty)),
         }
     }
@@ -895,6 +1089,16 @@ fn integer_value<'ctx>(
     }
 }
 
+fn struct_value<'ctx>(
+    values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+    id: ValueId,
+) -> Result<StructValue<'ctx>, BackendError> {
+    match value(values, id)? {
+        BasicValueEnum::StructValue(value) => Ok(value),
+        _ => Err(BackendError::MissingValue(id)),
+    }
+}
+
 fn operation_name(operation: &Operation) -> &'static str {
     match operation {
         Operation::Constant { .. } => "constant",
@@ -907,6 +1111,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::ListHead { .. } => "list_head",
         Operation::ListTail { .. } => "list_tail",
         Operation::CheckedArithmetic { .. } => "checked_arithmetic",
+        Operation::Compare { .. } => "compare",
         Operation::Call { .. } => "call",
         Operation::UnionInject { .. } => "union_inject",
         Operation::UnionProject { .. } => "union_project",
@@ -976,6 +1181,20 @@ mod tests {
         assert!(text.contains("v2.fail.overflow"));
         assert!(text.contains("call void @__el_runtime_fail(i32 1, i32 0, i64"));
         assert!(text.contains("sdiv i32"));
+    }
+
+    #[test]
+    fn lowers_tuples_atoms_union_payloads_and_exhaustive_switches() {
+        let core = concrete(
+            "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  def parse(valid: bool) -> Parsed do\n    if valid do\n      {:ok, 40}\n    else\n      :error\n    end\n  end\n  def payload(value: {:ok, i32}) -> i32 do\n    match value do\n      {:ok, number} -> number\n    end\n  end\n  def unwrap(value: Parsed) -> i32 do\n    match value do\n      ok: {:ok, i32} -> payload(ok)\n      _ -> 2\n    end\n  end\n  def main() -> i32 do\n    unwrap(parse(true)) + unwrap(parse(false))\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("aggregate match lowering verifies");
+        let text = llvm.as_str();
+
+        assert!(text.contains("extractvalue"), "{text}");
+        assert!(text.contains("switch"), "{text}");
+        assert!(text.contains("{ i32, i8, { i8, i32 } }"), "{text}");
     }
 
     #[test]

@@ -571,8 +571,8 @@ make cleanup explicit in Core IR.
 
 **Deliverables**
 
-- [ ] Comparisons, `if`, `while`, short-circuit `and`/`or`, and early `return`.
-- [ ] Tuples, atoms, closed unions, explicit injection, discriminants, payloads,
+- [x] Comparisons, `if`, `while`, short-circuit `and`/`or`, and early `return`.
+- [x] Tuples, atoms, closed unions, explicit injection, discriminants, payloads,
   typed member patterns, tagged tuples, and exhaustive `match`.
 - [ ] Pattern usefulness/exhaustiveness analysis with unreachable-arm diagnostics.
 - [ ] Pipeline validation and desugaring that evaluates the left input before
@@ -1005,7 +1005,14 @@ unchecked and add `(in progress)` after the item when useful.
   process entry shim, target reproducibility metadata, and profile output directories
   are implemented, and debug/release native execution has parity; accepted D-008's
   basic LLVM debug-location requirement remains before closing the milestone.
-- [ ] **4 — Core control and matching:** factorial, tagged parser, union match.
+- [ ] **4 — Core control and matching (in progress):** primitive `i32`/`i64`
+  comparisons, `bool` equality, expression-valued `if`, `while`, short-circuit
+  `and`/`or`, and early `return` now pass Typed AST/Core IR verification and
+  debug/release native factorial coverage. Tuples, atoms, normalized closed
+  unions, branch injections, private discriminants/member payload storage, typed
+  member projections, tagged tuples, exhaustive matches, and LLVM switches now
+  pass a debug/release native tagged-result test; pattern-analysis completion,
+  the string-backed tagged parser, pipelines, and cleanup remain.
 - [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
 - [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
   rejection.

@@ -358,6 +358,20 @@ fn lowers_nested_scopes_to_typed_cfg_edges() {
 }
 
 #[test]
+fn lowers_loops_short_circuit_logic_comparisons_and_nested_returns() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and 1 / 0 == 0 do\n      return 1\n    end\n    if true or 1 / 0 == 0 do\n      return result\n    end\n    0\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+
+    assert!(debug.contains("compare.Greater"));
+    assert!(debug.contains("compare.Equal"));
+    assert!(debug.matches("branch_if").count() >= 5);
+    assert!(debug.matches("return").count() >= 2);
+    verify(&module).expect("control-flow CFG verifies");
+}
+
+#[test]
 fn verifier_rejects_wrong_cfg_argument_signature() {
     let mut module = lowered(
         "defmodule Main do\n  def choose(flag: bool) -> i64 do\n    if flag do\n      1\n    else\n      2\n    end\n  end\nend\n",
@@ -449,6 +463,46 @@ fn lowers_typed_union_patterns_to_member_switches_and_projections() {
     assert!(debug.contains("UnionMember(TypeId(1))"));
     assert!(debug.contains("project t1 v0: t1"));
     verify(&module).expect("typed union match Core verifies");
+}
+
+#[test]
+fn verifier_rejects_mistyped_union_discriminants_and_payload_projections() {
+    let source = "defmodule Main do\n  @type Scalar = bool | i64\n  def choose(value: Scalar) -> i64 do\n    match value do\n      number: i64 -> number\n      flag: bool -> 0\n    end\n  end\nend\n";
+
+    let mut bad_switch = lowered(source);
+    let switch_ty = bad_switch.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Switch { subject_ty, .. } => Some(subject_ty),
+            _ => None,
+        })
+        .expect("union discriminant switch");
+    *switch_ty = TypeId(0);
+    assert!(
+        verify(&bad_switch)
+            .expect_err("mistyped switch is rejected")
+            .iter()
+            .any(|error| error.contains("incorrect subject type"))
+    );
+
+    let mut bad_projection = lowered(source);
+    let union_ty = bad_projection.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::UnionProject { union_ty, .. } => Some(union_ty),
+            _ => None,
+        })
+        .expect("union payload projection");
+    *union_ty = TypeId(1);
+    assert!(
+        verify(&bad_projection)
+            .expect_err("projection from a non-union is rejected")
+            .iter()
+            .any(|error| error.contains("invalid source"))
+    );
 }
 
 #[test]

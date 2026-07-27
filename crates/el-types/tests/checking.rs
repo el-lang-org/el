@@ -23,6 +23,38 @@ fn checks_bindings_mutation_calls_returns_and_generic_inference() {
 }
 
 #[test]
+fn checks_comparisons_short_circuit_logic_while_and_nested_returns() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if true do\n      result := result\n    end\n    if n == 1 and result >= 120 do\n      return result\n    else\n      0\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("core control flow type checks");
+    let debug = typed.debug_tree();
+
+    assert!(debug.contains("while"));
+    assert!(debug.contains("comparison Greater"));
+    assert!(debug.contains("logical And"));
+    assert!(debug.contains("return"));
+    verify(&typed).expect("control-flow Typed AST verifies");
+}
+
+#[test]
+fn rejects_non_bool_control_conditions_and_unsupported_comparisons() {
+    let cases = [
+        ("while 1 do\n      unit\n    end\n    0", "E2113"),
+        ("if 1 do\n      0\n    else\n      1\n    end", "E2113"),
+        ("true < false\n    0", "E2125"),
+        ("1 and true\n    0", "E2113"),
+    ];
+    for (body, code) in cases {
+        let source = format!("defmodule Main do\n  def main() -> i32 do\n    {body}\n  end\nend\n");
+        let diagnostics = checked(&source).expect_err("invalid control flow is rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "missing {code}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn expected_result_type_infers_a_zero_argument_generic_call() {
     let source = "defmodule Main do\n  def loop() -> a do\n    loop()\n  end\n  def main() -> i32 do\n    value: i32 = loop()\n    value\n  end\nend\n";
 
@@ -179,6 +211,15 @@ fn checks_tagged_tuple_unions_and_inserts_the_member() {
     let typed = checked(source).expect("tagged tuple alternatives are disjoint");
 
     assert!(typed.debug_tree().contains("inject {:some, i64}"));
+}
+
+#[test]
+fn injects_each_if_branch_into_an_expected_union() {
+    let source = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  def parse(valid: bool) -> Parsed do\n    if valid do\n      {:ok, 40}\n    else\n      :error\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("union expectation flows into both branches");
+    assert_eq!(typed.debug_tree().matches("inject").count(), 2);
+    verify(&typed).expect("branch injections verify");
 }
 
 #[test]

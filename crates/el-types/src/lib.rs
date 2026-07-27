@@ -171,6 +171,11 @@ pub enum TypedItem {
     },
     Expr(TypedExpr),
     Return(TypedExpr),
+    While {
+        condition: TypedExpr,
+        body: TypedBlock,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,6 +215,16 @@ pub enum TypedExprKind {
         left: Box<TypedExpr>,
         right: Box<TypedExpr>,
     },
+    Comparison {
+        operator: ComparisonOperator,
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
+    },
+    Logical {
+        operator: LogicalOperator,
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
+    },
     Call {
         function: DeclId,
         substitutions: Vec<(TypeId, TypeId)>,
@@ -228,6 +243,22 @@ pub enum ArithmeticOperator {
     Multiply,
     Divide,
     Remainder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparisonOperator {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalOperator {
+    And,
+    Or,
 }
 
 #[derive(Clone, Debug)]
@@ -761,6 +792,21 @@ impl<'a> Checker<'a> {
                         items.push(TypedItem::Return(value));
                     }
                 }
+                "while_expr" => {
+                    let condition =
+                        self.check_expr(item.children.first()?, Some(TypeId(2)), owner, scopes);
+                    scopes.push(BTreeMap::new());
+                    let body =
+                        self.check_block(item.children.get(1)?, Some(TypeId(3)), owner, scopes);
+                    scopes.pop();
+                    if let (Some(condition), Some(body)) = (condition, body) {
+                        items.push(TypedItem::While {
+                            condition,
+                            body,
+                            span: item.span,
+                        });
+                    }
+                }
                 _ => {
                     if let Some(expression) = self.check_expr(item, item_expected, owner, scopes) {
                         items.push(TypedItem::Expr(expression));
@@ -1025,6 +1071,12 @@ impl<'a> Checker<'a> {
         if let Some(expected) = expected
             && matches!(self.types[expected.0 as usize], Type::Union(_))
         {
+            if node.kind.as_str() == "if_expr" {
+                return self.check_if(node, Some(expected), owner, scopes);
+            }
+            if node.kind.as_str() == "match_expr" {
+                return self.check_match(node, Some(expected), owner, scopes);
+            }
             return self.check_union_injection(node, expected, owner, scopes);
         }
         let expression = match node.kind.as_str() {
@@ -1051,6 +1103,8 @@ impl<'a> Checker<'a> {
             "additive_expr" | "multiplicative_expr" => {
                 self.check_binary(node, expected, owner, scopes)
             }
+            "equality_expr" | "comparison_expr" => self.check_comparison(node, owner, scopes),
+            "logical_and_expr" | "logical_or_expr" => self.check_logical(node, owner, scopes),
             "postfix_expr" => self.check_call(node, expected, owner, scopes),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -1851,6 +1905,76 @@ impl<'a> Checker<'a> {
                 right: Box::new(right),
             },
             ty,
+            span: node.span,
+        })
+    }
+
+    fn check_comparison(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let operator = match node.value.as_ref() {
+            Some(Value::Text(value)) if value == "==" => ComparisonOperator::Equal,
+            Some(Value::Text(value)) if value == "!=" => ComparisonOperator::NotEqual,
+            Some(Value::Text(value)) if value == "<" => ComparisonOperator::Less,
+            Some(Value::Text(value)) if value == "<=" => ComparisonOperator::LessEqual,
+            Some(Value::Text(value)) if value == ">" => ComparisonOperator::Greater,
+            Some(Value::Text(value)) if value == ">=" => ComparisonOperator::GreaterEqual,
+            _ => return None,
+        };
+        let left = self.check_expr(&node.children[0], None, owner, scopes)?;
+        let ordered = !matches!(
+            operator,
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual
+        );
+        let supported = matches!(self.types[left.ty.0 as usize], Type::I32 | Type::I64)
+            || (!ordered && matches!(self.types[left.ty.0 as usize], Type::Bool));
+        if !supported {
+            self.diagnostics.push(Diagnostic::error(
+                "E2125",
+                node.span,
+                if ordered {
+                    "ordered comparison requires matching integer operands"
+                } else {
+                    "equality requires matching integer or bool operands"
+                },
+            ));
+            return None;
+        }
+        let right = self.check_expr(&node.children[1], Some(left.ty), owner, scopes)?;
+        Some(TypedExpr {
+            kind: TypedExprKind::Comparison {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ty: TypeId(2),
+            span: node.span,
+        })
+    }
+
+    fn check_logical(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let operator = match node.value.as_ref() {
+            Some(Value::Text(value)) if value == "and" => LogicalOperator::And,
+            Some(Value::Text(value)) if value == "or" => LogicalOperator::Or,
+            _ => return None,
+        };
+        let left = self.check_expr(&node.children[0], Some(TypeId(2)), owner, scopes)?;
+        let right = self.check_expr(&node.children[1], Some(TypeId(2)), owner, scopes)?;
+        Some(TypedExpr {
+            kind: TypedExprKind::Logical {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ty: TypeId(2),
             span: node.span,
         })
     }
@@ -2832,6 +2956,7 @@ fn verify_item(
                 type_count,
                 declarations,
                 symbols,
+                mutable_symbols,
                 errors,
             );
             if initializer.ty != *ty {
@@ -2855,10 +2980,58 @@ fn verify_item(
             if !mutable_symbols.contains(symbol) {
                 errors.push(format!("assignment targets immutable symbol {symbol:?}"));
             }
-            verify_expr(value, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
         }
         TypedItem::Expr(expression) | TypedItem::Return(expression) => {
-            verify_expr(expression, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                expression,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+        }
+        TypedItem::While {
+            condition, body, ..
+        } => {
+            verify_expr(
+                condition,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if condition.ty != TypeId(2) {
+                errors.push("while condition has a non-bool type".to_owned());
+            }
+            let mut nested_symbols = symbols.clone();
+            let mut nested_mutable = mutable_symbols.clone();
+            for item in &body.items {
+                verify_item(
+                    item,
+                    types,
+                    type_count,
+                    declarations,
+                    &mut nested_symbols,
+                    &mut nested_mutable,
+                    errors,
+                );
+            }
+            if body.ty != TypeId(3) {
+                errors.push("while body has a non-unit type".to_owned());
+            }
         }
     }
 }
@@ -2869,6 +3042,7 @@ fn verify_expr(
     type_count: u32,
     declarations: &BTreeSet<DeclId>,
     symbols: &BTreeMap<SymbolId, TypeId>,
+    mutable_symbols: &BTreeSet<SymbolId>,
     errors: &mut Vec<String>,
 ) {
     if expression.ty.0 >= type_count {
@@ -2914,13 +3088,29 @@ fn verify_expr(
                 }
             };
             for element in elements {
-                verify_expr(element, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    element,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 if item_type.is_some_and(|item| element.ty != item) {
                     errors.push("list element has an incorrect type".to_owned());
                 }
             }
             if let Some(tail) = tail {
-                verify_expr(tail, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    tail,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 if tail.ty != expression.ty {
                     errors.push("list tail has an incorrect type".to_owned());
                 }
@@ -2937,7 +3127,15 @@ fn verify_expr(
                 }
             };
             for (index, element) in elements.iter().enumerate() {
-                verify_expr(element, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    element,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 if element_types.is_some_and(|types| element.ty != types[index]) {
                     errors.push("tuple element has an incorrect type".to_owned());
                 }
@@ -2954,7 +3152,15 @@ fn verify_expr(
                 }
             };
             for element in elements {
-                verify_expr(element, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    element,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 if item.is_some_and(|item| item != element.ty) {
                     errors.push("array element has an incorrect type".to_owned());
                 }
@@ -2969,8 +3175,24 @@ fn verify_expr(
                 }
             };
             for (key, value) in entries {
-                verify_expr(key, types, type_count, declarations, symbols, errors);
-                verify_expr(value, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    key,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+                verify_expr(
+                    value,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 if components.is_some_and(|pair| pair != (key.ty, value.ty)) {
                     errors.push("map entry has incorrect types".to_owned());
                 }
@@ -2981,13 +3203,21 @@ fn verify_expr(
             then_block,
             else_block,
         } => {
-            verify_expr(condition, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                condition,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
             if !matches!(types.get(condition.ty.0 as usize), Some(Type::Bool)) {
                 errors.push("if condition has a non-bool type".to_owned());
             }
             let mut verify_nested = |block: &TypedBlock| {
                 let mut nested_symbols = symbols.clone();
-                let mut nested_mutable = BTreeSet::new();
+                let mut nested_mutable = mutable_symbols.clone();
                 for item in &block.items {
                     verify_item(
                         item,
@@ -3015,7 +3245,15 @@ fn verify_expr(
             arms,
             exhaustive,
         } => {
-            verify_expr(subject, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                subject,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
             if !*exhaustive {
                 errors.push("typed match is not exhaustive".to_owned());
             }
@@ -3025,7 +3263,7 @@ fn verify_expr(
                 }
                 let mut nested_symbols = symbols.clone();
                 verify_pattern(&arm.pattern, types, type_count, &mut nested_symbols, errors);
-                let mut nested_mutable = BTreeSet::new();
+                let mut nested_mutable = mutable_symbols.clone();
                 for item in &arm.body.items {
                     verify_item(
                         item,
@@ -3043,16 +3281,96 @@ fn verify_expr(
             }
         }
         TypedExprKind::Ascription(value) => {
-            verify_expr(value, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
             if value.ty != expression.ty {
                 errors.push("ascription changed the expression type".to_owned());
             }
         }
         TypedExprKind::Binary { left, right, .. } => {
-            verify_expr(left, types, type_count, declarations, symbols, errors);
-            verify_expr(right, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                right,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
             if left.ty != right.ty || left.ty != expression.ty {
                 errors.push("binary operand types differ".to_owned());
+            }
+        }
+        TypedExprKind::Comparison {
+            operator,
+            left,
+            right,
+        } => {
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                right,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let ordered = !matches!(
+                operator,
+                ComparisonOperator::Equal | ComparisonOperator::NotEqual
+            );
+            let supported = matches!(types.get(left.ty.0 as usize), Some(Type::I32 | Type::I64))
+                || (!ordered && matches!(types.get(left.ty.0 as usize), Some(Type::Bool)));
+            if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
+                errors.push("comparison has invalid operand or result types".to_owned());
+            }
+        }
+        TypedExprKind::Logical { left, right, .. } => {
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                right,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if left.ty != TypeId(2) || right.ty != TypeId(2) || expression.ty != TypeId(2) {
+                errors.push("logical expression has a non-bool type".to_owned());
             }
         }
         TypedExprKind::Call {
@@ -3064,11 +3382,27 @@ fn verify_expr(
                 errors.push(format!("call references unknown function {function:?}"));
             }
             for argument in arguments {
-                verify_expr(argument, types, type_count, declarations, symbols, errors);
+                verify_expr(
+                    argument,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
             }
         }
         TypedExprKind::UnionInject { member, value } => {
-            verify_expr(value, types, type_count, declarations, symbols, errors);
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
             if value.ty != *member {
                 errors.push("union injection value does not match its member".to_owned());
             }
@@ -3267,6 +3601,13 @@ fn write_items(program: &TypedProgram, output: &mut String, items: &[TypedItem],
                 output.push_str(&format!("{indent}return\n"));
                 write_expr(program, output, expression, depth + 1);
             }
+            TypedItem::While {
+                condition, body, ..
+            } => {
+                output.push_str(&format!("{indent}while\n"));
+                write_expr(program, output, condition, depth + 1);
+                write_items(program, output, &body.items, depth + 1);
+            }
         }
     }
 }
@@ -3287,6 +3628,8 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::Ascription(_) => "ascription".to_owned(),
         TypedExprKind::Local(symbol) => format!("local s{}", symbol.0),
         TypedExprKind::Binary { operator, .. } => format!("binary {operator:?}"),
+        TypedExprKind::Comparison { operator, .. } => format!("comparison {operator:?}"),
+        TypedExprKind::Logical { operator, .. } => format!("logical {operator:?}"),
         TypedExprKind::Call {
             function,
             substitutions,
@@ -3313,7 +3656,9 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         program.display_type(expression.ty)
     ));
     match &expression.kind {
-        TypedExprKind::Binary { left, right, .. } => {
+        TypedExprKind::Binary { left, right, .. }
+        | TypedExprKind::Comparison { left, right, .. }
+        | TypedExprKind::Logical { left, right, .. } => {
             write_expr(program, output, left, depth + 1);
             write_expr(program, output, right, depth + 1);
         }

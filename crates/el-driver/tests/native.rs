@@ -117,3 +117,53 @@ fn development_and_release_preserve_arithmetic_exit_semantics() {
         );
     }
 }
+
+#[test]
+fn native_control_flow_preserves_loops_short_circuiting_and_early_returns() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let factorial = "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and 1 / 0 == 0 do\n      return 1\n    end\n    if true or 1 / 0 == 0 do\n      return result\n    end\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-control-flow"),
+                factorial,
+                profile,
+            )
+            .code(),
+            Some(120),
+            "short-circuited division must not run and nested return must preserve factorial"
+        );
+    }
+}
+
+#[test]
+fn native_tagged_union_match_preserves_discriminants_and_payloads() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let tagged = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  def parse(valid: bool) -> Parsed do\n    if valid do\n      {:ok, 40}\n    else\n      :error\n    end\n  end\n  def payload(value: {:ok, i32}) -> i32 do\n    match value do\n      {:ok, number} -> number\n    end\n  end\n  def atom_value(value: :error) -> i32 do\n    match value do\n      :error -> 2\n    end\n  end\n  def unwrap(value: Parsed) -> i32 do\n    match value do\n      ok: {:ok, i32} -> payload(ok)\n      _ -> atom_value(:error)\n    end\n  end\n  def main() -> i32 do\n    unwrap(parse(true)) + unwrap(parse(false))\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-tagged-union"),
+                tagged,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "union tags and tagged-tuple payloads must survive calls and exhaustive matches"
+        );
+    }
+}

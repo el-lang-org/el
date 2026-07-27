@@ -2,8 +2,10 @@
 
 use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
-pub use el_types::{ArithmeticOperator, Type, TypeId};
-use el_types::{TypedExpr, TypedExprKind, TypedItem, TypedPatternKind, TypedProgram};
+pub use el_types::{ArithmeticOperator, ComparisonOperator, Type, TypeId};
+use el_types::{
+    LogicalOperator, TypedExpr, TypedExprKind, TypedItem, TypedPatternKind, TypedProgram,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -163,6 +165,14 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    Compare {
+        result: ValueId,
+        operator: ComparisonOperator,
+        left: ValueId,
+        right: ValueId,
+        operand_ty: TypeId,
+        origin: Span,
+    },
     Call {
         result: ValueId,
         function: FunctionId,
@@ -182,6 +192,7 @@ pub enum Operation {
         result: ValueId,
         member: TypeId,
         value: ValueId,
+        union_ty: TypeId,
         ty: TypeId,
         origin: Span,
     },
@@ -221,6 +232,7 @@ pub enum Terminator {
     },
     Switch {
         subject: ValueId,
+        subject_ty: TypeId,
         cases: Vec<(SwitchValue, BlockId)>,
         default: Option<BlockId>,
         origin: Span,
@@ -372,7 +384,9 @@ impl<'a> Lowerer<'a> {
                     span,
                     ..
                 } => {
-                    let value = self.lower_expr(initializer);
+                    let Some(value) = self.lower_expr(initializer) else {
+                        break;
+                    };
                     if *mutable {
                         let slot = SlotId(self.slots.len() as u32);
                         self.slots.push(Slot {
@@ -395,7 +409,9 @@ impl<'a> Lowerer<'a> {
                     value,
                     span,
                 } => {
-                    let lowered = self.lower_expr(value);
+                    let Some(lowered) = self.lower_expr(value) else {
+                        break;
+                    };
                     let Binding::Slot(slot) = self.bindings[symbol] else {
                         panic!("Typed AST assignment target must be mutable");
                     };
@@ -406,22 +422,49 @@ impl<'a> Lowerer<'a> {
                     });
                 }
                 TypedItem::Expr(expression) => {
-                    result = Some(self.lower_expr(expression));
+                    let Some(value) = self.lower_expr(expression) else {
+                        result = None;
+                        break;
+                    };
+                    result = Some(value);
                     return_origin = expression.span;
                 }
                 TypedItem::Return(expression) => {
-                    result = Some(self.lower_expr(expression));
-                    return_origin = expression.span;
+                    if let Some(value) = self.lower_expr(expression) {
+                        self.finish_current(Terminator::Return {
+                            value,
+                            origin: expression.span,
+                        });
+                    }
+                    result = None;
                     break;
+                }
+                TypedItem::While {
+                    condition,
+                    body,
+                    span,
+                } => {
+                    if !self.lower_while(condition, body, *span) {
+                        result = None;
+                        break;
+                    }
+                    result = None;
                 }
             }
         }
-        let value = result
-            .unwrap_or_else(|| self.constant(Constant::Unit, TypeId(3), self.function.body.span));
-        self.finish_current(Terminator::Return {
-            value,
-            origin: return_origin,
-        });
+        if !self
+            .blocks
+            .iter()
+            .any(|block| block.id == self.current_block)
+        {
+            let value = result.unwrap_or_else(|| {
+                self.constant(Constant::Unit, TypeId(3), self.function.body.span)
+            });
+            self.finish_current(Terminator::Return {
+                value,
+                origin: return_origin,
+            });
+        }
         self.blocks.sort_by_key(|block| block.id);
         CoreFunction {
             id: self.id,
@@ -440,8 +483,8 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_expr(&mut self, expression: &TypedExpr) -> ValueId {
-        match &expression.kind {
+    fn lower_expr(&mut self, expression: &TypedExpr) -> Option<ValueId> {
+        Some(match &expression.kind {
             TypedExprKind::Integer(value) => {
                 self.constant(Constant::Integer(*value), expression.ty, expression.span)
             }
@@ -456,8 +499,11 @@ impl<'a> Lowerer<'a> {
                 let elements = elements
                     .iter()
                     .map(|element| self.lower_expr(element))
-                    .collect();
-                let tail = tail.as_ref().map(|tail| self.lower_expr(tail));
+                    .collect::<Option<Vec<_>>>()?;
+                let tail = match tail {
+                    Some(tail) => Some(self.lower_expr(tail)?),
+                    None => None,
+                };
                 let result = self.value();
                 self.operations.push(Operation::List {
                     result,
@@ -472,7 +518,7 @@ impl<'a> Lowerer<'a> {
                 let elements = elements
                     .iter()
                     .map(|element| self.lower_expr(element))
-                    .collect();
+                    .collect::<Option<Vec<_>>>()?;
                 let result = self.value();
                 self.operations.push(Operation::Tuple {
                     result,
@@ -486,7 +532,7 @@ impl<'a> Lowerer<'a> {
                 let elements = elements
                     .iter()
                     .map(|element| self.lower_expr(element))
-                    .collect();
+                    .collect::<Option<Vec<_>>>()?;
                 let result = self.value();
                 self.operations.push(Operation::Array {
                     result,
@@ -499,8 +545,8 @@ impl<'a> Lowerer<'a> {
             TypedExprKind::Map(source_entries) => {
                 let mut entries = Vec::new();
                 for (key, value) in source_entries {
-                    let key = self.lower_expr(key);
-                    let value = self.lower_expr(value);
+                    let key = self.lower_expr(key)?;
+                    let value = self.lower_expr(value)?;
                     entries.push((key, value));
                 }
                 let result = self.value();
@@ -512,7 +558,7 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
-            TypedExprKind::Ascription(value) => self.lower_expr(value),
+            TypedExprKind::Ascription(value) => return self.lower_expr(value),
             TypedExprKind::Local(symbol) => match self.bindings[symbol] {
                 Binding::Value(value) => value,
                 Binding::Slot(slot) => {
@@ -531,8 +577,8 @@ impl<'a> Lowerer<'a> {
                 left,
                 right,
             } => {
-                let left = self.lower_expr(left);
-                let right = self.lower_expr(right);
+                let left = self.lower_expr(left)?;
+                let right = self.lower_expr(right)?;
                 let result = self.value();
                 self.operations.push(Operation::CheckedArithmetic {
                     result,
@@ -544,6 +590,30 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::Comparison {
+                operator,
+                left,
+                right,
+            } => {
+                let operand_ty = left.ty;
+                let left = self.lower_expr(left)?;
+                let right = self.lower_expr(right)?;
+                let result = self.value();
+                self.operations.push(Operation::Compare {
+                    result,
+                    operator: *operator,
+                    left,
+                    right,
+                    operand_ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::Logical {
+                operator,
+                left,
+                right,
+            } => return self.lower_logical(*operator, left, right, expression.span),
             TypedExprKind::Call {
                 function,
                 substitutions,
@@ -552,7 +622,7 @@ impl<'a> Lowerer<'a> {
                 let arguments = arguments
                     .iter()
                     .map(|argument| self.lower_expr(argument))
-                    .collect();
+                    .collect::<Option<Vec<_>>>()?;
                 let result = self.value();
                 self.operations.push(Operation::Call {
                     result,
@@ -565,7 +635,7 @@ impl<'a> Lowerer<'a> {
                 result
             }
             TypedExprKind::UnionInject { member, value } => {
-                let value = self.lower_expr(value);
+                let value = self.lower_expr(value)?;
                 let result = self.value();
                 self.operations.push(Operation::UnionInject {
                     result,
@@ -580,17 +650,19 @@ impl<'a> Lowerer<'a> {
                 condition,
                 then_block,
                 else_block,
-            } => self.lower_if(
-                condition,
-                then_block,
-                else_block.as_ref(),
-                expression.ty,
-                expression.span,
-            ),
-            TypedExprKind::Match { subject, arms, .. } => {
-                self.lower_match(subject, arms, expression.ty, expression.span)
+            } => {
+                return self.lower_if(
+                    condition,
+                    then_block,
+                    else_block.as_ref(),
+                    expression.ty,
+                    expression.span,
+                );
             }
-        }
+            TypedExprKind::Match { subject, arms, .. } => {
+                return self.lower_match(subject, arms, expression.ty, expression.span);
+            }
+        })
     }
 
     fn lower_if(
@@ -600,8 +672,8 @@ impl<'a> Lowerer<'a> {
         else_block: Option<&el_types::TypedBlock>,
         ty: TypeId,
         origin: Span,
-    ) -> ValueId {
-        let condition = self.lower_expr(condition);
+    ) -> Option<ValueId> {
+        let condition = self.lower_expr(condition)?;
         let then_target = self.new_block();
         let else_target = self.new_block();
         let join_target = self.new_block();
@@ -617,11 +689,13 @@ impl<'a> Lowerer<'a> {
         self.current_parameters.clear();
         self.bindings = outer_bindings.clone();
         let then_value = self.lower_block_value(then_block);
-        self.finish_current(Terminator::Branch {
-            target: join_target,
-            arguments: vec![then_value],
-            origin: then_block.span,
-        });
+        if let Some(value) = then_value {
+            self.finish_current(Terminator::Branch {
+                target: join_target,
+                arguments: vec![value],
+                origin: then_block.span,
+            });
+        }
 
         self.current_block = else_target;
         self.current_parameters.clear();
@@ -629,13 +703,20 @@ impl<'a> Lowerer<'a> {
         let else_value = if let Some(block) = else_block {
             self.lower_block_value(block)
         } else {
-            self.constant(Constant::Unit, TypeId(3), origin)
+            Some(self.constant(Constant::Unit, TypeId(3), origin))
         };
-        self.finish_current(Terminator::Branch {
-            target: join_target,
-            arguments: vec![else_value],
-            origin,
-        });
+        if let Some(value) = else_value {
+            self.finish_current(Terminator::Branch {
+                target: join_target,
+                arguments: vec![value],
+                origin,
+            });
+        }
+
+        if then_value.is_none() && else_value.is_none() {
+            self.bindings = outer_bindings;
+            return None;
+        }
 
         self.current_block = join_target;
         self.bindings = outer_bindings;
@@ -645,10 +726,10 @@ impl<'a> Lowerer<'a> {
             ty,
             origin,
         }];
-        result
+        Some(result)
     }
 
-    fn lower_block_value(&mut self, block: &el_types::TypedBlock) -> ValueId {
+    fn lower_block_value(&mut self, block: &el_types::TypedBlock) -> Option<ValueId> {
         let mut result = None;
         for item in &block.items {
             match item {
@@ -660,7 +741,7 @@ impl<'a> Lowerer<'a> {
                     span,
                     ..
                 } => {
-                    let value = self.lower_expr(initializer);
+                    let value = self.lower_expr(initializer)?;
                     if *mutable {
                         let slot = SlotId(self.slots.len() as u32);
                         self.slots.push(Slot {
@@ -683,7 +764,7 @@ impl<'a> Lowerer<'a> {
                     value,
                     span,
                 } => {
-                    let value = self.lower_expr(value);
+                    let value = self.lower_expr(value)?;
                     let Binding::Slot(slot) = self.bindings[symbol] else {
                         panic!("verified mutable binding")
                     };
@@ -693,12 +774,125 @@ impl<'a> Lowerer<'a> {
                         origin: *span,
                     });
                 }
-                TypedItem::Expr(value) | TypedItem::Return(value) => {
-                    result = Some(self.lower_expr(value))
+                TypedItem::Expr(value) => result = Some(self.lower_expr(value)?),
+                TypedItem::Return(value) => {
+                    let value = self.lower_expr(value)?;
+                    self.finish_current(Terminator::Return {
+                        value,
+                        origin: block.span,
+                    });
+                    return None;
+                }
+                TypedItem::While {
+                    condition,
+                    body,
+                    span,
+                } => {
+                    if !self.lower_while(condition, body, *span) {
+                        return None;
+                    }
+                    result = None;
                 }
             }
         }
-        result.unwrap_or_else(|| self.constant(Constant::Unit, TypeId(3), block.span))
+        Some(result.unwrap_or_else(|| self.constant(Constant::Unit, TypeId(3), block.span)))
+    }
+
+    fn lower_logical(
+        &mut self,
+        operator: LogicalOperator,
+        left: &TypedExpr,
+        right: &TypedExpr,
+        origin: Span,
+    ) -> Option<ValueId> {
+        let left = self.lower_expr(left)?;
+        let right_target = self.new_block();
+        let short_target = self.new_block();
+        let join_target = self.new_block();
+        let (then_target, else_target, short_value) = match operator {
+            LogicalOperator::And => (right_target, short_target, false),
+            LogicalOperator::Or => (short_target, right_target, true),
+        };
+        self.finish_current(Terminator::CondBranch {
+            condition: left,
+            then_target,
+            else_target,
+            origin,
+        });
+
+        self.current_block = short_target;
+        self.current_parameters.clear();
+        let short = self.constant(Constant::Boolean(short_value), TypeId(2), origin);
+        self.finish_current(Terminator::Branch {
+            target: join_target,
+            arguments: vec![short],
+            origin,
+        });
+
+        self.current_block = right_target;
+        self.current_parameters.clear();
+        if let Some(right) = self.lower_expr(right) {
+            self.finish_current(Terminator::Branch {
+                target: join_target,
+                arguments: vec![right],
+                origin,
+            });
+        }
+
+        self.current_block = join_target;
+        let result = self.value();
+        self.current_parameters = vec![CoreParameter {
+            value: result,
+            ty: TypeId(2),
+            origin,
+        }];
+        Some(result)
+    }
+
+    fn lower_while(
+        &mut self,
+        condition: &TypedExpr,
+        body: &el_types::TypedBlock,
+        origin: Span,
+    ) -> bool {
+        let condition_target = self.new_block();
+        let body_target = self.new_block();
+        let exit_target = self.new_block();
+        self.finish_current(Terminator::Branch {
+            target: condition_target,
+            arguments: Vec::new(),
+            origin,
+        });
+
+        let outer_bindings = self.bindings.clone();
+        self.current_block = condition_target;
+        self.current_parameters.clear();
+        self.bindings = outer_bindings.clone();
+        let Some(condition) = self.lower_expr(condition) else {
+            return false;
+        };
+        self.finish_current(Terminator::CondBranch {
+            condition,
+            then_target: body_target,
+            else_target: exit_target,
+            origin,
+        });
+
+        self.current_block = body_target;
+        self.current_parameters.clear();
+        self.bindings = outer_bindings.clone();
+        if self.lower_block_value(body).is_some() {
+            self.finish_current(Terminator::Branch {
+                target: condition_target,
+                arguments: Vec::new(),
+                origin: body.span,
+            });
+        }
+
+        self.current_block = exit_target;
+        self.current_parameters.clear();
+        self.bindings = outer_bindings;
+        true
     }
 
     fn lower_match(
@@ -707,8 +901,8 @@ impl<'a> Lowerer<'a> {
         arms: &[el_types::TypedMatchArm],
         ty: TypeId,
         origin: Span,
-    ) -> ValueId {
-        let subject_value = self.lower_expr(subject);
+    ) -> Option<ValueId> {
+        let subject_value = self.lower_expr(subject)?;
         let join_target = self.new_block();
         let outer_bindings = self.bindings.clone();
         for arm in arms {
@@ -739,17 +933,35 @@ impl<'a> Lowerer<'a> {
                 self.bindings
                     .insert(symbol, Binding::Value(parameter.value));
             }
-            let value = self.lower_block_value(&arm.body);
-            self.finish_current(Terminator::Branch {
-                target: join_target,
-                arguments: vec![value],
-                origin: arm.body.span,
-            });
+            if let Some(value) = self.lower_block_value(&arm.body) {
+                self.finish_current(Terminator::Branch {
+                    target: join_target,
+                    arguments: vec![value],
+                    origin: arm.body.span,
+                });
+            }
             self.current_block = failure_target;
             self.current_parameters.clear();
             self.bindings = outer_bindings.clone();
         }
-        self.finish_current(Terminator::Unreachable { origin });
+        let failure_is_reachable = self.blocks.iter().any(|block| match &block.terminator {
+            Terminator::Branch { target, .. } => *target == self.current_block,
+            Terminator::CondBranch {
+                then_target,
+                else_target,
+                ..
+            } => *then_target == self.current_block || *else_target == self.current_block,
+            Terminator::Switch { cases, default, .. } => {
+                cases
+                    .iter()
+                    .any(|(_, target)| *target == self.current_block)
+                    || default.is_some_and(|target| target == self.current_block)
+            }
+            Terminator::Return { .. } | Terminator::Unreachable { .. } => false,
+        });
+        if failure_is_reachable {
+            self.finish_current(Terminator::Unreachable { origin });
+        }
         self.current_block = join_target;
         self.current_parameters = vec![CoreParameter {
             value: self.value(),
@@ -757,7 +969,7 @@ impl<'a> Lowerer<'a> {
             origin,
         }];
         self.bindings = outer_bindings;
-        self.current_parameters[0].value
+        Some(self.current_parameters[0].value)
     }
 
     fn lower_pattern(
@@ -783,7 +995,7 @@ impl<'a> Lowerer<'a> {
                 });
             }
             TypedPatternKind::Boolean(value) => self.pattern_switch(
-                subject,
+                (subject, pattern.ty),
                 SwitchValue::Boolean(*value),
                 success,
                 failure,
@@ -791,7 +1003,7 @@ impl<'a> Lowerer<'a> {
                 pattern_arguments(bindings),
             ),
             TypedPatternKind::Integer(value) => self.pattern_switch(
-                subject,
+                (subject, pattern.ty),
                 SwitchValue::Integer(*value),
                 success,
                 failure,
@@ -799,7 +1011,7 @@ impl<'a> Lowerer<'a> {
                 pattern_arguments(bindings),
             ),
             TypedPatternKind::Atom(value) => self.pattern_switch(
-                subject,
+                (subject, pattern.ty),
                 SwitchValue::Atom(value.clone()),
                 success,
                 failure,
@@ -809,7 +1021,7 @@ impl<'a> Lowerer<'a> {
             TypedPatternKind::UnionMember { member, symbol, .. } => {
                 let matched = self.new_block();
                 self.pattern_switch(
-                    subject,
+                    (subject, pattern.ty),
                     SwitchValue::UnionMember(*member),
                     matched,
                     failure,
@@ -823,6 +1035,7 @@ impl<'a> Lowerer<'a> {
                     result: value,
                     member: *member,
                     value: subject,
+                    union_ty: pattern.ty,
                     ty: *member,
                     origin: pattern.span,
                 });
@@ -849,7 +1062,7 @@ impl<'a> Lowerer<'a> {
                 self.lower_pattern_sequence(&children, success, failure, bindings);
             }
             TypedPatternKind::ListEmpty => self.pattern_switch(
-                subject,
+                (subject, pattern.ty),
                 SwitchValue::ListEmpty,
                 success,
                 failure,
@@ -859,7 +1072,7 @@ impl<'a> Lowerer<'a> {
             TypedPatternKind::ListCons { head, tail } => {
                 let matched = self.new_block();
                 self.pattern_switch(
-                    subject,
+                    (subject, pattern.ty),
                     SwitchValue::ListCons,
                     matched,
                     failure,
@@ -954,15 +1167,17 @@ impl<'a> Lowerer<'a> {
 
     fn pattern_switch(
         &mut self,
-        subject: ValueId,
+        subject: (ValueId, TypeId),
         value: SwitchValue,
         success: BlockId,
         failure: BlockId,
         origin: Span,
         success_arguments: Vec<ValueId>,
     ) {
+        let (subject, subject_ty) = subject;
         self.finish_current(Terminator::Switch {
             subject,
+            subject_ty,
             cases: vec![(value, success)],
             default: Some(failure),
             origin,
@@ -1342,7 +1557,11 @@ impl<'a> Monomorphizer<'a> {
             for operation in &block.operations {
                 operation_type_ids(operation, &mut types);
             }
-            if let Terminator::Switch { cases, .. } = &block.terminator {
+            if let Terminator::Switch {
+                subject_ty, cases, ..
+            } = &block.terminator
+            {
+                types.push(*subject_ty);
                 types.extend(cases.iter().filter_map(|(value, _)| match value {
                     SwitchValue::UnionMember(ty) => Some(*ty),
                     _ => None,
@@ -1462,7 +1681,11 @@ impl<'a> Monomorphizer<'a> {
             for operation in &mut block.operations {
                 self.specialize_operation(operation, &substitution, ids)?;
             }
-            if let Terminator::Switch { cases, .. } = &mut block.terminator {
+            if let Terminator::Switch {
+                subject_ty, cases, ..
+            } = &mut block.terminator
+            {
+                *subject_ty = self.materialize_type(*subject_ty, &substitution)?;
                 for (value, _) in cases {
                     if let SwitchValue::UnionMember(ty) = value {
                         *ty = self.materialize_type(*ty, &substitution)?;
@@ -1512,6 +1735,9 @@ impl<'a> Monomorphizer<'a> {
             | Operation::Load { ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
             }
+            Operation::Compare { operand_ty, .. } => {
+                *operand_ty = self.materialize_type(*operand_ty, substitution)?;
+            }
             Operation::Call {
                 function,
                 substitutions,
@@ -1527,9 +1753,18 @@ impl<'a> Monomorphizer<'a> {
                 substitutions.clear();
                 *ty = self.materialize_type(*ty, substitution)?;
             }
-            Operation::UnionInject { member, ty, .. }
-            | Operation::UnionProject { member, ty, .. } => {
+            Operation::UnionInject { member, ty, .. } => {
                 *member = self.materialize_type(*member, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::UnionProject {
+                member,
+                union_ty,
+                ty,
+                ..
+            } => {
+                *member = self.materialize_type(*member, substitution)?;
+                *union_ty = self.materialize_type(*union_ty, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
             }
             Operation::Store { .. } => {}
@@ -1693,8 +1928,19 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::CheckedArithmetic { ty, .. }
         | Operation::Call { ty, .. }
         | Operation::Load { ty, .. } => output.push(*ty),
-        Operation::UnionInject { member, ty, .. } | Operation::UnionProject { member, ty, .. } => {
+        Operation::Compare { operand_ty, .. } => output.push(*operand_ty),
+        Operation::UnionInject { member, ty, .. } => {
             output.push(*member);
+            output.push(*ty);
+        }
+        Operation::UnionProject {
+            member,
+            union_ty,
+            ty,
+            ..
+        } => {
+            output.push(*member);
+            output.push(*union_ty);
             output.push(*ty);
         }
         Operation::Store { .. } => {}
@@ -1973,6 +2219,7 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::UnionInject { result, ty, .. }
                     | Operation::UnionProject { result, ty, .. }
                     | Operation::Load { result, ty, .. } => Some((*result, *ty)),
+                    Operation::Compare { result, .. } => Some((*result, TypeId(2))),
                     Operation::Store { .. } => None,
                 })
         }))
@@ -2204,23 +2451,26 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                 }
                 Terminator::Switch {
                     subject,
+                    subject_ty,
                     cases,
                     default,
                     ..
                 } => {
-                    let subject_ty = values.get(subject).copied();
-                    if subject_ty.is_none() {
+                    let actual_subject_ty = values.get(subject).copied();
+                    if actual_subject_ty.is_none() {
                         errors.push(format!("switch in {:?} uses an undefined value", block.id));
+                    } else if actual_subject_ty != Some(*subject_ty) {
+                        errors.push(format!(
+                            "switch in {:?} has an incorrect subject type",
+                            block.id
+                        ));
                     }
                     let mut seen = BTreeSet::new();
                     for (case, target) in cases {
                         if !seen.insert(case_key(case)) {
                             errors.push(format!("switch in {:?} has a duplicate case", block.id));
                         }
-                        let compatible = match (
-                            case,
-                            subject_ty.and_then(|ty| module.types.get(ty.0 as usize)),
-                        ) {
+                        let compatible = match (case, module.types.get(subject_ty.0 as usize)) {
                             (SwitchValue::Boolean(_), Some(Type::Bool))
                             | (SwitchValue::Integer(_), Some(Type::I32 | Type::I64))
                             | (
@@ -2510,6 +2760,31 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::Compare {
+            result,
+            operator,
+            left,
+            right,
+            operand_ty,
+            ..
+        } => {
+            let ordered = !matches!(
+                operator,
+                ComparisonOperator::Equal | ComparisonOperator::NotEqual
+            );
+            let supported = matches!(
+                types.get(operand_ty.0 as usize),
+                Some(Type::I32 | Type::I64)
+            ) || (!ordered
+                && matches!(types.get(operand_ty.0 as usize), Some(Type::Bool)));
+            if values.get(left) != Some(operand_ty)
+                || values.get(right) != Some(operand_ty)
+                || !supported
+            {
+                errors.push(format!("comparison result {result:?} has invalid operands"));
+            }
+            define(*result, TypeId(2), values, errors);
+        }
         Operation::Call {
             result,
             function,
@@ -2556,6 +2831,7 @@ fn verify_operation(
             result,
             member,
             value,
+            union_ty,
             ty,
             ..
         } => {
@@ -2564,7 +2840,8 @@ fn verify_operation(
                     "union projection {result:?} has inconsistent member type"
                 ));
             }
-            if !matches!(values.get(value).and_then(|union| types.get(union.0 as usize)), Some(Type::Union(members)) if members.contains(member))
+            if values.get(value) != Some(union_ty)
+                || !matches!(types.get(union_ty.0 as usize), Some(Type::Union(members)) if members.contains(member))
             {
                 errors.push(format!("union projection {result:?} has an invalid source"));
             }
@@ -2798,6 +3075,17 @@ fn display_operation(operation: &Operation) -> String {
         } => format!(
             "v{} = checked.{operator:?} v{}, v{}: t{}",
             result.0, left.0, right.0, ty.0
+        ),
+        Operation::Compare {
+            result,
+            operator,
+            left,
+            right,
+            operand_ty,
+            ..
+        } => format!(
+            "v{} = compare.{operator:?} v{}, v{}: t{} -> t2",
+            result.0, left.0, right.0, operand_ty.0
         ),
         Operation::Call {
             result,
