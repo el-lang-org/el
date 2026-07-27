@@ -574,23 +574,23 @@ make cleanup explicit in Core IR.
 - [x] Comparisons, `if`, `while`, short-circuit `and`/`or`, and early `return`.
 - [x] Tuples, atoms, closed unions, explicit injection, discriminants, payloads,
   typed member patterns, tagged tuples, and exhaustive `match`.
-- [ ] Pattern usefulness/exhaustiveness analysis with unreachable-arm diagnostics.
-- [ ] Pipeline validation and desugaring that evaluates the left input before
+- [x] Pattern usefulness/exhaustiveness analysis with unreachable-arm diagnostics.
+- [x] Pipeline validation and desugaring that evaluates the left input before
   explicit arguments.
-- [ ] `defer` registration: immediate target/argument evaluation for calls and
+- [x] `defer` registration: immediate target/argument evaluation for calls and
   by-value capture environments for blocks.
-- [ ] Cleanup CFGs that preserve block results and run actions once in LIFO order on
+- [x] Cleanup CFGs that preserve block results and run actions once in LIFO order on
   fallthrough and every normal `return` path.
-- [ ] Unrecoverable failure terminators that deliberately bypass cleanup.
+- [x] Unrecoverable failure terminators that deliberately bypass cleanup.
 - [ ] LLVM lowering for block parameters, conditional branches, switches, aggregate
   values, and cleanup paths.
 
 **Tests**
 
-- [ ] Branch values, loops, nested returns, short-circuit effects, and pipelines.
-- [ ] Exhaustive and non-exhaustive finite/structural matches, top-to-bottom arm
+- [x] Branch values, loops, nested returns, short-circuit effects, and pipelines.
+- [x] Exhaustive and non-exhaustive finite/structural matches, top-to-bottom arm
   order, typed union patterns, and unreachable arms.
-- [ ] Deferred call timing versus block timing, capture snapshots, per-iteration
+- [x] Deferred call timing versus block timing, capture snapshots, per-iteration
   cleanup, nested scopes, saved results, LIFO order, and failure skipping.
 - [ ] Core IR cleanup verifier tests and LLVM verification for every generated
   module.
@@ -1011,8 +1011,24 @@ unchecked and add `(in progress)` after the item when useful.
   debug/release native factorial coverage. Tuples, atoms, normalized closed
   unions, branch injections, private discriminants/member payload storage, typed
   member projections, tagged tuples, exhaustive matches, and LLVM switches now
-  pass a debug/release native tagged-result test; pattern-analysis completion,
-  the string-backed tagged parser, pipelines, and cleanup remain.
+  pass a debug/release native tagged-result test. Recursive usefulness and
+  exhaustiveness analysis now covers finite, infinite-scalar, tuple, list, struct,
+  atom, and union domains; detects individually and collectively subsumed arms;
+  emits span-based diagnostics; and is independently rechecked by the Typed AST
+  verifier. Statically resolved pipelines now desugar during type checking into
+  ordinary calls with the left input in argument zero; chained and generic calls
+  preserve this order through Generic Core and debug/release native execution.
+  Deferred calls now retain registration-time argument values, while deferred
+  blocks rewrite referenced outer bindings to fresh immutable capture symbols and
+  retain registration-time SSA snapshots; timing and mutation-sensitive capture
+  behavior pass debug/release native tests. Dedicated cleanup blocks now carry
+  saved scope results as block parameters and route fallthrough, nested returns,
+  and loop iterations through exactly-once LIFO actions; these paths pass Core IR
+  verification and debug/release native tests. Checked arithmetic now exposes its
+  ordered exceptional edges as category-tagged Core IR failure terminators; the
+  verifier checks their plans and source origins, and debug/release execution
+  confirms failures bypass pending and remaining cleanup. The string-backed tagged
+  parser and remaining LLVM/Core verifier closure remain.
 - [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
 - [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
   rejection.

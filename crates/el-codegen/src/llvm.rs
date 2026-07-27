@@ -1,13 +1,13 @@
 //! The private Inkwell boundary. No Inkwell or LLVM type escapes this module.
 
-use crate::integer_checks::{FailureOrigin, failure_categories};
+use crate::integer_checks::FailureOrigin;
 use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
-    ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant, CoreFunction,
-    FunctionId, Operation, SlotId, SwitchValue, Terminator, Type, TypeId, ValueId, verify_concrete,
+    ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant,
+    CoreFailureCategory, CoreFunction, FunctionId, Operation, SlotId, SwitchValue, Terminator,
+    Type, TypeId, ValueId, verify_concrete,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
-use el_span::Span;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock as LlvmBlock;
@@ -509,6 +509,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     block.id,
                     operation,
                     &builder,
+                    &blocks,
                     &mut values,
                     &slots,
                 )?;
@@ -518,12 +519,14 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_operation(
         &self,
         function: FunctionId,
         block: BlockId,
         operation: &Operation,
         builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
         values: &mut BTreeMap<ValueId, BasicValueEnum<'ctx>>,
         slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
     ) -> Result<(), BackendError> {
@@ -574,13 +577,14 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 operator,
                 left,
                 right,
+                failures,
                 ty,
-                origin,
+                ..
             } => {
                 let left = integer_value(values, *left)?;
                 let right = integer_value(values, *right)?;
                 let value = self.lower_checked_arithmetic(
-                    function, *result, *operator, left, right, *ty, *origin, builder,
+                    *result, *operator, left, right, failures, *ty, builder, blocks,
                 )?;
                 values.insert(*result, value.into());
             }
@@ -740,6 +744,27 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let result = value(values, *id)?;
                 built(builder.build_return(Some(&result)))?;
             }
+            Terminator::Failure { category, origin } => {
+                let origin = FailureOrigin::from_span(*origin)
+                    .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                let category = match category {
+                    CoreFailureCategory::IntegerOverflow => FailureCategory::IntegerOverflow,
+                    CoreFailureCategory::DivisionByZero => FailureCategory::DivisionByZero,
+                };
+                let i32_type = self.context.i32_type();
+                let i64_type = self.context.i64_type();
+                built(builder.build_call(
+                    self.failure,
+                    &[
+                        i32_type.const_int(u64::from(category.code()), false).into(),
+                        i32_type.const_int(u64::from(origin.file), false).into(),
+                        i64_type.const_int(origin.start, false).into(),
+                        i64_type.const_int(origin.end, false).into(),
+                    ],
+                    "",
+                ))?;
+                built(builder.build_unreachable())?;
+            }
             Terminator::Unreachable { .. } => {
                 built(builder.build_unreachable())?;
             }
@@ -843,18 +868,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
     #[allow(clippy::too_many_arguments)]
     fn lower_checked_arithmetic(
         &self,
-        function: FunctionId,
         result: ValueId,
         operator: ArithmeticOperator,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        failures: &[(CoreFailureCategory, BlockId)],
         ty: TypeId,
-        origin: Span,
         builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
     ) -> Result<IntValue<'ctx>, BackendError> {
-        let origin =
-            FailureOrigin::from_span(origin).map_err(|()| BackendError::SourceOriginOutOfRange)?;
-        let categories = failure_categories(operator);
         match operator {
             ArithmeticOperator::Add
             | ArithmeticOperator::Subtract
@@ -896,13 +918,13 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     _ => return Err(BackendError::InvalidIntrinsicResult(intrinsic)),
                 };
                 self.branch_on_failure(
-                    function,
                     result,
                     "overflow",
                     overflow,
-                    categories.overflow,
-                    origin,
+                    CoreFailureCategory::IntegerOverflow,
+                    failures,
                     builder,
+                    blocks,
                 )?;
                 Ok(checked)
             }
@@ -914,15 +936,13 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &format!("v{}.zero", result.0),
                 ))?;
                 self.branch_on_failure(
-                    function,
                     result,
                     "division_by_zero",
                     zero,
-                    categories
-                        .zero
-                        .ok_or(BackendError::InvalidIntegerCheckPlan)?,
-                    origin,
+                    CoreFailureCategory::DivisionByZero,
+                    failures,
                     builder,
+                    blocks,
                 )?;
 
                 let minimum = match self.core.types.get(ty.0 as usize) {
@@ -949,13 +969,13 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &format!("v{}.overflow", result.0),
                 ))?;
                 self.branch_on_failure(
-                    function,
                     result,
                     "overflow",
                     overflow,
-                    categories.overflow,
-                    origin,
+                    CoreFailureCategory::IntegerOverflow,
+                    failures,
                     builder,
+                    blocks,
                 )?;
                 let name = format!("v{}", result.0);
                 match operator {
@@ -976,42 +996,30 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
     #[allow(clippy::too_many_arguments)]
     fn branch_on_failure(
         &self,
-        function: FunctionId,
         result: ValueId,
         label: &str,
         failed: IntValue<'ctx>,
-        category: FailureCategory,
-        origin: FailureOrigin,
+        category: CoreFailureCategory,
+        failures: &[(CoreFailureCategory, BlockId)],
         builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
     ) -> Result<(), BackendError> {
-        let function = self
-            .functions
-            .get(&function)
-            .copied()
-            .ok_or(BackendError::MissingFunction(function))?;
-        let failure = self
-            .context
-            .append_basic_block(function, &format!("v{}.fail.{label}", result.0));
-        let continuation = self
-            .context
-            .append_basic_block(function, &format!("v{}.ok.{label}", result.0));
-        built(builder.build_conditional_branch(failed, failure, continuation))?;
-
-        builder.position_at_end(failure);
-        let i32_type = self.context.i32_type();
-        let i64_type = self.context.i64_type();
-        built(builder.build_call(
-            self.failure,
-            &[
-                i32_type.const_int(u64::from(category.code()), false).into(),
-                i32_type.const_int(u64::from(origin.file), false).into(),
-                i64_type.const_int(origin.start, false).into(),
-                i64_type.const_int(origin.end, false).into(),
-            ],
-            "",
+        let failure = failures
+            .iter()
+            .find_map(|(candidate, block)| (*candidate == category).then_some(*block))
+            .ok_or(BackendError::InvalidIntegerCheckPlan)?;
+        let continuation = self.context.append_basic_block(
+            builder
+                .get_insert_block()
+                .and_then(|block| block.get_parent())
+                .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?,
+            &format!("v{}.ok.{label}", result.0),
+        );
+        built(builder.build_conditional_branch(
+            failed,
+            self.block(blocks, failure)?,
+            continuation,
         ))?;
-        built(builder.build_unreachable())?;
-
         builder.position_at_end(continuation);
         Ok(())
     }
@@ -1175,10 +1183,29 @@ mod tests {
 
         let llvm = lower_to_llvm_ir(&core).expect("checked division lowers and verifies");
         let text = llvm.as_str();
+        let failures = core.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|operation| match operation {
+                Operation::CheckedArithmetic { failures, .. } => Some(failures),
+                _ => None,
+            })
+            .expect("division failure plan");
+        assert_eq!(
+            failures
+                .iter()
+                .map(|(category, _)| *category)
+                .collect::<Vec<_>>(),
+            vec![
+                CoreFailureCategory::DivisionByZero,
+                CoreFailureCategory::IntegerOverflow,
+            ]
+        );
 
-        assert!(text.contains("v2.fail.division_by_zero"));
+        assert!(text.contains(&format!("b{}:", failures[0].1.0)));
         assert!(text.contains("call void @__el_runtime_fail(i32 2, i32 0, i64"));
-        assert!(text.contains("v2.fail.overflow"));
+        assert!(text.contains(&format!("b{}:", failures[1].1.0)));
         assert!(text.contains("call void @__el_runtime_fail(i32 1, i32 0, i64"));
         assert!(text.contains("sdiv i32"));
     }

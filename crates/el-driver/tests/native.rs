@@ -144,6 +144,157 @@ fn native_control_flow_preserves_loops_short_circuiting_and_early_returns() {
 }
 
 #[test]
+fn native_pipelines_insert_and_evaluate_their_input_first() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let succeeds = "defmodule Main do\n  def multiply(value: i32, factor: i32) -> i32 do\n    value * factor\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    6 |> multiply(7) |> identity()\n  end\nend\n";
+    let ordered_failure = "defmodule Main do\n  def fail_input() -> i32 do\n    2147483647 + 1\n  end\n  def combine(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def main() -> i32 do\n    fail_input() |> combine(1 / 0)\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-pipeline"),
+                succeeds,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-pipeline-order"),
+                ordered_failure,
+                profile,
+            )
+            .code(),
+            Some(101),
+            "input overflow must occur before explicit-argument division by zero"
+        );
+    }
+}
+
+#[test]
+fn native_defer_registration_preserves_call_timing_and_capture_snapshots() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let immediate_call = "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def fail_input() -> i32 do\n    2147483647 + 1\n  end\n  def main() -> i32 do\n    defer cleanup(fail_input())\n    1 / 0\n  end\nend\n";
+    let captured_block = "defmodule Main do\n  def numerator() -> i32 do\n    1\n  end\n  def denominator(value: i32) -> i32 do\n    value - 1\n  end\n  def use(value: i32) -> unit do\n    numerator() / denominator(value)\n    unit\n  end\n  def main() -> i32 do\n    mut value: i32 = 1\n    defer do\n      use(value)\n    end\n    value := 2\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-defer-call-registration"),
+                immediate_call,
+                profile,
+            )
+            .code(),
+            Some(101),
+            "deferred call input overflow must run before the later division"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-defer-block-capture"),
+                captured_block,
+                profile,
+            )
+            .code(),
+            Some(102),
+            "deferred block must observe the captured value 1 rather than the later value 2"
+        );
+    }
+}
+
+#[test]
+fn native_cleanup_cfg_preserves_results_returns_lifo_and_loop_scopes() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let saved_result = "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    if true do\n      defer cleanup()\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let nested_return_lifo = "defmodule Main do\n  def maximum() -> i32 do\n    2147483647\n  end\n  def one() -> i32 do\n    1\n  end\n  def numerator() -> i32 do\n    1\n  end\n  def zero() -> i32 do\n    0\n  end\n  def overflow() -> unit do\n    maximum() + one()\n    unit\n  end\n  def divide_by_zero() -> unit do\n    numerator() / zero()\n    unit\n  end\n  def main() -> i32 do\n    defer divide_by_zero()\n    if true do\n      defer divide_by_zero()\n      defer overflow()\n      return 42\n    end\n    0\n  end\nend\n";
+    let per_iteration = "defmodule Main do\n  def maximum() -> i32 do\n    2147483647\n  end\n  def one() -> i32 do\n    1\n  end\n  def numerator() -> i32 do\n    1\n  end\n  def zero() -> i32 do\n    0\n  end\n  def overflow() -> unit do\n    maximum() + one()\n    unit\n  end\n  def main() -> i32 do\n    mut count: i32 = 2\n    while count > 1 do\n      defer overflow()\n      count := count - 1\n    end\n    numerator() / zero()\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-cleanup-saved-result"),
+                saved_result,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "fallthrough cleanup must preserve nested block results"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-cleanup-return-lifo"),
+                nested_return_lifo,
+                profile,
+            )
+            .code(),
+            Some(101),
+            "the last inner action must run first on a nested return"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-cleanup-loop-scope"),
+                per_iteration,
+                profile,
+            )
+            .code(),
+            Some(101),
+            "loop-body cleanup must run before control reaches the next expression"
+        );
+    }
+}
+
+#[test]
+fn native_unrecoverable_failure_bypasses_pending_cleanup() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  def maximum() -> i32 do\n    2147483647\n  end\n  def one() -> i32 do\n    1\n  end\n  def numerator() -> i32 do\n    1\n  end\n  def zero() -> i32 do\n    0\n  end\n  def divide_by_zero() -> unit do\n    numerator() / zero()\n    unit\n  end\n  def main() -> i32 do\n    defer divide_by_zero()\n    maximum() + one()\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-failure-skips-cleanup"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(101),
+            "main overflow must terminate before pending division-by-zero cleanup"
+        );
+    }
+}
+
+#[test]
 fn native_tagged_union_match_preserves_discriminants_and_payloads() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);

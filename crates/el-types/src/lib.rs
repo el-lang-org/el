@@ -144,6 +144,7 @@ pub enum TypedPatternKind {
     },
     Struct {
         declaration: DeclId,
+        field_count: usize,
         fields: Vec<(usize, TypedPattern)>,
     },
 }
@@ -152,6 +153,15 @@ pub enum TypedPatternKind {
 pub struct TypedMatchArm {
     pub pattern: TypedPattern,
     pub body: TypedBlock,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedCapture {
+    pub source: SymbolId,
+    pub symbol: SymbolId,
+    pub name: String,
+    pub ty: TypeId,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +183,17 @@ pub enum TypedItem {
     Return(TypedExpr),
     While {
         condition: TypedExpr,
+        body: TypedBlock,
+        span: Span,
+    },
+    DeferCall {
+        function: DeclId,
+        substitutions: Vec<(TypeId, TypeId)>,
+        arguments: Vec<TypedExpr>,
+        span: Span,
+    },
+    DeferBlock {
+        captures: Vec<TypedCapture>,
         body: TypedBlock,
         span: Span,
     },
@@ -346,6 +367,7 @@ struct Checker<'a> {
     structs: BTreeMap<DeclId, Struct>,
     diagnostics: Vec<Diagnostic>,
     next_symbol: u32,
+    defer_depth: usize,
 }
 
 impl<'a> Checker<'a> {
@@ -385,6 +407,7 @@ impl<'a> Checker<'a> {
                 .collect(),
             diagnostics: Vec::new(),
             next_symbol,
+            defer_depth: 0,
         }
     }
 
@@ -782,6 +805,14 @@ impl<'a> Checker<'a> {
                     items.push(typed);
                 }
                 "return_expr" => {
+                    if self.defer_depth > 0 {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2142",
+                            item.span,
+                            "a deferred block cannot return",
+                        ));
+                        continue;
+                    }
                     let expression = item.children.first()?;
                     if let Some(value) = self.check_expr(
                         expression,
@@ -807,6 +838,19 @@ impl<'a> Checker<'a> {
                         });
                     }
                 }
+                "defer_expr" => {
+                    if self.defer_depth > 0 {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2141",
+                            item.span,
+                            "a deferred block cannot register another `defer`",
+                        ));
+                        continue;
+                    }
+                    if let Some(typed) = self.check_defer(item, owner, scopes) {
+                        items.push(typed);
+                    }
+                }
                 _ => {
                     if let Some(expression) = self.check_expr(item, item_expected, owner, scopes) {
                         items.push(TypedItem::Expr(expression));
@@ -829,6 +873,85 @@ impl<'a> Checker<'a> {
             span: node.span,
             ty,
             items,
+        })
+    }
+
+    fn check_defer(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedItem> {
+        let action = node.children.first()?;
+        if action.kind.as_str() != "defer_block" {
+            let call = self.check_call(action, Some(TypeId(3)), owner, scopes)?;
+            if call.ty != TypeId(3) {
+                self.type_mismatch(action.span, TypeId(3), call.ty);
+                return None;
+            }
+            let TypedExprKind::Call {
+                function,
+                substitutions,
+                arguments,
+            } = call.kind
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2143",
+                    action.span,
+                    "a deferred call must have a statically resolved target",
+                ));
+                return None;
+            };
+            return Some(TypedItem::DeferCall {
+                function,
+                substitutions,
+                arguments,
+                span: node.span,
+            });
+        }
+
+        let block = action.children.first()?;
+        let mut visible = BTreeMap::<String, Local>::new();
+        for scope in scopes.iter() {
+            visible.extend(scope.clone());
+        }
+        let mut visible = visible.into_iter().collect::<Vec<_>>();
+        visible.sort_by_key(|(_, local)| local.symbol);
+        let mut capture_scope = BTreeMap::new();
+        let mut captures = Vec::new();
+        for (name, local) in visible {
+            let symbol = SymbolId(self.next_symbol);
+            self.next_symbol += 1;
+            capture_scope.insert(
+                name.clone(),
+                Local {
+                    symbol,
+                    ty: local.ty,
+                    mutable: false,
+                    span: local.span,
+                },
+            );
+            captures.push(TypedCapture {
+                source: local.symbol,
+                symbol,
+                name,
+                ty: local.ty,
+                span: local.span,
+            });
+        }
+
+        let mut action_scopes = vec![capture_scope];
+        self.defer_depth += 1;
+        let body = self.check_block(block, Some(TypeId(3)), owner, &mut action_scopes);
+        self.defer_depth -= 1;
+        let body = body?;
+        let mut referenced = BTreeSet::new();
+        collect_block_locals(&body, &mut referenced);
+        captures.retain(|capture| referenced.contains(&capture.symbol));
+        Some(TypedItem::DeferBlock {
+            captures,
+            body,
+            span: node.span,
         })
     }
 
@@ -1070,6 +1193,7 @@ impl<'a> Checker<'a> {
     ) -> Option<TypedExpr> {
         if let Some(expected) = expected
             && matches!(self.types[expected.0 as usize], Type::Union(_))
+            && node.kind.as_str() != "pipeline_expr"
         {
             if node.kind.as_str() == "if_expr" {
                 return self.check_if(node, Some(expected), owner, scopes);
@@ -1105,6 +1229,7 @@ impl<'a> Checker<'a> {
             }
             "equality_expr" | "comparison_expr" => self.check_comparison(node, owner, scopes),
             "logical_and_expr" | "logical_or_expr" => self.check_logical(node, owner, scopes),
+            "pipeline_expr" => self.check_pipeline(node, expected, owner, scopes),
             "postfix_expr" => self.check_call(node, expected, owner, scopes),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -1448,6 +1573,7 @@ impl<'a> Checker<'a> {
     ) -> Option<TypedExpr> {
         let subject = Box::new(self.check_expr(&node.children[0], None, owner, scopes)?);
         let mut matrix = Vec::<Vec<PatternShape>>::new();
+        let mut matrix_spans = Vec::<Span>::new();
         let mut arms = Vec::new();
         let mut result_type = expected;
         for arm_node in &node.children[1..] {
@@ -1455,23 +1581,30 @@ impl<'a> Checker<'a> {
             let mut arm_scope = BTreeMap::new();
             let (mut pattern, shape) =
                 self.check_pattern(pattern_node, subject.ty, owner, &mut arm_scope)?;
-            let reachable = pattern_is_useful(
-                &matrix,
-                vec![shape.clone()],
-                vec![subject.ty],
-                &self.types,
-                &self.structs,
-            );
+            let reachable =
+                pattern_is_useful(&matrix, vec![shape.clone()], vec![subject.ty], &self.types);
             if !reachable {
-                self.diagnostics.push(Diagnostic::error(
-                    "E2125",
-                    pattern.span,
-                    "unreachable match arm",
-                ));
+                let mut diagnostic =
+                    Diagnostic::error("E2125", pattern.span, "unreachable match arm");
+                if let Some((_, span)) = matrix.iter().zip(&matrix_spans).find(|(row, _)| {
+                    !pattern_is_useful(
+                        std::slice::from_ref(*row),
+                        vec![shape.clone()],
+                        vec![subject.ty],
+                        &self.types,
+                    )
+                }) {
+                    diagnostic = diagnostic.with_label(*span, "earlier arm subsumes this pattern");
+                } else {
+                    diagnostic =
+                        diagnostic.with_note("the preceding arms collectively cover this pattern");
+                }
+                self.diagnostics.push(diagnostic);
                 continue;
             }
             pattern.facts.reachable = true;
             matrix.push(vec![shape]);
+            matrix_spans.push(pattern.span);
             scopes.push(arm_scope);
             let body = self.check_block(&arm_node.children[1], result_type, owner, scopes);
             scopes.pop();
@@ -1484,14 +1617,12 @@ impl<'a> Checker<'a> {
             vec![PatternShape::Wildcard],
             vec![subject.ty],
             &self.types,
-            &self.structs,
         );
         if !exhaustive {
-            self.diagnostics.push(Diagnostic::error(
-                "E2126",
-                node.span,
-                "non-exhaustive match",
-            ));
+            self.diagnostics.push(
+                Diagnostic::error("E2126", node.span, "non-exhaustive match")
+                    .with_help("add the missing cases or a wildcard/binding catch-all arm"),
+            );
             return None;
         }
         Some(TypedExpr {
@@ -1563,7 +1694,7 @@ impl<'a> Checker<'a> {
                 }
                 (
                     TypedPatternKind::Atom(name.clone()),
-                    false,
+                    true,
                     PatternShape::Atom(name.clone()),
                 )
             }
@@ -1770,6 +1901,7 @@ impl<'a> Checker<'a> {
                 (
                     TypedPatternKind::Struct {
                         declaration,
+                        field_count: structure.fields.len(),
                         fields,
                     },
                     irrefutable,
@@ -1933,7 +2065,7 @@ impl<'a> Checker<'a> {
             || (!ordered && matches!(self.types[left.ty.0 as usize], Type::Bool));
         if !supported {
             self.diagnostics.push(Diagnostic::error(
-                "E2125",
+                "E2139",
                 node.span,
                 if ordered {
                     "ordered comparison requires matching integer operands"
@@ -1982,6 +2114,39 @@ impl<'a> Checker<'a> {
     fn check_call(
         &mut self,
         node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        self.check_call_with_input(node, None, node.span, expected, owner, scopes)
+    }
+
+    fn check_pipeline(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let [input, call] = node.children.as_slice() else {
+            return None;
+        };
+        if call.kind.as_str() != "postfix_expr" {
+            self.diagnostics.push(Diagnostic::error(
+                "E2140",
+                call.span,
+                "the right side of `|>` must be a statically resolvable call",
+            ));
+            return None;
+        }
+        self.check_call_with_input(call, Some(input), node.span, expected, owner, scopes)
+    }
+
+    fn check_call_with_input<'b>(
+        &mut self,
+        node: &'b Node,
+        input: Option<&'b Node>,
+        span: Span,
         expected: Option<TypeId>,
         owner: DeclId,
         scopes: &mut Vec<BTreeMap<String, Local>>,
@@ -2036,14 +2201,18 @@ impl<'a> Checker<'a> {
             .children
             .iter()
             .find(|node| node.kind.as_str() == "call_arguments")?;
-        if arguments_node.children.len() != signature.parameters.len() {
+        let argument_nodes = input
+            .into_iter()
+            .chain(arguments_node.children.iter())
+            .collect::<Vec<_>>();
+        if argument_nodes.len() != signature.parameters.len() {
             self.diagnostics.push(Diagnostic::error(
                 "E2111",
-                node.span,
+                span,
                 format!(
                     "function `{name}` expects {} arguments but received {}",
                     signature.parameters.len(),
-                    arguments_node.children.len()
+                    argument_nodes.len()
                 ),
             ));
             return None;
@@ -2053,8 +2222,7 @@ impl<'a> Checker<'a> {
             let _ = unify_types(&self.types, signature.result, expected, &mut substitutions);
         }
         let mut arguments = Vec::new();
-        for (argument_node, parameter) in arguments_node.children.iter().zip(&signature.parameters)
-        {
+        for (argument_node, parameter) in argument_nodes.into_iter().zip(&signature.parameters) {
             let parameter_expected = self.apply_substitutions(*parameter, &substitutions);
             let argument = self.check_expr(
                 argument_node,
@@ -2076,7 +2244,7 @@ impl<'a> Checker<'a> {
         {
             self.diagnostics.push(Diagnostic::error(
                 "E2112",
-                node.span,
+                span,
                 format!(
                     "cannot infer generic type parameter `{}`",
                     self.type_name(*missing)
@@ -2089,7 +2257,7 @@ impl<'a> Checker<'a> {
             if !self.type_satisfies(concrete, protocol, owner) {
                 self.diagnostics.push(Diagnostic::error(
                     "E2120",
-                    node.span,
+                    span,
                     format!(
                         "type `{}` does not satisfy `{protocol}`",
                         self.type_name(concrete)
@@ -2106,7 +2274,7 @@ impl<'a> Checker<'a> {
                 arguments,
             },
             ty: result,
-            span: node.span,
+            span,
         })
     }
 
@@ -2621,7 +2789,6 @@ fn pattern_is_useful(
     query: Vec<PatternShape>,
     types_to_match: Vec<TypeId>,
     types: &[Type],
-    structs: &BTreeMap<DeclId, Struct>,
 ) -> bool {
     if query.is_empty() {
         return matrix.is_empty();
@@ -2636,17 +2803,11 @@ fn pattern_is_useful(
                 .map(|row| row[1..].to_vec())
                 .collect::<Vec<_>>();
             if !defaults.is_empty()
-                && !pattern_is_useful(
-                    &defaults,
-                    query[1..].to_vec(),
-                    tail_types.to_vec(),
-                    types,
-                    structs,
-                )
+                && !pattern_is_useful(&defaults, query[1..].to_vec(), tail_types.to_vec(), types)
             {
                 return false;
             }
-            if let Some(constructors) = complete_constructors(head_ty, matrix, types, structs) {
+            if let Some(constructors) = complete_constructors(head_ty, matrix, types) {
                 constructors.into_iter().any(|constructor| {
                     let component_types =
                         constructor_component_types(&constructor, head_ty, matrix, types);
@@ -2655,22 +2816,10 @@ fn pattern_is_useful(
                     specialized_query.extend_from_slice(&query[1..]);
                     let mut specialized_types = component_types;
                     specialized_types.extend_from_slice(tail_types);
-                    pattern_is_useful(
-                        &specialized,
-                        specialized_query,
-                        specialized_types,
-                        types,
-                        structs,
-                    )
+                    pattern_is_useful(&specialized, specialized_query, specialized_types, types)
                 })
             } else {
-                pattern_is_useful(
-                    &defaults,
-                    query[1..].to_vec(),
-                    tail_types.to_vec(),
-                    types,
-                    structs,
-                )
+                pattern_is_useful(&defaults, query[1..].to_vec(), tail_types.to_vec(), types)
             }
         }
         shape => {
@@ -2687,13 +2836,7 @@ fn pattern_is_useful(
             specialized_query.extend_from_slice(&query[1..]);
             let mut specialized_types = component_types;
             specialized_types.extend_from_slice(tail_types);
-            pattern_is_useful(
-                &specialized,
-                specialized_query,
-                specialized_types,
-                types,
-                structs,
-            )
+            pattern_is_useful(&specialized, specialized_query, specialized_types, types)
         }
     }
 }
@@ -2702,7 +2845,6 @@ fn complete_constructors(
     ty: TypeId,
     matrix: &[Vec<PatternShape>],
     types: &[Type],
-    structs: &BTreeMap<DeclId, Struct>,
 ) -> Option<Vec<PatternConstructor>> {
     match &types[ty.0 as usize] {
         Type::Bool => Some(vec![
@@ -2715,9 +2857,7 @@ fn complete_constructors(
             PatternConstructor::ListEmpty,
             PatternConstructor::ListCons,
         ]),
-        Type::Struct { declaration, .. } if structs.contains_key(declaration) => {
-            Some(vec![PatternConstructor::Struct(*declaration)])
-        }
+        Type::Struct { declaration, .. } => Some(vec![PatternConstructor::Struct(*declaration)]),
         Type::Union(members) => Some(
             members
                 .iter()
@@ -2820,6 +2960,58 @@ fn shape_components(shape: &PatternShape) -> Vec<(TypeId, PatternShape)> {
         PatternShape::Tuple(elements) | PatternShape::Struct(_, elements) => elements.clone(),
         PatternShape::ListCons(head, tail) => vec![(**head).clone(), (**tail).clone()],
         _ => Vec::new(),
+    }
+}
+
+fn verified_pattern_shape(pattern: &TypedPattern) -> (PatternShape, bool) {
+    match &pattern.kind {
+        TypedPatternKind::Wildcard | TypedPatternKind::Binding { .. } => {
+            (PatternShape::Wildcard, true)
+        }
+        TypedPatternKind::Boolean(value) => (PatternShape::Bool(*value), false),
+        TypedPatternKind::Integer(value) => (PatternShape::Integer(*value), false),
+        TypedPatternKind::Atom(value) => (PatternShape::Atom(value.clone()), true),
+        TypedPatternKind::UnionMember { member, .. } => (PatternShape::Union(*member), false),
+        TypedPatternKind::Tuple(elements) => {
+            let mut irrefutable = true;
+            let children = elements
+                .iter()
+                .map(|child| {
+                    let (shape, child_irrefutable) = verified_pattern_shape(child);
+                    irrefutable &= child_irrefutable;
+                    (child.ty, shape)
+                })
+                .collect();
+            (PatternShape::Tuple(children), irrefutable)
+        }
+        TypedPatternKind::ListEmpty => (PatternShape::ListEmpty, false),
+        TypedPatternKind::ListCons { head, tail } => {
+            let (head_shape, _) = verified_pattern_shape(head);
+            let (tail_shape, _) = verified_pattern_shape(tail);
+            (
+                PatternShape::ListCons(
+                    Box::new((head.ty, head_shape)),
+                    Box::new((tail.ty, tail_shape)),
+                ),
+                false,
+            )
+        }
+        TypedPatternKind::Struct {
+            declaration,
+            field_count,
+            fields,
+        } => {
+            let mut shapes = vec![(TypeId(3), PatternShape::Wildcard); *field_count];
+            let mut irrefutable = true;
+            for (index, child) in fields {
+                if let Some(slot) = shapes.get_mut(*index) {
+                    let (shape, child_irrefutable) = verified_pattern_shape(child);
+                    irrefutable &= child_irrefutable;
+                    *slot = (child.ty, shape);
+                }
+            }
+            (PatternShape::Struct(*declaration, shapes), irrefutable)
+        }
     }
 }
 
@@ -3033,6 +3225,184 @@ fn verify_item(
                 errors.push("while body has a non-unit type".to_owned());
             }
         }
+        TypedItem::DeferCall {
+            function,
+            arguments,
+            ..
+        } => {
+            if !declarations.contains(function) {
+                errors.push(format!(
+                    "deferred call references unknown function {function:?}"
+                ));
+            }
+            for argument in arguments {
+                verify_expr(
+                    argument,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+        }
+        TypedItem::DeferBlock { captures, body, .. } => {
+            let mut nested_symbols = BTreeMap::new();
+            let mut seen_sources = BTreeSet::new();
+            for capture in captures {
+                match symbols.get(&capture.source) {
+                    Some(ty) if *ty != capture.ty => {
+                        errors.push("deferred capture source has an incorrect type".to_owned())
+                    }
+                    None => errors.push("deferred capture references an unknown source".to_owned()),
+                    _ => {}
+                }
+                if capture.source == capture.symbol
+                    || !seen_sources.insert(capture.source)
+                    || nested_symbols.insert(capture.symbol, capture.ty).is_some()
+                {
+                    errors.push("deferred capture identities are not unique".to_owned());
+                }
+            }
+            let mut nested_mutable = BTreeSet::new();
+            for item in &body.items {
+                verify_item(
+                    item,
+                    types,
+                    type_count,
+                    declarations,
+                    &mut nested_symbols,
+                    &mut nested_mutable,
+                    errors,
+                );
+            }
+            if body.ty != TypeId(3) {
+                errors.push("deferred block has a non-unit type".to_owned());
+            }
+            if deferred_block_has_forbidden_item(body) {
+                errors.push("deferred block contains return or nested defer".to_owned());
+            }
+        }
+    }
+}
+
+fn deferred_block_has_forbidden_item(block: &TypedBlock) -> bool {
+    block.items.iter().any(|item| match item {
+        TypedItem::Return(_) | TypedItem::DeferCall { .. } | TypedItem::DeferBlock { .. } => true,
+        TypedItem::While { body, .. } => deferred_block_has_forbidden_item(body),
+        TypedItem::Expr(TypedExpr {
+            kind:
+                TypedExprKind::If {
+                    then_block,
+                    else_block,
+                    ..
+                },
+            ..
+        }) => {
+            deferred_block_has_forbidden_item(then_block)
+                || else_block
+                    .as_ref()
+                    .is_some_and(deferred_block_has_forbidden_item)
+        }
+        TypedItem::Expr(TypedExpr {
+            kind: TypedExprKind::Match { arms, .. },
+            ..
+        }) => arms
+            .iter()
+            .any(|arm| deferred_block_has_forbidden_item(&arm.body)),
+        _ => false,
+    })
+}
+
+fn collect_block_locals(block: &TypedBlock, output: &mut BTreeSet<SymbolId>) {
+    for item in &block.items {
+        match item {
+            TypedItem::Let { initializer, .. } => collect_expr_locals(initializer, output),
+            TypedItem::Assign { symbol, value, .. } => {
+                output.insert(*symbol);
+                collect_expr_locals(value, output);
+            }
+            TypedItem::Expr(expression) | TypedItem::Return(expression) => {
+                collect_expr_locals(expression, output);
+            }
+            TypedItem::While {
+                condition, body, ..
+            } => {
+                collect_expr_locals(condition, output);
+                collect_block_locals(body, output);
+            }
+            TypedItem::DeferCall { arguments, .. } => {
+                for argument in arguments {
+                    collect_expr_locals(argument, output);
+                }
+            }
+            TypedItem::DeferBlock { captures, .. } => {
+                output.extend(captures.iter().map(|capture| capture.source));
+            }
+        }
+    }
+}
+
+fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) {
+    match &expression.kind {
+        TypedExprKind::Local(symbol) => {
+            output.insert(*symbol);
+        }
+        TypedExprKind::List { elements, tail } => {
+            for element in elements {
+                collect_expr_locals(element, output);
+            }
+            if let Some(tail) = tail {
+                collect_expr_locals(tail, output);
+            }
+        }
+        TypedExprKind::Array(elements) | TypedExprKind::Tuple(elements) => {
+            for element in elements {
+                collect_expr_locals(element, output);
+            }
+        }
+        TypedExprKind::Map(entries) => {
+            for (key, value) in entries {
+                collect_expr_locals(key, output);
+                collect_expr_locals(value, output);
+            }
+        }
+        TypedExprKind::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            collect_expr_locals(condition, output);
+            collect_block_locals(then_block, output);
+            if let Some(block) = else_block {
+                collect_block_locals(block, output);
+            }
+        }
+        TypedExprKind::Match { subject, arms, .. } => {
+            collect_expr_locals(subject, output);
+            for arm in arms {
+                collect_block_locals(&arm.body, output);
+            }
+        }
+        TypedExprKind::Ascription(value) | TypedExprKind::UnionInject { value, .. } => {
+            collect_expr_locals(value, output);
+        }
+        TypedExprKind::Binary { left, right, .. }
+        | TypedExprKind::Comparison { left, right, .. }
+        | TypedExprKind::Logical { left, right, .. } => {
+            collect_expr_locals(left, output);
+            collect_expr_locals(right, output);
+        }
+        TypedExprKind::Call { arguments, .. } => {
+            for argument in arguments {
+                collect_expr_locals(argument, output);
+            }
+        }
+        TypedExprKind::Integer(_)
+        | TypedExprKind::Boolean(_)
+        | TypedExprKind::Unit
+        | TypedExprKind::Atom(_) => {}
     }
 }
 
@@ -3254,13 +3624,18 @@ fn verify_expr(
                 mutable_symbols,
                 errors,
             );
-            if !*exhaustive {
-                errors.push("typed match is not exhaustive".to_owned());
-            }
+            let mut matrix = Vec::<Vec<PatternShape>>::new();
             for arm in arms {
-                if arm.pattern.ty != subject.ty || !arm.pattern.facts.reachable {
+                let (shape, irrefutable) = verified_pattern_shape(&arm.pattern);
+                let useful =
+                    pattern_is_useful(&matrix, vec![shape.clone()], vec![subject.ty], types);
+                if arm.pattern.ty != subject.ty
+                    || arm.pattern.facts.reachable != useful
+                    || arm.pattern.facts.irrefutable != irrefutable
+                {
                     errors.push("match pattern facts are inconsistent".to_owned());
                 }
+                matrix.push(vec![shape]);
                 let mut nested_symbols = symbols.clone();
                 verify_pattern(&arm.pattern, types, type_count, &mut nested_symbols, errors);
                 let mut nested_mutable = mutable_symbols.clone();
@@ -3278,6 +3653,15 @@ fn verify_expr(
                 if arm.body.ty != expression.ty {
                     errors.push("match arm has an incorrect result type".to_owned());
                 }
+            }
+            let proven_exhaustive = !pattern_is_useful(
+                &matrix,
+                vec![PatternShape::Wildcard],
+                vec![subject.ty],
+                types,
+            );
+            if *exhaustive != proven_exhaustive {
+                errors.push("typed match exhaustiveness fact is inconsistent".to_owned());
             }
         }
         TypedExprKind::Ascription(value) => {
@@ -3426,6 +3810,10 @@ fn verify_pattern(
         errors.push("pattern has an unknown type".to_owned());
         return;
     }
+    let (_, irrefutable) = verified_pattern_shape(pattern);
+    if !pattern.facts.reachable || pattern.facts.irrefutable != irrefutable {
+        errors.push("pattern facts are inconsistent".to_owned());
+    }
     match &pattern.kind {
         TypedPatternKind::Binding { symbol, .. } => {
             if symbols.insert(*symbol, pattern.ty).is_some() {
@@ -3468,13 +3856,18 @@ fn verify_pattern(
         }
         TypedPatternKind::Struct {
             declaration,
+            field_count,
             fields,
         } => {
             if !matches!(types[pattern.ty.0 as usize], Type::Struct { declaration: found, .. } if found == *declaration)
             {
                 errors.push("struct pattern has an incorrect nominal type".to_owned());
             }
-            for (_, child) in fields {
+            let mut seen = BTreeSet::new();
+            for (index, child) in fields {
+                if *index >= *field_count || !seen.insert(*index) {
+                    errors.push("struct pattern has an invalid field index".to_owned());
+                }
                 verify_pattern(child, types, type_count, symbols, errors);
             }
         }
@@ -3606,6 +3999,29 @@ fn write_items(program: &TypedProgram, output: &mut String, items: &[TypedItem],
             } => {
                 output.push_str(&format!("{indent}while\n"));
                 write_expr(program, output, condition, depth + 1);
+                write_items(program, output, &body.items, depth + 1);
+            }
+            TypedItem::DeferCall {
+                function,
+                arguments,
+                ..
+            } => {
+                output.push_str(&format!("{indent}defer call d{}\n", function.0));
+                for argument in arguments {
+                    write_expr(program, output, argument, depth + 1);
+                }
+            }
+            TypedItem::DeferBlock { captures, body, .. } => {
+                output.push_str(&format!("{indent}defer block\n"));
+                for capture in captures {
+                    output.push_str(&format!(
+                        "{indent}  capture s{} as s{} {}: {}\n",
+                        capture.source.0,
+                        capture.symbol.0,
+                        capture.name,
+                        program.display_type(capture.ty)
+                    ));
+                }
                 write_items(program, output, &body.items, depth + 1);
             }
         }

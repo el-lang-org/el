@@ -20,6 +20,12 @@ pub struct ValueId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SlotId(pub u32);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CoreFailureCategory {
+    IntegerOverflow,
+    DivisionByZero,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenericModule {
     pub types: Vec<Type>,
@@ -162,6 +168,7 @@ pub enum Operation {
         operator: ArithmeticOperator,
         left: ValueId,
         right: ValueId,
+        failures: Vec<(CoreFailureCategory, BlockId)>,
         ty: TypeId,
         origin: Span,
     },
@@ -241,6 +248,10 @@ pub enum Terminator {
         value: ValueId,
         origin: Span,
     },
+    Failure {
+        category: CoreFailureCategory,
+        origin: Span,
+    },
     Unreachable {
         origin: Span,
     },
@@ -262,8 +273,34 @@ enum Binding {
     Slot(SlotId),
 }
 
+#[derive(Clone)]
+enum CleanupAction<'a> {
+    Call {
+        function: DeclId,
+        substitutions: &'a [(TypeId, TypeId)],
+        arguments: Vec<ValueId>,
+        origin: Span,
+    },
+    Block {
+        captures: BTreeMap<SymbolId, Binding>,
+        body: &'a el_types::TypedBlock,
+    },
+}
+
 fn pattern_arguments(bindings: &BTreeMap<SymbolId, (ValueId, TypeId)>) -> Vec<ValueId> {
     bindings.values().map(|(value, _)| *value).collect()
+}
+
+fn arithmetic_failure_categories(operator: ArithmeticOperator) -> &'static [CoreFailureCategory] {
+    match operator {
+        ArithmeticOperator::Add | ArithmeticOperator::Subtract | ArithmeticOperator::Multiply => {
+            &[CoreFailureCategory::IntegerOverflow]
+        }
+        ArithmeticOperator::Divide | ArithmeticOperator::Remainder => &[
+            CoreFailureCategory::DivisionByZero,
+            CoreFailureCategory::IntegerOverflow,
+        ],
+    }
 }
 
 /// Lowers verified Typed AST while preserving source evaluation order.
@@ -332,6 +369,7 @@ struct Lowerer<'a> {
     current_parameters: Vec<CoreParameter>,
     next_block: u32,
     operations: Vec<Operation>,
+    cleanup_scopes: Vec<Vec<CleanupAction<'a>>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -352,6 +390,7 @@ impl<'a> Lowerer<'a> {
             current_parameters: Vec::new(),
             next_block: 1,
             operations: Vec::new(),
+            cleanup_scopes: Vec::new(),
         }
     }
 
@@ -372,6 +411,7 @@ impl<'a> Lowerer<'a> {
                 }
             })
             .collect();
+        self.cleanup_scopes.push(Vec::new());
         let mut result = None;
         let mut return_origin = self.function.body.span;
         for item in &self.function.body.items {
@@ -431,6 +471,12 @@ impl<'a> Lowerer<'a> {
                 }
                 TypedItem::Return(expression) => {
                     if let Some(value) = self.lower_expr(expression) {
+                        let Some(value) =
+                            self.run_all_cleanups(value, self.function.result, expression.span)
+                        else {
+                            result = None;
+                            break;
+                        };
                         self.finish_current(Terminator::Return {
                             value,
                             origin: expression.span,
@@ -450,6 +496,42 @@ impl<'a> Lowerer<'a> {
                     }
                     result = None;
                 }
+                TypedItem::DeferCall {
+                    function,
+                    substitutions,
+                    arguments,
+                    span,
+                } => {
+                    let Some(arguments) = arguments
+                        .iter()
+                        .map(|argument| self.lower_expr(argument))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        result = None;
+                        break;
+                    };
+                    self.cleanup_scopes
+                        .last_mut()
+                        .expect("function scope exists")
+                        .push(CleanupAction::Call {
+                            function: *function,
+                            substitutions,
+                            arguments,
+                            origin: *span,
+                        });
+                    result = None;
+                }
+                TypedItem::DeferBlock { captures, body, .. } => {
+                    let Some(captures) = self.lower_captures(captures) else {
+                        result = None;
+                        break;
+                    };
+                    self.cleanup_scopes
+                        .last_mut()
+                        .expect("function scope exists")
+                        .push(CleanupAction::Block { captures, body });
+                    result = None;
+                }
             }
         }
         if !self
@@ -460,10 +542,12 @@ impl<'a> Lowerer<'a> {
             let value = result.unwrap_or_else(|| {
                 self.constant(Constant::Unit, TypeId(3), self.function.body.span)
             });
-            self.finish_current(Terminator::Return {
-                value,
-                origin: return_origin,
-            });
+            if let Some(value) = self.finish_scope(value, self.function.result, return_origin) {
+                self.finish_current(Terminator::Return {
+                    value,
+                    origin: return_origin,
+                });
+            }
         }
         self.blocks.sort_by_key(|block| block.id);
         CoreFunction {
@@ -483,7 +567,7 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    fn lower_expr(&mut self, expression: &TypedExpr) -> Option<ValueId> {
+    fn lower_expr(&mut self, expression: &'a TypedExpr) -> Option<ValueId> {
         Some(match &expression.kind {
             TypedExprKind::Integer(value) => {
                 self.constant(Constant::Integer(*value), expression.ty, expression.span)
@@ -579,12 +663,14 @@ impl<'a> Lowerer<'a> {
             } => {
                 let left = self.lower_expr(left)?;
                 let right = self.lower_expr(right)?;
+                let failures = self.checked_failure_targets(*operator, expression.span);
                 let result = self.value();
                 self.operations.push(Operation::CheckedArithmetic {
                     result,
                     operator: *operator,
                     left,
                     right,
+                    failures,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -667,9 +753,9 @@ impl<'a> Lowerer<'a> {
 
     fn lower_if(
         &mut self,
-        condition: &TypedExpr,
-        then_block: &el_types::TypedBlock,
-        else_block: Option<&el_types::TypedBlock>,
+        condition: &'a TypedExpr,
+        then_block: &'a el_types::TypedBlock,
+        else_block: Option<&'a el_types::TypedBlock>,
         ty: TypeId,
         origin: Span,
     ) -> Option<ValueId> {
@@ -729,7 +815,8 @@ impl<'a> Lowerer<'a> {
         Some(result)
     }
 
-    fn lower_block_value(&mut self, block: &el_types::TypedBlock) -> Option<ValueId> {
+    fn lower_block_value(&mut self, block: &'a el_types::TypedBlock) -> Option<ValueId> {
+        self.cleanup_scopes.push(Vec::new());
         let mut result = None;
         for item in &block.items {
             match item {
@@ -775,12 +862,19 @@ impl<'a> Lowerer<'a> {
                     });
                 }
                 TypedItem::Expr(value) => result = Some(self.lower_expr(value)?),
-                TypedItem::Return(value) => {
-                    let value = self.lower_expr(value)?;
+                TypedItem::Return(expression) => {
+                    let value = self.lower_expr(expression)?;
+                    let Some(value) =
+                        self.run_all_cleanups(value, self.function.result, expression.span)
+                    else {
+                        self.cleanup_scopes.pop();
+                        return None;
+                    };
                     self.finish_current(Terminator::Return {
                         value,
                         origin: block.span,
                     });
+                    self.cleanup_scopes.pop();
                     return None;
                 }
                 TypedItem::While {
@@ -793,16 +887,164 @@ impl<'a> Lowerer<'a> {
                     }
                     result = None;
                 }
+                TypedItem::DeferCall {
+                    function,
+                    substitutions,
+                    arguments,
+                    span,
+                } => {
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| self.lower_expr(argument))
+                        .collect::<Option<Vec<_>>>()?;
+                    self.cleanup_scopes
+                        .last_mut()
+                        .expect("lexical scope exists")
+                        .push(CleanupAction::Call {
+                            function: *function,
+                            substitutions,
+                            arguments,
+                            origin: *span,
+                        });
+                    result = None;
+                }
+                TypedItem::DeferBlock { captures, body, .. } => {
+                    let captures = self.lower_captures(captures)?;
+                    self.cleanup_scopes
+                        .last_mut()
+                        .expect("lexical scope exists")
+                        .push(CleanupAction::Block { captures, body });
+                    result = None;
+                }
             }
         }
-        Some(result.unwrap_or_else(|| self.constant(Constant::Unit, TypeId(3), block.span)))
+        let result = result.unwrap_or_else(|| self.constant(Constant::Unit, TypeId(3), block.span));
+        self.finish_scope(result, block.ty, block.span)
+    }
+
+    fn lower_captures(
+        &mut self,
+        captures: &[el_types::TypedCapture],
+    ) -> Option<BTreeMap<SymbolId, Binding>> {
+        let mut lowered = BTreeMap::new();
+        for capture in captures {
+            let value = self.read_binding(capture.source, capture.ty, capture.span)?;
+            lowered.insert(capture.symbol, Binding::Value(value));
+        }
+        Some(lowered)
+    }
+
+    fn checked_failure_targets(
+        &mut self,
+        operator: ArithmeticOperator,
+        origin: Span,
+    ) -> Vec<(CoreFailureCategory, BlockId)> {
+        arithmetic_failure_categories(operator)
+            .iter()
+            .copied()
+            .map(|category| {
+                let block = self.new_block();
+                self.blocks.push(Block {
+                    id: block,
+                    parameters: Vec::new(),
+                    operations: Vec::new(),
+                    terminator: Terminator::Failure { category, origin },
+                });
+                (category, block)
+            })
+            .collect()
+    }
+
+    fn read_binding(&mut self, symbol: SymbolId, ty: TypeId, origin: Span) -> Option<ValueId> {
+        Some(match self.bindings.get(&symbol).copied()? {
+            Binding::Value(value) => value,
+            Binding::Slot(slot) => {
+                let result = self.value();
+                self.operations.push(Operation::Load {
+                    result,
+                    slot,
+                    ty,
+                    origin,
+                });
+                result
+            }
+        })
+    }
+
+    fn finish_scope(&mut self, result: ValueId, ty: TypeId, origin: Span) -> Option<ValueId> {
+        let actions = self.cleanup_scopes.pop().expect("lexical scope exists");
+        self.route_cleanup_actions(actions, result, ty, origin)
+    }
+
+    fn run_all_cleanups(
+        &mut self,
+        mut result: ValueId,
+        ty: TypeId,
+        origin: Span,
+    ) -> Option<ValueId> {
+        let scopes = self.cleanup_scopes.clone();
+        for actions in scopes.into_iter().rev() {
+            result = self.route_cleanup_actions(actions, result, ty, origin)?;
+        }
+        Some(result)
+    }
+
+    fn route_cleanup_actions(
+        &mut self,
+        actions: Vec<CleanupAction<'a>>,
+        mut saved: ValueId,
+        saved_ty: TypeId,
+        origin: Span,
+    ) -> Option<ValueId> {
+        for action in actions.into_iter().rev() {
+            let cleanup = self.new_block();
+            self.finish_current(Terminator::Branch {
+                target: cleanup,
+                arguments: vec![saved],
+                origin,
+            });
+            self.current_block = cleanup;
+            saved = self.value();
+            self.current_parameters = vec![CoreParameter {
+                value: saved,
+                ty: saved_ty,
+                origin,
+            }];
+            match action {
+                CleanupAction::Call {
+                    function,
+                    substitutions,
+                    arguments,
+                    origin,
+                } => {
+                    let result = self.value();
+                    self.operations.push(Operation::Call {
+                        result,
+                        function: self.functions[&function],
+                        substitutions: substitutions.to_vec(),
+                        arguments,
+                        ty: TypeId(3),
+                        origin,
+                    });
+                }
+                CleanupAction::Block { captures, body } => {
+                    let outer_bindings = std::mem::replace(&mut self.bindings, captures);
+                    let succeeded = self.lower_block_value(body).is_some();
+                    self.bindings = outer_bindings;
+                    if !succeeded {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(saved)
     }
 
     fn lower_logical(
         &mut self,
         operator: LogicalOperator,
-        left: &TypedExpr,
-        right: &TypedExpr,
+        left: &'a TypedExpr,
+        right: &'a TypedExpr,
         origin: Span,
     ) -> Option<ValueId> {
         let left = self.lower_expr(left)?;
@@ -851,8 +1093,8 @@ impl<'a> Lowerer<'a> {
 
     fn lower_while(
         &mut self,
-        condition: &TypedExpr,
-        body: &el_types::TypedBlock,
+        condition: &'a TypedExpr,
+        body: &'a el_types::TypedBlock,
         origin: Span,
     ) -> bool {
         let condition_target = self.new_block();
@@ -897,8 +1139,8 @@ impl<'a> Lowerer<'a> {
 
     fn lower_match(
         &mut self,
-        subject: &TypedExpr,
-        arms: &[el_types::TypedMatchArm],
+        subject: &'a TypedExpr,
+        arms: &'a [el_types::TypedMatchArm],
         ty: TypeId,
         origin: Span,
     ) -> Option<ValueId> {
@@ -957,7 +1199,9 @@ impl<'a> Lowerer<'a> {
                     .any(|(_, target)| *target == self.current_block)
                     || default.is_some_and(|target| target == self.current_block)
             }
-            Terminator::Return { .. } | Terminator::Unreachable { .. } => false,
+            Terminator::Return { .. }
+            | Terminator::Failure { .. }
+            | Terminator::Unreachable { .. } => false,
         });
         if failure_is_reachable {
             self.finish_current(Terminator::Unreachable { origin });
@@ -1105,6 +1349,7 @@ impl<'a> Lowerer<'a> {
             TypedPatternKind::Struct {
                 declaration,
                 fields,
+                ..
             } => {
                 let mut children = Vec::new();
                 for (index, child) in fields {
@@ -2355,7 +2600,14 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
             errors.push(format!("function {:?} has no entry block", function.id));
         }
         let mut predecessors = BTreeSet::new();
+        let mut failure_predecessors = BTreeSet::new();
         for block in &function.blocks {
+            for operation in &block.operations {
+                if let Operation::CheckedArithmetic { failures, .. } = operation {
+                    predecessors.extend(failures.iter().map(|(_, target)| *target));
+                    failure_predecessors.extend(failures.iter().map(|(_, target)| *target));
+                }
+            }
             match &block.terminator {
                 Terminator::Branch { target, .. } => {
                     predecessors.insert(*target);
@@ -2372,7 +2624,9 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                     predecessors.extend(cases.iter().map(|(_, target)| *target));
                     predecessors.extend(default.iter().copied());
                 }
-                Terminator::Return { .. } | Terminator::Unreachable { .. } => {}
+                Terminator::Return { .. }
+                | Terminator::Failure { .. }
+                | Terminator::Unreachable { .. } => {}
             }
         }
         for block in &function.blocks {
@@ -2407,6 +2661,49 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                     &mut values,
                     &mut errors,
                 );
+                if let Operation::CheckedArithmetic {
+                    operator,
+                    failures,
+                    origin,
+                    ..
+                } = operation
+                {
+                    let actual = failures
+                        .iter()
+                        .map(|(category, _)| *category)
+                        .collect::<Vec<_>>();
+                    if actual != arithmetic_failure_categories(*operator) {
+                        errors.push(format!(
+                            "checked arithmetic in {:?} has an invalid failure plan",
+                            block.id
+                        ));
+                    }
+                    let mut targets = BTreeSet::new();
+                    for (category, target) in failures {
+                        if !targets.insert(*target) {
+                            errors.push(format!(
+                                "checked arithmetic in {:?} reuses a failure block",
+                                block.id
+                            ));
+                        }
+                        match blocks.get(target) {
+                            Some(target_block)
+                                if target_block.parameters.is_empty()
+                                    && target_block.operations.is_empty()
+                                    && matches!(
+                                        target_block.terminator,
+                                        Terminator::Failure {
+                                            category: found,
+                                            origin: found_origin,
+                                        } if found == *category && found_origin == *origin
+                                    ) => {}
+                            _ => errors.push(format!(
+                                "checked arithmetic in {:?} has an invalid failure target",
+                                block.id
+                            )),
+                        }
+                    }
+                }
             }
             let mut propagate = |target: BlockId| {
                 initialized_by_block
@@ -2499,6 +2796,13 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                         propagate(*target);
                     }
                 }
+                Terminator::Failure { .. } if !failure_predecessors.contains(&block.id) => {
+                    errors.push(format!(
+                        "function {:?} has an unjustified failure terminator",
+                        function.id
+                    ));
+                }
+                Terminator::Failure { .. } => {}
                 Terminator::Unreachable { .. }
                     if block.id == BlockId(0) || !predecessors.contains(&block.id) =>
                 {
@@ -2959,6 +3263,9 @@ impl GenericModule {
                         default
                             .map_or_else(String::new, |target| format!(" default b{}", target.0))
                     )),
+                    Terminator::Failure { category, .. } => {
+                        output.push_str(&format!("    fail {category:?}\n"))
+                    }
                     Terminator::Unreachable { .. } => output.push_str("    unreachable\n"),
                 }
             }
@@ -3070,11 +3377,20 @@ fn display_operation(operation: &Operation) -> String {
             operator,
             left,
             right,
+            failures,
             ty,
             ..
         } => format!(
-            "v{} = checked.{operator:?} v{}, v{}: t{}",
-            result.0, left.0, right.0, ty.0
+            "v{} = checked.{operator:?} v{}, v{}: t{} [{}]",
+            result.0,
+            left.0,
+            right.0,
+            ty.0,
+            failures
+                .iter()
+                .map(|(category, target)| format!("{category:?} => b{}", target.0))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Operation::Compare {
             result,

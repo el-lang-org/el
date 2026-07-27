@@ -23,6 +23,105 @@ fn checks_bindings_mutation_calls_returns_and_generic_inference() {
 }
 
 #[test]
+fn desugars_left_associative_pipelines_into_first_call_arguments() {
+    let source = "defmodule Main do\n  def add(value: i32, extra: i32) -> i32 do\n    value + extra\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    40 |> add(2) |> identity()\n  end\nend\n";
+
+    let typed = checked(source).expect("pipeline type checks after call rewriting");
+    let el_types::TypedItem::Expr(outer) = &typed.functions[2].body.items[0] else {
+        panic!("pipeline expression")
+    };
+    let TypedExprKind::Call {
+        function,
+        arguments,
+        ..
+    } = &outer.kind
+    else {
+        panic!("outer pipeline desugars to a call")
+    };
+    assert_eq!(*function, typed.functions[1].id);
+    assert_eq!(arguments.len(), 1);
+    let TypedExprKind::Call {
+        function,
+        arguments,
+        ..
+    } = &arguments[0].kind
+    else {
+        panic!("left-associated input remains the first argument")
+    };
+    assert_eq!(*function, typed.functions[0].id);
+    assert_eq!(arguments.len(), 2);
+    assert!(matches!(arguments[0].kind, TypedExprKind::Integer(40)));
+    assert!(matches!(arguments[1].kind, TypedExprKind::Integer(2)));
+    assert_eq!(outer.ty, TypeId(0));
+    verify(&typed).expect("desugared pipeline Typed AST verifies");
+}
+
+#[test]
+fn records_immediate_deferred_call_inputs_and_immutable_block_captures() {
+    let source = "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def immediate() -> i32 do\n    1\n  end\n  def main(unused: i32) -> unit do\n    mut value: i32 = 10\n    defer cleanup(value + immediate())\n    defer do\n      cleanup(value)\n    end\n    value := 20\n    unit\n  end\nend\n";
+
+    let typed = checked(source).expect("deferred actions type check at registration");
+    let main = &typed.functions[2];
+    let el_types::TypedItem::DeferCall {
+        function,
+        arguments,
+        ..
+    } = &main.body.items[1]
+    else {
+        panic!("first action is a deferred call")
+    };
+    assert_eq!(*function, typed.functions[0].id);
+    assert!(matches!(arguments[0].kind, TypedExprKind::Binary { .. }));
+
+    let el_types::TypedItem::Let { symbol: source, .. } = &main.body.items[0] else {
+        panic!("mutable source binding")
+    };
+    let el_types::TypedItem::DeferBlock { captures, body, .. } = &main.body.items[2] else {
+        panic!("second action is a deferred block")
+    };
+    assert_eq!(captures.len(), 1, "unused outer bindings are not captured");
+    assert_eq!(captures[0].source, *source);
+    assert_ne!(captures[0].symbol, captures[0].source);
+    let el_types::TypedItem::Expr(call) = &body.items[0] else {
+        panic!("deferred body call")
+    };
+    let TypedExprKind::Call { arguments, .. } = &call.kind else {
+        panic!("deferred body contains a typed call")
+    };
+    assert!(matches!(
+        arguments[0].kind,
+        TypedExprKind::Local(symbol) if symbol == captures[0].symbol
+    ));
+    verify(&typed).expect("deferred registration facts verify");
+}
+
+#[test]
+fn rejects_invalid_deferred_actions_and_capture_mutation() {
+    let cases = [
+        ("defer immediate()\n    unit", "E2113"),
+        ("defer do\n      return unit\n    end\n    unit", "E2142"),
+        (
+            "defer do\n      defer cleanup(1)\n      unit\n    end\n    unit",
+            "E2141",
+        ),
+        (
+            "mut value: i32 = 1\n    defer do\n      value := 2\n      unit\n    end\n    unit",
+            "E2104",
+        ),
+    ];
+    for (body, code) in cases {
+        let source = format!(
+            "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def immediate() -> i32 do\n    1\n  end\n  def main() -> unit do\n    {body}\n  end\nend\n"
+        );
+        let diagnostics = checked(&source).expect_err("invalid deferred action is rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "missing {code}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn checks_comparisons_short_circuit_logic_while_and_nested_returns() {
     let source = "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if true do\n      result := result\n    end\n    if n == 1 and result >= 120 do\n      return result\n    else\n      0\n    end\n  end\nend\n";
 
@@ -41,7 +140,7 @@ fn rejects_non_bool_control_conditions_and_unsupported_comparisons() {
     let cases = [
         ("while 1 do\n      unit\n    end\n    0", "E2113"),
         ("if 1 do\n      0\n    else\n      1\n    end", "E2113"),
-        ("true < false\n    0", "E2125"),
+        ("true < false\n    0", "E2139"),
         ("1 and true\n    0", "E2113"),
     ];
     for (body, code) in cases {
@@ -107,6 +206,60 @@ fn typed_ast_verifier_rejects_unknown_type_ids() {
             .expect_err("malformed Typed AST is rejected")
             .iter()
             .any(|error| error.contains("unknown type"))
+    );
+}
+
+#[test]
+fn typed_ast_verifier_recomputes_pattern_usefulness_and_exhaustiveness() {
+    let source = "defmodule Main do\n  def choose(flag: bool) -> i64 do\n    match flag do\n      true -> 1\n      false -> 2\n    end\n  end\nend\n";
+    let typed = checked(source).expect("baseline exhaustive match");
+
+    let mut missing_arm = typed.clone();
+    let el_types::TypedItem::Expr(expression) = &mut missing_arm.functions[0].body.items[0] else {
+        panic!("match expression")
+    };
+    let TypedExprKind::Match { arms, .. } = &mut expression.kind else {
+        panic!("typed match")
+    };
+    arms.pop();
+    assert!(
+        verify(&missing_arm)
+            .expect_err("stale exhaustive fact is rejected")
+            .iter()
+            .any(|error| error.contains("exhaustiveness fact"))
+    );
+
+    let mut duplicate_arm = typed.clone();
+    let el_types::TypedItem::Expr(expression) = &mut duplicate_arm.functions[0].body.items[0]
+    else {
+        panic!("match expression")
+    };
+    let TypedExprKind::Match { arms, .. } = &mut expression.kind else {
+        panic!("typed match")
+    };
+    arms.insert(1, arms[0].clone());
+    assert!(
+        verify(&duplicate_arm)
+            .expect_err("stale reachability fact is rejected")
+            .iter()
+            .any(|error| error.contains("match pattern facts"))
+    );
+
+    let mut wrong_irrefutability = typed;
+    let el_types::TypedItem::Expr(expression) =
+        &mut wrong_irrefutability.functions[0].body.items[0]
+    else {
+        panic!("match expression")
+    };
+    let TypedExprKind::Match { arms, .. } = &mut expression.kind else {
+        panic!("typed match")
+    };
+    arms[0].pattern.facts.irrefutable = true;
+    assert!(
+        verify(&wrong_irrefutability)
+            .expect_err("stale irrefutability fact is rejected")
+            .iter()
+            .any(|error| error.contains("pattern facts"))
     );
 }
 
@@ -345,6 +498,93 @@ fn records_pattern_reachability_and_exhaustiveness() {
             .iter()
             .any(|diagnostic| diagnostic.code == "E2125")
     );
+}
+
+#[test]
+fn decomposes_singleton_atoms_lists_and_nested_finite_domains() {
+    let source = "defmodule Main do\n  def atom(value: :ready) -> i64 do\n    match value do\n      :ready -> 1\n    end\n  end\n  def list(values: [bool]) -> i64 do\n    match values do\n      [] -> 0\n      [true | _] -> 1\n      [false | _] -> 2\n    end\n  end\n  def nested(value: {bool, bool}) -> i64 do\n    match value do\n      {true, true} -> 0\n      {true, false} -> 1\n      {false, _} -> 2\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("finite and structural domains are exhaustive");
+    assert_eq!(
+        typed.debug_tree().matches("match exhaustive=true").count(),
+        3
+    );
+}
+
+#[test]
+fn reports_structurally_subsumed_arms_at_the_pattern_with_the_covering_arm() {
+    let source = "defmodule Main do\n  def choose(value: {bool, i64}) -> i64 do\n    match value do\n      {true, _} -> 1\n      {true, 0} -> 2\n      {false, _} -> 3\n    end\n  end\nend\n";
+
+    let diagnostics = checked(source).expect_err("narrower tuple arm is unreachable");
+    let unreachable = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E2125")
+        .expect("unreachable-arm diagnostic");
+    assert_eq!(
+        unreachable.primary.start(),
+        source.find("{true, 0}").unwrap()
+    );
+    assert_eq!(unreachable.labels.len(), 1);
+    assert_eq!(
+        unreachable.labels[0].span.start(),
+        source.find("{true, _}").unwrap()
+    );
+}
+
+#[test]
+fn reports_collective_coverage_and_actionable_non_exhaustiveness() {
+    let covered = "defmodule Main do\n  def choose(flag: bool) -> i64 do\n    match flag do\n      true -> 1\n      false -> 2\n      _ -> 3\n    end\n  end\nend\n";
+    let diagnostics = checked(covered).expect_err("finite cases collectively cover wildcard");
+    let unreachable = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E2125")
+        .expect("collective unreachable-arm diagnostic");
+    assert!(unreachable.labels.is_empty());
+    assert!(
+        unreachable
+            .notes
+            .iter()
+            .any(|note| note.contains("collectively cover"))
+    );
+
+    let missing = covered.replace("      false -> 2\n      _ -> 3\n", "");
+    let diagnostics = checked(&missing).expect_err("bool match is not exhaustive");
+    let non_exhaustive = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E2126")
+        .expect("non-exhaustive diagnostic");
+    assert!(
+        non_exhaustive
+            .help
+            .as_deref()
+            .is_some_and(|help| help.contains("wildcard/binding"))
+    );
+}
+
+#[test]
+fn infinite_scalar_domains_require_a_catch_all_and_reject_duplicate_literals() {
+    let incomplete = "defmodule Main do\n  def choose(value: i64) -> i64 do\n    match value do\n      0 -> 0\n      1 -> 1\n    end\n  end\nend\n";
+    assert!(
+        checked(incomplete)
+            .expect_err("a finite set of integers cannot cover i64")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2126")
+    );
+
+    let complete = incomplete.replace("      1 -> 1\n", "      _ -> 1\n");
+    checked(&complete).expect("a wildcard covers the remaining integer domain");
+
+    let duplicate = complete.replace("      _ -> 1", "      0 -> 2\n      _ -> 1");
+    let diagnostics = checked(&duplicate).expect_err("a repeated literal is unreachable");
+    let unreachable = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E2125")
+        .expect("duplicate-literal diagnostic");
+    assert_eq!(
+        unreachable.primary.start(),
+        duplicate.rfind("0 -> 2").unwrap()
+    );
+    assert_eq!(unreachable.labels.len(), 1);
 }
 
 #[test]

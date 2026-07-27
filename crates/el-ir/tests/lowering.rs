@@ -1,6 +1,6 @@
 use el_ir::{
-    EntryPointError, FunctionId, Operation, Terminator, ValueId, executable_reachability_roots,
-    lower, monomorphize, verify, verify_concrete,
+    CoreFailureCategory, EntryPointError, FunctionId, Operation, Terminator, ValueId,
+    executable_reachability_roots, lower, monomorphize, verify, verify_concrete,
 };
 use el_parser::parse;
 use el_resolve::{resolve, resolve_package};
@@ -263,7 +263,200 @@ fn lowers_calls_and_mutation_in_left_to_right_order() {
 
     assert_eq!(
         module.debug_text(),
-        "fn f0 identity -> t4 {\n  b0:\n    return v0\n}\nfn f1 main -> t0 {\n  slot q0: t0\n  b0:\n    v0 = const Integer(40): t0\n    v1 = call f0(v0): t0\n    store q0, v1\n    v2 = load q0: t0\n    v3 = const Integer(2): t0\n    v4 = checked.Add v2, v3: t0\n    store q0, v4\n    v5 = load q0: t0\n    return v5\n}\n"
+        "fn f0 identity -> t4 {\n  b0:\n    return v0\n}\nfn f1 main -> t0 {\n  slot q0: t0\n  b0:\n    v0 = const Integer(40): t0\n    v1 = call f0(v0): t0\n    store q0, v1\n    v2 = load q0: t0\n    v3 = const Integer(2): t0\n    v4 = checked.Add v2, v3: t0 [IntegerOverflow => b1]\n    store q0, v4\n    v5 = load q0: t0\n    return v5\n  b1:\n    fail IntegerOverflow\n}\n"
+    );
+}
+
+#[test]
+fn lowers_pipeline_input_before_explicit_call_arguments() {
+    let module = lowered(
+        "defmodule Main do\n  def input() -> i32 do\n    20\n  end\n  def explicit() -> i32 do\n    22\n  end\n  def combine(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def main() -> i32 do\n    input() |> combine(explicit())\n  end\nend\n",
+    );
+    let main = &module.functions[3];
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match operation {
+            Operation::Call { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(calls, vec![FunctionId(0), FunctionId(1), FunctionId(2)]);
+    verify(&module).expect("pipeline-free Generic Core verifies");
+}
+
+#[test]
+fn lowers_defer_registration_values_before_lifo_cleanup() {
+    let module = lowered(
+        "defmodule Main do\n  def immediate() -> i32 do\n    1\n  end\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def main() -> unit do\n    mut value: i32 = 10\n    defer cleanup(immediate())\n    defer do\n      cleanup(value)\n    end\n    value := 20\n    unit\n  end\nend\n",
+    );
+    let main = &module.functions[2];
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|operation| match operation {
+            Operation::Call {
+                function,
+                arguments,
+                ..
+            } => Some((*function, arguments.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[0].0,
+        FunctionId(0),
+        "call argument runs at registration"
+    );
+    assert_eq!(calls[1].0, FunctionId(1), "last block action runs first");
+    assert_eq!(calls[2].0, FunctionId(1), "first call action runs last");
+    assert_ne!(
+        calls[1].1, calls[2].1,
+        "block capture and deferred call retain distinct registration values"
+    );
+    assert_eq!(
+        main.blocks
+            .iter()
+            .filter(|block| !block.parameters.is_empty())
+            .count(),
+        2,
+        "each registered action receives the saved scope result through its cleanup block"
+    );
+    verify(&module).expect("defer-free Generic Core verifies");
+}
+
+#[test]
+fn routes_nested_fallthrough_and_return_values_through_cleanup_blocks() {
+    let module = lowered(
+        "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def main(flag: bool) -> i32 do\n    defer cleanup(1)\n    if flag do\n      defer cleanup(2)\n      return 42\n    else\n      defer cleanup(3)\n      41\n    end\n  end\nend\n",
+    );
+    let main = &module.functions[1];
+    let cleanup_calls = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::Call {
+                    function: FunctionId(0),
+                    ..
+                }
+            )
+        })
+        .count();
+    let cleanup_blocks = main
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    Operation::Call {
+                        function: FunctionId(0),
+                        ..
+                    }
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(cleanup_calls, 4, "each reachable cleanup path is explicit");
+    assert_eq!(
+        cleanup_blocks.len(),
+        4,
+        "nested return and fallthrough cleanup blocks carry the i32 result"
+    );
+    assert!(
+        cleanup_blocks.iter().all(|block| {
+            matches!(block.parameters.as_slice(), [parameter] if parameter.ty == TypeId(0))
+                && block
+                    .operations
+                    .iter()
+                    .filter(|operation| {
+                        matches!(
+                            operation,
+                            Operation::Call {
+                                function: FunctionId(0),
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+                    == 1
+        }),
+        "each cleanup block carries the saved result and invokes its action once"
+    );
+    verify(&module).expect("nested cleanup CFG verifies");
+}
+
+#[test]
+fn explicit_failure_terminators_bypass_cleanup_and_are_verified() {
+    let module = lowered(
+        "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def maximum() -> i32 do\n    2147483647\n  end\n  def one() -> i32 do\n    1\n  end\n  def main() -> i32 do\n    defer cleanup()\n    maximum() + one()\n  end\nend\n",
+    );
+    let main = &module.functions[3];
+    let failures = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|operation| match operation {
+            Operation::CheckedArithmetic { failures, .. } => Some(failures.clone()),
+            _ => None,
+        })
+        .expect("checked addition has an explicit failure edge");
+    assert_eq!(
+        failures
+            .iter()
+            .map(|(category, _)| *category)
+            .collect::<Vec<_>>(),
+        vec![CoreFailureCategory::IntegerOverflow]
+    );
+    let failure_target = failures[0].1;
+    assert!(matches!(
+        main.blocks
+            .iter()
+            .find(|block| block.id == failure_target)
+            .map(|block| &block.terminator),
+        Some(Terminator::Failure {
+            category: CoreFailureCategory::IntegerOverflow,
+            ..
+        })
+    ));
+    assert!(main.blocks.iter().any(|block| {
+        block.id != failure_target
+            && block.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    Operation::Call {
+                        function: FunctionId(0),
+                        ..
+                    }
+                )
+            })
+    }));
+    verify(&module).expect("explicit failure CFG verifies");
+
+    let mut wrong_category = module.clone();
+    let failure = wrong_category.functions[3]
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == failure_target)
+        .expect("failure block");
+    let Terminator::Failure { category, .. } = &mut failure.terminator else {
+        panic!("failure terminator")
+    };
+    *category = CoreFailureCategory::DivisionByZero;
+    assert!(
+        verify(&wrong_category)
+            .expect_err("mismatched failure category is rejected")
+            .iter()
+            .any(|error| error.contains("invalid failure target"))
     );
 }
 
