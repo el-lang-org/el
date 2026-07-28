@@ -8,7 +8,9 @@ use el_ir::{
     Type, TypeId, ValueId, collection_point_roots, verify_concrete,
 };
 #[cfg(feature = "managed-runtime")]
-use el_runtime::{ALLOCATE_SCANNED_SYMBOL, INITIALIZE_SYMBOL};
+use el_runtime::{
+    ALLOCATE_ATOMIC_SYMBOL, ALLOCATE_SCANNED_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL,
+};
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -29,6 +31,7 @@ use inkwell::values::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::Path;
 
 /// Verified LLVM text produced from a verified Concrete Core module.
@@ -324,12 +327,52 @@ struct ModuleLowerer<'ctx, 'core> {
     functions: BTreeMap<FunctionId, FunctionValue<'ctx>>,
     failure: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
+    memcmp: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
     initialize_runtime: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     allocate_scanned: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    allocate_atomic: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    hash_seed: FunctionValue<'ctx>,
 }
 
 impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
+    fn usize_type(&self) -> Result<inkwell::types::IntType<'ctx>, BackendError> {
+        let bits = NonZeroU32::new(usize::BITS).expect("Rust pointer width is nonzero");
+        self.context
+            .custom_width_int_type(bits)
+            .map_err(|error| BackendError::Builder(error.to_owned()))
+    }
+
+    fn element_pointer(
+        &self,
+        builder: &Builder<'ctx>,
+        element: BasicTypeEnum<'ctx>,
+        base: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let usize_ty = self.usize_type()?;
+        let address = built(builder.build_ptr_to_int(base, usize_ty, &format!("{name}.address")))?;
+        let size = element.size_of().ok_or_else(|| {
+            BackendError::Builder("slice element has no statically known size".to_owned())
+        })?;
+        let size = if size.get_type() == usize_ty {
+            size
+        } else {
+            built(builder.build_int_cast(size, usize_ty, &format!("{name}.size")))?
+        };
+        let offset = built(builder.build_int_mul(size, index, &format!("{name}.offset")))?;
+        let address = built(builder.build_int_add(address, offset, &format!("{name}.indexed")))?;
+        built(builder.build_int_to_ptr(
+            address,
+            self.context.ptr_type(AddressSpace::default()),
+            name,
+        ))
+    }
+
     fn new(context: &'ctx Context, core: &'core ConcreteModule) -> Self {
         let module = context.create_module("el");
         let failure_type = context.void_type().fn_type(
@@ -342,6 +385,22 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             false,
         );
         let failure = module.add_function(FAILURE_SYMBOL, failure_type, None);
+        #[cfg(feature = "managed-runtime")]
+        let memcmp = module.add_function(
+            "memcmp",
+            context.i32_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                ],
+                false,
+            ),
+            None,
+        );
         #[cfg(feature = "managed-runtime")]
         let initialize_runtime = module.add_function(
             INITIALIZE_SYMBOL,
@@ -362,6 +421,29 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             ),
             None,
         );
+        #[cfg(feature = "managed-runtime")]
+        let allocate_atomic = module.add_function(
+            ALLOCATE_ATOMIC_SYMBOL,
+            context.ptr_type(AddressSpace::default()).fn_type(
+                &[
+                    context.i64_type().into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let hash_seed = module.add_function(
+            HASH_SEED_SYMBOL,
+            context
+                .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                .expect("host usize type")
+                .fn_type(&[], false),
+            None,
+        );
         Self {
             context,
             core,
@@ -369,9 +451,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             functions: BTreeMap::new(),
             failure,
             #[cfg(feature = "managed-runtime")]
+            memcmp,
+            #[cfg(feature = "managed-runtime")]
             initialize_runtime,
             #[cfg(feature = "managed-runtime")]
             allocate_scanned,
+            #[cfg(feature = "managed-runtime")]
+            allocate_atomic,
+            #[cfg(feature = "managed-runtime")]
+            hash_seed,
         }
     }
 
@@ -450,8 +538,10 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
 
     fn basic_type(&self, ty: TypeId) -> Result<BasicTypeEnum<'ctx>, BackendError> {
         match self.core.types.get(ty.0 as usize) {
+            Some(Type::U8) => Ok(self.context.i8_type().into()),
             Some(Type::I32) => Ok(self.context.i32_type().into()),
             Some(Type::I64) => Ok(self.context.i64_type().into()),
+            Some(Type::Usize) => Ok(self.usize_type()?.into()),
             Some(Type::Bool) => Ok(self.context.bool_type().into()),
             Some(Type::Unit) => Ok(self.context.struct_type(&[], false).into()),
             Some(Type::String) => Ok(self
@@ -464,12 +554,54 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     false,
                 )
                 .into()),
+            Some(Type::Bytes) => Ok(self
+                .context
+                .struct_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.usize_type()?.into(),
+                    ],
+                    false,
+                )
+                .into()),
             Some(Type::List(_)) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
+            Some(Type::Array { item, length }) => {
+                let item = self.basic_type(*item)?;
+                let fields = (0..*length).map(|_| item).collect::<Vec<_>>();
+                Ok(self.context.struct_type(&fields, false).into())
+            }
+            Some(Type::Slice(_)) => Ok(self
+                .context
+                .struct_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.usize_type()?.into(),
+                    ],
+                    false,
+                )
+                .into()),
+            Some(Type::Map { .. }) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             Some(Type::Atom(_)) => Ok(self.context.i8_type().into()),
             Some(Type::Tuple(elements)) => {
                 let fields = elements
                     .iter()
                     .map(|element| self.basic_type(*element))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(self.context.struct_type(&fields, false).into())
+            }
+            Some(Type::Struct { declaration, .. }) => {
+                let structure = self
+                    .core
+                    .structs
+                    .iter()
+                    .find(|structure| structure.declaration == *declaration)
+                    .ok_or(BackendError::UnsupportedType(ty))?;
+                let fields = structure
+                    .fields
+                    .iter()
+                    .map(|(_, field)| self.basic_type(*field))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(self.context.struct_type(&fields, false).into())
             }
@@ -507,6 +639,1463 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             ],
             false,
         ))
+    }
+
+    fn map_node_type(&self, map: TypeId) -> Result<StructType<'ctx>, BackendError> {
+        let Some(Type::Map { key, value }) = self.core.types.get(map.0 as usize) else {
+            return Err(BackendError::UnsupportedType(map));
+        };
+        Ok(self.context.struct_type(
+            &[
+                self.usize_type()?.into(),
+                self.basic_type(*key)?,
+                self.basic_type(*value)?,
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        ))
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn map_key_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+        ty: TypeId,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        match self.core.types.get(ty.0 as usize) {
+            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool | Type::Atom(_)) => {
+                built(builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left.into_int_value(),
+                    right.into_int_value(),
+                    name,
+                ))
+            }
+            Some(Type::Unit) => Ok(self.context.bool_type().const_all_ones()),
+            Some(Type::Tuple(elements)) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let mut equal = self.context.bool_type().const_all_ones();
+                for (index, element) in elements.iter().enumerate() {
+                    let left_element = built(builder.build_extract_value(
+                        left,
+                        index as u32,
+                        &format!("{name}.left{index}"),
+                    ))?;
+                    let right_element = built(builder.build_extract_value(
+                        right,
+                        index as u32,
+                        &format!("{name}.right{index}"),
+                    ))?;
+                    let component = self.map_key_equal(
+                        builder,
+                        left_element,
+                        right_element,
+                        *element,
+                        &format!("{name}.element{index}"),
+                    )?;
+                    equal =
+                        built(builder.build_and(equal, component, &format!("{name}.and{index}")))?;
+                }
+                Ok(equal)
+            }
+            Some(Type::Array { item, length }) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let mut equal = self.context.bool_type().const_all_ones();
+                for index in 0..*length {
+                    let left_element = built(builder.build_extract_value(
+                        left,
+                        index as u32,
+                        &format!("{name}.left{index}"),
+                    ))?;
+                    let right_element = built(builder.build_extract_value(
+                        right,
+                        index as u32,
+                        &format!("{name}.right{index}"),
+                    ))?;
+                    let component = self.map_key_equal(
+                        builder,
+                        left_element,
+                        right_element,
+                        *item,
+                        &format!("{name}.element{index}"),
+                    )?;
+                    equal =
+                        built(builder.build_and(equal, component, &format!("{name}.and{index}")))?;
+                }
+                Ok(equal)
+            }
+            Some(Type::String) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let left_data =
+                    built(builder.build_extract_value(left, 0, &format!("{name}.left_data")))?
+                        .into_pointer_value();
+                let right_data =
+                    built(builder.build_extract_value(right, 0, &format!("{name}.right_data")))?
+                        .into_pointer_value();
+                let left_length =
+                    built(builder.build_extract_value(left, 1, &format!("{name}.left_length")))?
+                        .into_int_value();
+                let right_length =
+                    built(builder.build_extract_value(right, 1, &format!("{name}.right_length")))?
+                        .into_int_value();
+                self.byte_sequence_equal(
+                    builder,
+                    left_data,
+                    left_length,
+                    right_data,
+                    right_length,
+                    name,
+                )
+            }
+            Some(Type::Bytes) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let left_data =
+                    built(builder.build_extract_value(left, 1, &format!("{name}.left_data")))?
+                        .into_pointer_value();
+                let right_data =
+                    built(builder.build_extract_value(right, 1, &format!("{name}.right_data")))?
+                        .into_pointer_value();
+                let left_length =
+                    built(builder.build_extract_value(left, 2, &format!("{name}.left_length")))?
+                        .into_int_value();
+                let right_length =
+                    built(builder.build_extract_value(right, 2, &format!("{name}.right_length")))?
+                        .into_int_value();
+                self.byte_sequence_equal(
+                    builder,
+                    left_data,
+                    left_length,
+                    right_data,
+                    right_length,
+                    name,
+                )
+            }
+            Some(Type::Slice(item)) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let left_data =
+                    built(builder.build_extract_value(left, 1, &format!("{name}.left_data")))?
+                        .into_pointer_value();
+                let right_data =
+                    built(builder.build_extract_value(right, 1, &format!("{name}.right_data")))?
+                        .into_pointer_value();
+                let left_length =
+                    built(builder.build_extract_value(left, 2, &format!("{name}.left_length")))?
+                        .into_int_value();
+                let right_length =
+                    built(builder.build_extract_value(right, 2, &format!("{name}.right_length")))?
+                        .into_int_value();
+                self.sequence_equal(
+                    builder,
+                    left_data,
+                    left_length,
+                    right_data,
+                    right_length,
+                    *item,
+                    name,
+                )
+            }
+            Some(Type::List(item)) => self.list_equal(
+                builder,
+                left.into_pointer_value(),
+                right.into_pointer_value(),
+                *item,
+                name,
+            ),
+            Some(Type::Map { .. }) => self.map_equal(
+                builder,
+                left.into_pointer_value(),
+                right.into_pointer_value(),
+                ty,
+                name,
+            ),
+            _ => Err(BackendError::UnsupportedType(ty)),
+        }
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn byte_sequence_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left: PointerValue<'ctx>,
+        left_length: IntValue<'ctx>,
+        right: PointerValue<'ctx>,
+        right_length: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let length_equal = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            left_length,
+            right_length,
+            &format!("{name}.length_equal"),
+        ))?;
+        let zero = left_length.get_type().const_zero();
+        let safe_length = built(builder.build_select(
+            length_equal,
+            left_length,
+            zero,
+            &format!("{name}.safe_length"),
+        ))?
+        .into_int_value();
+        let compared = built(builder.build_call(
+            self.memcmp,
+            &[left.into(), right.into(), safe_length.into()],
+            &format!("{name}.memcmp"),
+        ))?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| BackendError::Builder("memcmp returned void".to_owned()))?
+        .into_int_value();
+        let contents_equal = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            compared,
+            self.context.i32_type().const_zero(),
+            &format!("{name}.contents_equal"),
+        ))?;
+        built(builder.build_and(length_equal, contents_equal, name))
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn sequence_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left: PointerValue<'ctx>,
+        left_length: IntValue<'ctx>,
+        right: PointerValue<'ctx>,
+        right_length: IntValue<'ctx>,
+        item: TypeId,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let result_slot =
+            built(builder.build_alloca(self.context.bool_type(), &format!("{name}.result")))?;
+        built(builder.build_store(result_slot, self.context.bool_type().const_all_ones()))?;
+        let lengths_equal = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            left_length,
+            right_length,
+            &format!("{name}.lengths_equal"),
+        ))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let advance = self
+            .context
+            .append_basic_block(function, &format!("{name}.advance"));
+        let mismatch = self
+            .context
+            .append_basic_block(function, &format!("{name}.mismatch"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_conditional_branch(lengths_equal, loop_block, mismatch))?;
+        builder.position_at_end(loop_block);
+        let index = built(builder.build_phi(left_length.get_type(), &format!("{name}.index")))?;
+        let zero = left_length.get_type().const_zero();
+        index.add_incoming(&[(&zero, preheader)]);
+        let exhausted = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            index.as_basic_value().into_int_value(),
+            left_length,
+            &format!("{name}.exhausted"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let element_ty = self.basic_type(item)?;
+        let left_ptr = self.element_pointer(
+            builder,
+            element_ty,
+            left,
+            index.as_basic_value().into_int_value(),
+            &format!("{name}.left_ptr"),
+        )?;
+        let right_ptr = self.element_pointer(
+            builder,
+            element_ty,
+            right,
+            index.as_basic_value().into_int_value(),
+            &format!("{name}.right_ptr"),
+        )?;
+        let left_item =
+            built(builder.build_load(element_ty, left_ptr, &format!("{name}.left_item")))?;
+        let right_item =
+            built(builder.build_load(element_ty, right_ptr, &format!("{name}.right_item")))?;
+        let equal = self.map_key_equal(
+            builder,
+            left_item,
+            right_item,
+            item,
+            &format!("{name}.item_equal"),
+        )?;
+        built(builder.build_conditional_branch(equal, advance, mismatch))?;
+        builder.position_at_end(advance);
+        let next = built(builder.build_int_add(
+            index.as_basic_value().into_int_value(),
+            left_length.get_type().const_int(1, false),
+            &format!("{name}.next"),
+        ))?;
+        let advance_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        index.add_incoming(&[(&next, advance_end)]);
+        builder.position_at_end(mismatch);
+        built(builder.build_store(result_slot, self.context.bool_type().const_zero()))?;
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(done);
+        Ok(
+            built(builder.build_load(self.context.bool_type(), result_slot, name))?
+                .into_int_value(),
+        )
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn list_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left: PointerValue<'ctx>,
+        right: PointerValue<'ctx>,
+        item: TypeId,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let result_slot =
+            built(builder.build_alloca(self.context.bool_type(), &format!("{name}.result")))?;
+        built(builder.build_store(result_slot, self.context.bool_type().const_all_ones()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let inspect = self
+            .context
+            .append_basic_block(function, &format!("{name}.inspect"));
+        let advance = self
+            .context
+            .append_basic_block(function, &format!("{name}.advance"));
+        let mismatch = self
+            .context
+            .append_basic_block(function, &format!("{name}.mismatch"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let left_cursor = built(builder.build_phi(pointer_ty, &format!("{name}.left")))?;
+        let right_cursor = built(builder.build_phi(pointer_ty, &format!("{name}.right")))?;
+        left_cursor.add_incoming(&[(&left, preheader)]);
+        right_cursor.add_incoming(&[(&right, preheader)]);
+        let left_null = built(builder.build_is_null(
+            left_cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.left_null"),
+        ))?;
+        let right_null = built(builder.build_is_null(
+            right_cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.right_null"),
+        ))?;
+        let both_null =
+            built(builder.build_and(left_null, right_null, &format!("{name}.both_null")))?;
+        let either_null =
+            built(builder.build_or(left_null, right_null, &format!("{name}.either_null")))?;
+        let check_mismatch = self
+            .context
+            .append_basic_block(function, &format!("{name}.check_mismatch"));
+        built(builder.build_conditional_branch(both_null, done, check_mismatch))?;
+        builder.position_at_end(check_mismatch);
+        built(builder.build_conditional_branch(either_null, mismatch, inspect))?;
+        builder.position_at_end(inspect);
+        let node_ty = self.list_node_type(TypeId(
+            self.core
+                .types
+                .iter()
+                .position(|ty| ty == &Type::List(item))
+                .ok_or(BackendError::UnsupportedType(item))? as u32,
+        ))?;
+        let left_node = left_cursor.as_basic_value().into_pointer_value();
+        let right_node = right_cursor.as_basic_value().into_pointer_value();
+        let left_item_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            0,
+            &format!("{name}.left_item_ptr"),
+        ))?;
+        let right_item_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            0,
+            &format!("{name}.right_item_ptr"),
+        ))?;
+        let left_item = built(builder.build_load(
+            self.basic_type(item)?,
+            left_item_ptr,
+            &format!("{name}.left_item"),
+        ))?;
+        let right_item = built(builder.build_load(
+            self.basic_type(item)?,
+            right_item_ptr,
+            &format!("{name}.right_item"),
+        ))?;
+        let equal = self.map_key_equal(
+            builder,
+            left_item,
+            right_item,
+            item,
+            &format!("{name}.item_equal"),
+        )?;
+        built(builder.build_conditional_branch(equal, advance, mismatch))?;
+        builder.position_at_end(advance);
+        let left_next_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            1,
+            &format!("{name}.left_next_ptr"),
+        ))?;
+        let right_next_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            1,
+            &format!("{name}.right_next_ptr"),
+        ))?;
+        let left_next =
+            built(builder.build_load(pointer_ty, left_next_ptr, &format!("{name}.left_next")))?
+                .into_pointer_value();
+        let right_next =
+            built(builder.build_load(pointer_ty, right_next_ptr, &format!("{name}.right_next")))?
+                .into_pointer_value();
+        let advance_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        left_cursor.add_incoming(&[(&left_next, advance_end)]);
+        right_cursor.add_incoming(&[(&right_next, advance_end)]);
+        builder.position_at_end(mismatch);
+        built(builder.build_store(result_slot, self.context.bool_type().const_zero()))?;
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(done);
+        Ok(
+            built(builder.build_load(self.context.bool_type(), result_slot, name))?
+                .into_int_value(),
+        )
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn map_length(
+        &self,
+        builder: &Builder<'ctx>,
+        map: PointerValue<'ctx>,
+        ty: TypeId,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self.usize_type()?;
+        let node_ty = self.map_node_type(ty)?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let cursor = built(builder.build_phi(pointer_ty, &format!("{name}.cursor")))?;
+        let count = built(builder.build_phi(usize_ty, &format!("{name}.count")))?;
+        cursor.add_incoming(&[(&map, preheader)]);
+        count.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        let exhausted = built(builder.build_is_null(
+            cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.empty"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let next_ptr = built(builder.build_struct_gep(
+            node_ty,
+            cursor.as_basic_value().into_pointer_value(),
+            3,
+            &format!("{name}.next_ptr"),
+        ))?;
+        let next = built(builder.build_load(pointer_ty, next_ptr, &format!("{name}.next")))?
+            .into_pointer_value();
+        let next_count = built(builder.build_int_add(
+            count.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_count"),
+        ))?;
+        let body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        cursor.add_incoming(&[(&next, body_end)]);
+        count.add_incoming(&[(&next_count, body_end)]);
+        builder.position_at_end(done);
+        Ok(count.as_basic_value().into_int_value())
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn map_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left: PointerValue<'ctx>,
+        right: PointerValue<'ctx>,
+        ty: TypeId,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let Some(Type::Map {
+            key: key_ty,
+            value: value_ty,
+        }) = self.core.types.get(ty.0 as usize)
+        else {
+            return Err(BackendError::UnsupportedType(ty));
+        };
+        let (key_ty, value_ty) = (*key_ty, *value_ty);
+        let right_length = self.map_length(builder, right, ty, &format!("{name}.right_length"))?;
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self.usize_type()?;
+        let node_ty = self.map_node_type(ty)?;
+        let result_slot =
+            built(builder.build_alloca(self.context.bool_type(), &format!("{name}.result")))?;
+        built(builder.build_store(result_slot, self.context.bool_type().const_all_ones()))?;
+        let left_loop = self
+            .context
+            .append_basic_block(function, &format!("{name}.left_loop"));
+        let left_body = self
+            .context
+            .append_basic_block(function, &format!("{name}.left_body"));
+        let right_search = self
+            .context
+            .append_basic_block(function, &format!("{name}.right_search"));
+        let right_inspect = self
+            .context
+            .append_basic_block(function, &format!("{name}.right_inspect"));
+        let right_advance = self
+            .context
+            .append_basic_block(function, &format!("{name}.right_advance"));
+        let value_check = self
+            .context
+            .append_basic_block(function, &format!("{name}.value_check"));
+        let left_advance = self
+            .context
+            .append_basic_block(function, &format!("{name}.left_advance"));
+        let finish_check = self
+            .context
+            .append_basic_block(function, &format!("{name}.finish_check"));
+        let mismatch = self
+            .context
+            .append_basic_block(function, &format!("{name}.mismatch"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(left_loop))?;
+        builder.position_at_end(left_loop);
+        let left_cursor = built(builder.build_phi(pointer_ty, &format!("{name}.left_cursor")))?;
+        let matched = built(builder.build_phi(usize_ty, &format!("{name}.matched")))?;
+        left_cursor.add_incoming(&[(&left, preheader)]);
+        matched.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        let left_exhausted = built(builder.build_is_null(
+            left_cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.left_empty"),
+        ))?;
+        built(builder.build_conditional_branch(left_exhausted, finish_check, left_body))?;
+
+        builder.position_at_end(left_body);
+        let left_node = left_cursor.as_basic_value().into_pointer_value();
+        let left_hash_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            0,
+            &format!("{name}.left_hash_ptr"),
+        ))?;
+        let left_key_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            1,
+            &format!("{name}.left_key_ptr"),
+        ))?;
+        let left_value_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            2,
+            &format!("{name}.left_value_ptr"),
+        ))?;
+        let left_next_ptr = built(builder.build_struct_gep(
+            node_ty,
+            left_node,
+            3,
+            &format!("{name}.left_next_ptr"),
+        ))?;
+        let left_hash =
+            built(builder.build_load(usize_ty, left_hash_ptr, &format!("{name}.left_hash")))?
+                .into_int_value();
+        let left_key = built(builder.build_load(
+            self.basic_type(key_ty)?,
+            left_key_ptr,
+            &format!("{name}.left_key"),
+        ))?;
+        let left_value = built(builder.build_load(
+            self.basic_type(value_ty)?,
+            left_value_ptr,
+            &format!("{name}.left_value"),
+        ))?;
+        let left_next =
+            built(builder.build_load(pointer_ty, left_next_ptr, &format!("{name}.left_next")))?
+                .into_pointer_value();
+        let left_body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(right_search))?;
+
+        builder.position_at_end(right_search);
+        let right_cursor = built(builder.build_phi(pointer_ty, &format!("{name}.right_cursor")))?;
+        right_cursor.add_incoming(&[(&right, left_body_end)]);
+        let right_exhausted = built(builder.build_is_null(
+            right_cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.right_empty"),
+        ))?;
+        built(builder.build_conditional_branch(right_exhausted, mismatch, right_inspect))?;
+        builder.position_at_end(right_inspect);
+        let right_node = right_cursor.as_basic_value().into_pointer_value();
+        let right_hash_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            0,
+            &format!("{name}.right_hash_ptr"),
+        ))?;
+        let right_key_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            1,
+            &format!("{name}.right_key_ptr"),
+        ))?;
+        let right_hash =
+            built(builder.build_load(usize_ty, right_hash_ptr, &format!("{name}.right_hash")))?
+                .into_int_value();
+        let right_key = built(builder.build_load(
+            self.basic_type(key_ty)?,
+            right_key_ptr,
+            &format!("{name}.right_key"),
+        ))?;
+        let same_hash = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            left_hash,
+            right_hash,
+            &format!("{name}.same_hash"),
+        ))?;
+        let same_key = self.map_key_equal(
+            builder,
+            left_key,
+            right_key,
+            key_ty,
+            &format!("{name}.same_key"),
+        )?;
+        let found_key =
+            built(builder.build_and(same_hash, same_key, &format!("{name}.found_key")))?;
+        built(builder.build_conditional_branch(found_key, value_check, right_advance))?;
+        builder.position_at_end(right_advance);
+        let right_next_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            3,
+            &format!("{name}.right_next_ptr"),
+        ))?;
+        let right_next =
+            built(builder.build_load(pointer_ty, right_next_ptr, &format!("{name}.right_next")))?
+                .into_pointer_value();
+        let right_advance_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(right_search))?;
+        right_cursor.add_incoming(&[(&right_next, right_advance_end)]);
+        builder.position_at_end(value_check);
+        let right_value_ptr = built(builder.build_struct_gep(
+            node_ty,
+            right_node,
+            2,
+            &format!("{name}.right_value_ptr"),
+        ))?;
+        let right_value = built(builder.build_load(
+            self.basic_type(value_ty)?,
+            right_value_ptr,
+            &format!("{name}.right_value"),
+        ))?;
+        let values_equal = self.map_key_equal(
+            builder,
+            left_value,
+            right_value,
+            value_ty,
+            &format!("{name}.value_equal"),
+        )?;
+        built(builder.build_conditional_branch(values_equal, left_advance, mismatch))?;
+        builder.position_at_end(left_advance);
+        let next_matched = built(builder.build_int_add(
+            matched.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_matched"),
+        ))?;
+        let left_advance_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(left_loop))?;
+        left_cursor.add_incoming(&[(&left_next, left_advance_end)]);
+        matched.add_incoming(&[(&next_matched, left_advance_end)]);
+        builder.position_at_end(finish_check);
+        let same_length = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            matched.as_basic_value().into_int_value(),
+            right_length,
+            &format!("{name}.same_length"),
+        ))?;
+        built(builder.build_conditional_branch(same_length, done, mismatch))?;
+        builder.position_at_end(mismatch);
+        built(builder.build_store(result_slot, self.context.bool_type().const_zero()))?;
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(done);
+        Ok(
+            built(builder.build_load(self.context.bool_type(), result_slot, name))?
+                .into_int_value(),
+        )
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn map_key_hash(
+        &self,
+        builder: &Builder<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        ty: TypeId,
+        seed: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let usize_ty = self.usize_type()?;
+        let mix =
+            |builder: &Builder<'ctx>, state: IntValue<'ctx>, part: IntValue<'ctx>, suffix: &str| {
+                let part = if part.get_type() == usize_ty {
+                    Ok(part)
+                } else {
+                    built(builder.build_int_z_extend(
+                        part,
+                        usize_ty,
+                        &format!("{name}.{suffix}.extend"),
+                    ))
+                }?;
+                let xored = built(builder.build_xor(state, part, &format!("{name}.{suffix}.xor")))?;
+                built(builder.build_int_mul(
+                    xored,
+                    usize_ty.const_int(0x9e37_79b1, false),
+                    &format!("{name}.{suffix}.mix"),
+                ))
+            };
+        match self.core.types.get(ty.0 as usize) {
+            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool | Type::Atom(_)) => {
+                let integer = value.into_int_value();
+                let integer = if integer.get_type().get_bit_width() > usize_ty.get_bit_width() {
+                    built(builder.build_int_truncate(
+                        integer,
+                        usize_ty,
+                        &format!("{name}.truncate"),
+                    ))?
+                } else if integer.get_type() != usize_ty {
+                    built(builder.build_int_z_extend(integer, usize_ty, &format!("{name}.extend")))?
+                } else {
+                    integer
+                };
+                mix(builder, seed, integer, "scalar")
+            }
+            Some(Type::Unit) => mix(builder, seed, usize_ty.const_int(1, false), "unit"),
+            Some(Type::Tuple(elements)) => {
+                let aggregate = value.into_struct_value();
+                let mut hash = seed;
+                for (index, element) in elements.iter().enumerate() {
+                    let field = built(builder.build_extract_value(
+                        aggregate,
+                        index as u32,
+                        &format!("{name}.field{index}"),
+                    ))?;
+                    hash = self.map_key_hash(
+                        builder,
+                        field,
+                        *element,
+                        hash,
+                        &format!("{name}.field{index}"),
+                    )?;
+                }
+                Ok(hash)
+            }
+            Some(Type::Array { item, length }) => {
+                let aggregate = value.into_struct_value();
+                let mut hash = mix(builder, seed, usize_ty.const_int(*length, false), "length")?;
+                for index in 0..*length {
+                    let field = built(builder.build_extract_value(
+                        aggregate,
+                        index as u32,
+                        &format!("{name}.item{index}"),
+                    ))?;
+                    hash = self.map_key_hash(
+                        builder,
+                        field,
+                        *item,
+                        hash,
+                        &format!("{name}.item{index}"),
+                    )?;
+                }
+                Ok(hash)
+            }
+            Some(Type::String) => {
+                let value = value.into_struct_value();
+                let data = built(builder.build_extract_value(value, 0, &format!("{name}.data")))?
+                    .into_pointer_value();
+                let length =
+                    built(builder.build_extract_value(value, 1, &format!("{name}.length")))?
+                        .into_int_value();
+                self.byte_hash(builder, data, length, seed, name)
+            }
+            Some(Type::Bytes) => {
+                let value = value.into_struct_value();
+                let data = built(builder.build_extract_value(value, 1, &format!("{name}.data")))?
+                    .into_pointer_value();
+                let length =
+                    built(builder.build_extract_value(value, 2, &format!("{name}.length")))?
+                        .into_int_value();
+                self.byte_hash(builder, data, length, seed, name)
+            }
+            Some(Type::Slice(item)) => {
+                let value = value.into_struct_value();
+                let data = built(builder.build_extract_value(value, 1, &format!("{name}.data")))?
+                    .into_pointer_value();
+                let length =
+                    built(builder.build_extract_value(value, 2, &format!("{name}.length")))?
+                        .into_int_value();
+                self.sequence_hash(builder, data, length, *item, seed, name)
+            }
+            Some(Type::List(item)) => {
+                self.list_hash(builder, value.into_pointer_value(), *item, seed, name)
+            }
+            _ => Err(BackendError::UnsupportedType(ty)),
+        }
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn hash_mix(
+        &self,
+        builder: &Builder<'ctx>,
+        state: IntValue<'ctx>,
+        part: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let usize_ty = self.usize_type()?;
+        let part = if part.get_type().get_bit_width() > usize_ty.get_bit_width() {
+            built(builder.build_int_truncate(part, usize_ty, &format!("{name}.truncate")))?
+        } else if part.get_type() != usize_ty {
+            built(builder.build_int_z_extend(part, usize_ty, &format!("{name}.extend")))?
+        } else {
+            part
+        };
+        let xored = built(builder.build_xor(state, part, &format!("{name}.xor")))?;
+        built(builder.build_int_mul(
+            xored,
+            usize_ty.const_int(0x9e37_79b1, false),
+            &format!("{name}.mix"),
+        ))
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn byte_hash(
+        &self,
+        builder: &Builder<'ctx>,
+        data: PointerValue<'ctx>,
+        length: IntValue<'ctx>,
+        seed: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let usize_ty = self.usize_type()?;
+        let length = if length.get_type() == usize_ty {
+            length
+        } else {
+            built(builder.build_int_cast(length, usize_ty, &format!("{name}.length_cast")))?
+        };
+        let initial = self.hash_mix(builder, seed, length, &format!("{name}.length"))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let index = built(builder.build_phi(usize_ty, &format!("{name}.index")))?;
+        let hash = built(builder.build_phi(usize_ty, &format!("{name}.hash")))?;
+        index.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        hash.add_incoming(&[(&initial, preheader)]);
+        let exhausted = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            index.as_basic_value().into_int_value(),
+            length,
+            &format!("{name}.exhausted"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let byte_ptr = self.element_pointer(
+            builder,
+            self.context.i8_type().into(),
+            data,
+            index.as_basic_value().into_int_value(),
+            &format!("{name}.byte_ptr"),
+        )?;
+        let byte =
+            built(builder.build_load(self.context.i8_type(), byte_ptr, &format!("{name}.byte")))?
+                .into_int_value();
+        let next_hash = self.hash_mix(
+            builder,
+            hash.as_basic_value().into_int_value(),
+            byte,
+            &format!("{name}.byte_hash"),
+        )?;
+        let next_index = built(builder.build_int_add(
+            index.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_index"),
+        ))?;
+        let body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        index.add_incoming(&[(&next_index, body_end)]);
+        hash.add_incoming(&[(&next_hash, body_end)]);
+        builder.position_at_end(done);
+        Ok(hash.as_basic_value().into_int_value())
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn sequence_hash(
+        &self,
+        builder: &Builder<'ctx>,
+        data: PointerValue<'ctx>,
+        length: IntValue<'ctx>,
+        item: TypeId,
+        seed: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let usize_ty = self.usize_type()?;
+        let initial = self.hash_mix(builder, seed, length, &format!("{name}.length"))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let index = built(builder.build_phi(usize_ty, &format!("{name}.index")))?;
+        let hash = built(builder.build_phi(usize_ty, &format!("{name}.hash")))?;
+        index.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        hash.add_incoming(&[(&initial, preheader)]);
+        let exhausted = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            index.as_basic_value().into_int_value(),
+            length,
+            &format!("{name}.exhausted"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let element_ty = self.basic_type(item)?;
+        let item_ptr = self.element_pointer(
+            builder,
+            element_ty,
+            data,
+            index.as_basic_value().into_int_value(),
+            &format!("{name}.item_ptr"),
+        )?;
+        let item_value = built(builder.build_load(element_ty, item_ptr, &format!("{name}.item")))?;
+        let next_hash = self.map_key_hash(
+            builder,
+            item_value,
+            item,
+            hash.as_basic_value().into_int_value(),
+            &format!("{name}.item_hash"),
+        )?;
+        let next_index = built(builder.build_int_add(
+            index.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_index"),
+        ))?;
+        let body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        index.add_incoming(&[(&next_index, body_end)]);
+        hash.add_incoming(&[(&next_hash, body_end)]);
+        builder.position_at_end(done);
+        Ok(hash.as_basic_value().into_int_value())
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn list_hash(
+        &self,
+        builder: &Builder<'ctx>,
+        list: PointerValue<'ctx>,
+        item: TypeId,
+        seed: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self.usize_type()?;
+        let node_ty = self
+            .context
+            .struct_type(&[self.basic_type(item)?, pointer_ty.into()], false);
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let cursor = built(builder.build_phi(pointer_ty, &format!("{name}.cursor")))?;
+        let hash = built(builder.build_phi(usize_ty, &format!("{name}.hash")))?;
+        let count = built(builder.build_phi(usize_ty, &format!("{name}.count")))?;
+        cursor.add_incoming(&[(&list, preheader)]);
+        hash.add_incoming(&[(&seed, preheader)]);
+        count.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        let exhausted = built(builder.build_is_null(
+            cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.empty"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let node = cursor.as_basic_value().into_pointer_value();
+        let item_ptr =
+            built(builder.build_struct_gep(node_ty, node, 0, &format!("{name}.item_ptr")))?;
+        let next_ptr =
+            built(builder.build_struct_gep(node_ty, node, 1, &format!("{name}.next_ptr")))?;
+        let item_value =
+            built(builder.build_load(self.basic_type(item)?, item_ptr, &format!("{name}.item")))?;
+        let next = built(builder.build_load(pointer_ty, next_ptr, &format!("{name}.next")))?
+            .into_pointer_value();
+        let next_hash = self.map_key_hash(
+            builder,
+            item_value,
+            item,
+            hash.as_basic_value().into_int_value(),
+            &format!("{name}.item_hash"),
+        )?;
+        let next_count = built(builder.build_int_add(
+            count.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_count"),
+        ))?;
+        let body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        cursor.add_incoming(&[(&next, body_end)]);
+        hash.add_incoming(&[(&next_hash, body_end)]);
+        count.add_incoming(&[(&next_count, body_end)]);
+        builder.position_at_end(done);
+        self.hash_mix(
+            builder,
+            hash.as_basic_value().into_int_value(),
+            count.as_basic_value().into_int_value(),
+            &format!("{name}.final"),
+        )
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_map_node(
+        &self,
+        builder: &Builder<'ctx>,
+        node_type: StructType<'ctx>,
+        hash: IntValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        origin: FailureOrigin,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let native_size = node_type
+            .size_of()
+            .ok_or_else(|| BackendError::Builder("map node has no native size".to_owned()))?;
+        let size = if native_size.get_type() == self.context.i64_type() {
+            native_size
+        } else {
+            built(builder.build_int_cast(
+                native_size,
+                self.context.i64_type(),
+                &format!("{name}.size"),
+            ))?
+        };
+        let call = built(
+            builder.build_call(
+                self.allocate_scanned,
+                &[
+                    size.into(),
+                    self.context
+                        .i32_type()
+                        .const_int(u64::from(origin.file), false)
+                        .into(),
+                    self.context
+                        .i64_type()
+                        .const_int(origin.start, false)
+                        .into(),
+                    self.context.i64_type().const_int(origin.end, false).into(),
+                ],
+                name,
+            ),
+        )?;
+        let node = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| BackendError::Builder("map allocation returned void".to_owned()))?
+            .into_pointer_value();
+        for (field, field_value) in [
+            hash.into(),
+            key,
+            value,
+            self.context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = built(builder.build_struct_gep(
+                node_type,
+                node,
+                field as u32,
+                &format!("{name}.field{field}"),
+            ))?;
+            built(builder.build_store(destination, field_value))?;
+        }
+        Ok(node)
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn lower_map_change(
+        &self,
+        function: FunctionId,
+        block: BlockId,
+        builder: &Builder<'ctx>,
+        source_map: PointerValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        replacement: Option<BasicValueEnum<'ctx>>,
+        ty: TypeId,
+        origin: FailureOrigin,
+        roots: &el_ir::CollectionPointRoots,
+        values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+        slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        value_types: &BTreeMap<ValueId, TypeId>,
+        slot_types: &BTreeMap<SlotId, TypeId>,
+        partial: PointerValue<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let null = pointer_ty.const_null();
+        set_volatile(built(builder.build_store(partial, null))?)?;
+        let head_slot = built(builder.build_alloca(pointer_ty, &format!("{name}.head_slot")))?;
+        let tail_slot = built(builder.build_alloca(pointer_ty, &format!("{name}.tail_slot")))?;
+        let found_slot =
+            built(builder.build_alloca(self.context.bool_type(), &format!("{name}.found_slot")))?;
+        built(builder.build_store(head_slot, null))?;
+        built(builder.build_store(tail_slot, null))?;
+        built(builder.build_store(found_slot, self.context.bool_type().const_zero()))?;
+
+        let Some(Type::Map {
+            key: key_ty,
+            value: value_ty,
+        }) = self.core.types.get(ty.0 as usize)
+        else {
+            return Err(BackendError::UnsupportedType(ty));
+        };
+        let (key_ty, value_ty) = (*key_ty, *value_ty);
+        let node_type = self.map_node_type(ty)?;
+        let seed_call = built(builder.build_call(self.hash_seed, &[], &format!("{name}.seed")))?;
+        let seed = seed_call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| BackendError::Builder("hash seed returned void".to_owned()))?
+            .into_int_value();
+        let key_hash =
+            self.map_key_hash(builder, key, key_ty, seed, &format!("{name}.key_hash"))?;
+        let llvm_function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let loop_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.loop"));
+        let body_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.body"));
+        let clone_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.clone"));
+        let install_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.install"));
+        let link_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.link"));
+        let continue_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.continue"));
+        let exhausted_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.exhausted"));
+        let append_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.append"));
+        let append_install = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.append_install"));
+        let append_link = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.append_link"));
+        let finish_block = self
+            .context
+            .append_basic_block(llvm_function, &format!("{name}.finish"));
+        built(builder.build_unconditional_branch(loop_block))?;
+
+        builder.position_at_end(loop_block);
+        let cursor = built(builder.build_phi(pointer_ty, &format!("{name}.cursor")))?;
+        cursor.add_incoming(&[(&source_map, preheader)]);
+        let exhausted = built(builder.build_is_null(
+            cursor.as_basic_value().into_pointer_value(),
+            &format!("{name}.empty"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, exhausted_block, body_block))?;
+
+        builder.position_at_end(body_block);
+        let current = cursor.as_basic_value().into_pointer_value();
+        let hash_pointer =
+            built(builder.build_struct_gep(node_type, current, 0, &format!("{name}.hash_ptr")))?;
+        let key_pointer =
+            built(builder.build_struct_gep(node_type, current, 1, &format!("{name}.key_ptr")))?;
+        let value_pointer =
+            built(builder.build_struct_gep(node_type, current, 2, &format!("{name}.value_ptr")))?;
+        let next_pointer =
+            built(builder.build_struct_gep(node_type, current, 3, &format!("{name}.next_ptr")))?;
+        let old_hash =
+            built(builder.build_load(self.usize_type()?, hash_pointer, &format!("{name}.hash")))?
+                .into_int_value();
+        let old_key = built(builder.build_load(
+            self.basic_type(key_ty)?,
+            key_pointer,
+            &format!("{name}.key"),
+        ))?;
+        let old_value = built(builder.build_load(
+            self.basic_type(value_ty)?,
+            value_pointer,
+            &format!("{name}.value"),
+        ))?;
+        let next = built(builder.build_load(pointer_ty, next_pointer, &format!("{name}.next")))?
+            .into_pointer_value();
+        let same_hash = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            old_hash,
+            key_hash,
+            &format!("{name}.same_hash"),
+        ))?;
+        let same_key =
+            self.map_key_equal(builder, old_key, key, key_ty, &format!("{name}.same_key"))?;
+        let equal = built(builder.build_and(same_hash, same_key, &format!("{name}.equal")))?;
+        let value_to_copy = if let Some(replacement) = replacement {
+            let selected = built(builder.build_select(
+                equal,
+                replacement,
+                old_value,
+                &format!("{name}.selected_value"),
+            ))?;
+            let found = built(builder.build_load(
+                self.context.bool_type(),
+                found_slot,
+                &format!("{name}.found"),
+            ))?
+            .into_int_value();
+            let now_found = built(builder.build_or(found, equal, &format!("{name}.now_found")))?;
+            built(builder.build_store(found_slot, now_found))?;
+            selected
+        } else {
+            old_value
+        };
+        if replacement.is_some() {
+            built(builder.build_unconditional_branch(clone_block))?;
+        } else {
+            built(builder.build_conditional_branch(equal, continue_block, clone_block))?;
+        }
+
+        builder.position_at_end(clone_block);
+        let node = self.allocate_map_node(
+            builder,
+            node_type,
+            old_hash,
+            old_key,
+            value_to_copy,
+            origin,
+            &format!("{name}.node"),
+        )?;
+        let head = built(builder.build_load(pointer_ty, head_slot, &format!("{name}.head")))?
+            .into_pointer_value();
+        let empty_output = built(builder.build_is_null(head, &format!("{name}.output_empty")))?;
+        built(builder.build_conditional_branch(empty_output, install_block, link_block))?;
+
+        builder.position_at_end(install_block);
+        built(builder.build_store(head_slot, node))?;
+        built(builder.build_store(tail_slot, node))?;
+        set_volatile(built(builder.build_store(partial, node))?)?;
+        built(builder.build_unconditional_branch(continue_block))?;
+
+        builder.position_at_end(link_block);
+        let tail = built(builder.build_load(pointer_ty, tail_slot, &format!("{name}.tail")))?
+            .into_pointer_value();
+        let tail_next =
+            built(builder.build_struct_gep(node_type, tail, 3, &format!("{name}.tail_next")))?;
+        built(builder.build_store(tail_next, node))?;
+        built(builder.build_store(tail_slot, node))?;
+        built(builder.build_unconditional_branch(continue_block))?;
+
+        builder.position_at_end(continue_block);
+        let continue_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        cursor.add_incoming(&[(&next, continue_end)]);
+
+        builder.position_at_end(exhausted_block);
+        if replacement.is_some() {
+            let found = built(builder.build_load(
+                self.context.bool_type(),
+                found_slot,
+                &format!("{name}.found_final"),
+            ))?
+            .into_int_value();
+            built(builder.build_conditional_branch(found, finish_block, append_block))?;
+        } else {
+            built(builder.build_unconditional_branch(finish_block))?;
+        }
+
+        if let Some(replacement) = replacement {
+            builder.position_at_end(append_block);
+            let appended = self.allocate_map_node(
+                builder,
+                node_type,
+                key_hash,
+                key,
+                replacement,
+                origin,
+                &format!("{name}.appended"),
+            )?;
+            let head =
+                built(builder.build_load(pointer_ty, head_slot, &format!("{name}.append_head")))?
+                    .into_pointer_value();
+            let empty_output = built(builder.build_is_null(head, &format!("{name}.append_empty")))?;
+            built(builder.build_conditional_branch(empty_output, append_install, append_link))?;
+
+            builder.position_at_end(append_install);
+            built(builder.build_store(head_slot, appended))?;
+            built(builder.build_store(tail_slot, appended))?;
+            set_volatile(built(builder.build_store(partial, appended))?)?;
+            built(builder.build_unconditional_branch(finish_block))?;
+
+            builder.position_at_end(append_link);
+            let tail =
+                built(builder.build_load(pointer_ty, tail_slot, &format!("{name}.append_tail")))?
+                    .into_pointer_value();
+            let tail_next = built(builder.build_struct_gep(
+                node_type,
+                tail,
+                3,
+                &format!("{name}.append_tail_next"),
+            ))?;
+            built(builder.build_store(tail_next, appended))?;
+            built(builder.build_store(tail_slot, appended))?;
+            built(builder.build_unconditional_branch(finish_block))?;
+        } else {
+            for unreachable in [append_block, append_install, append_link] {
+                builder.position_at_end(unreachable);
+                built(builder.build_unreachable())?;
+            }
+        }
+
+        builder.position_at_end(finish_block);
+        let result = built(builder.build_load(pointer_ty, head_slot, &format!("{name}.result")))?
+            .into_pointer_value();
+        self.clear_value_roots(roots, builder, root_slots, value_types)?;
+        set_volatile(built(builder.build_store(partial, null))?)?;
+        let _ = (function, block);
+        Ok(result)
     }
 
     fn lower_function(&self, function: &CoreFunction) -> Result<(), BackendError> {
@@ -583,11 +2172,20 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             set_volatile(built(builder.build_store(pointer, llvm_ty.const_zero()))?)?;
             root_slots.insert(value, pointer);
         }
-        let mut partial_list_roots = BTreeMap::new();
+        let mut partial_allocation_roots = BTreeMap::new();
         for block in &function.blocks {
             for (operation_index, operation) in block.operations.iter().enumerate() {
                 if collection_points.contains_key(&(block.id, operation_index))
-                    && matches!(operation, Operation::List { .. })
+                    && matches!(
+                        operation,
+                        Operation::List { .. }
+                            | Operation::ListReverse { .. }
+                            | Operation::Map { .. }
+                            | Operation::MapPut { .. }
+                            | Operation::MapRemove { .. }
+                            | Operation::MapToList { .. }
+                            | Operation::BytesToList { .. }
+                    )
                 {
                     let pointer = built(builder.build_alloca(
                         self.context.ptr_type(AddressSpace::default()),
@@ -597,7 +2195,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         pointer,
                         self.context.ptr_type(AddressSpace::default()).const_null(),
                     ))?)?;
-                    partial_list_roots.insert((block.id, operation_index), pointer);
+                    partial_allocation_roots.insert((block.id, operation_index), pointer);
                 }
             }
         }
@@ -617,7 +2215,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &root_slots,
                     &value_types,
                     &slot_types,
-                    partial_list_roots
+                    partial_allocation_roots
                         .get(&(block.id, operation_index))
                         .copied(),
                 )?;
@@ -754,7 +2352,1059 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     }
                 }
             }
+            Operation::ListReverse {
+                result,
+                list,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, list, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "list_reverse",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("list reverse has no partial-result root".to_owned())
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let null = pointer_ty.const_null();
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.reverse_loop", result.0));
+                    let body_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.reverse_body", result.0));
+                    let done_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.reverse_done", result.0));
+                    built(builder.build_unconditional_branch(loop_block))?;
+
+                    builder.position_at_end(loop_block);
+                    let remaining_phi =
+                        built(builder.build_phi(pointer_ty, &format!("v{}.remaining", result.0)))?;
+                    let reversed_phi =
+                        built(builder.build_phi(pointer_ty, &format!("v{}.reversed", result.0)))?;
+                    let initial = pointer_value(values, *list)?;
+                    remaining_phi.add_incoming(&[(&initial, preheader)]);
+                    reversed_phi.add_incoming(&[(&null, preheader)]);
+                    let empty = built(builder.build_is_null(
+                        remaining_phi.as_basic_value().into_pointer_value(),
+                        &format!("v{}.empty", result.0),
+                    ))?;
+                    built(builder.build_conditional_branch(empty, done_block, body_block))?;
+
+                    builder.position_at_end(body_block);
+                    let node_type = self.list_node_type(*ty)?;
+                    let remaining = remaining_phi.as_basic_value().into_pointer_value();
+                    let item_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        remaining,
+                        0,
+                        &format!("v{}.source_item", result.0),
+                    ))?;
+                    let next_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        remaining,
+                        1,
+                        &format!("v{}.source_next", result.0),
+                    ))?;
+                    let item = built(builder.build_load(
+                        node_type.get_field_type_at_index(0).ok_or_else(|| {
+                            BackendError::Builder("list node has no item field".to_owned())
+                        })?,
+                        item_pointer,
+                        &format!("v{}.item", result.0),
+                    ))?;
+                    let next = built(builder.build_load(
+                        pointer_ty,
+                        next_pointer,
+                        &format!("v{}.next", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let native_size = node_type
+                        .size_of()
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let size = if native_size.get_type() == self.context.i64_type() {
+                        native_size
+                    } else {
+                        built(builder.build_int_cast(
+                            native_size,
+                            self.context.i64_type(),
+                            &format!("v{}.node_size", result.0),
+                        ))?
+                    };
+                    let source = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_scanned,
+                            &[
+                                size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source.start, false)
+                                    .into(),
+                                self.context.i64_type().const_int(source.end, false).into(),
+                            ],
+                            &format!("v{}.node", result.0),
+                        ),
+                    )?;
+                    let node = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    let destination_item = built(builder.build_struct_gep(
+                        node_type,
+                        node,
+                        0,
+                        &format!("v{}.destination_item", result.0),
+                    ))?;
+                    let destination_next = built(builder.build_struct_gep(
+                        node_type,
+                        node,
+                        1,
+                        &format!("v{}.destination_next", result.0),
+                    ))?;
+                    built(builder.build_store(destination_item, item))?;
+                    built(builder.build_store(
+                        destination_next,
+                        reversed_phi.as_basic_value().into_pointer_value(),
+                    ))?;
+                    set_volatile(built(builder.build_store(partial, node))?)?;
+                    let body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    remaining_phi.add_incoming(&[(&next, body_end)]);
+                    reversed_phi.add_incoming(&[(&node, body_end)]);
+
+                    builder.position_at_end(done_block);
+                    let reversed = reversed_phi.as_basic_value().into_pointer_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    values.insert(*result, reversed.into());
+                }
+            }
+            Operation::Map {
+                result,
+                entries,
+                ty,
+                origin,
+            } => {
+                let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                let null = pointer_ty.const_null();
+                if entries.is_empty() {
+                    values.insert(*result, null.into());
+                } else {
+                    #[cfg(not(feature = "managed-runtime"))]
+                    {
+                        let _ = (ty, origin);
+                        return Err(BackendError::UnsupportedOperation {
+                            function,
+                            block,
+                            operation: "map",
+                        });
+                    }
+                    #[cfg(feature = "managed-runtime")]
+                    {
+                        let roots = roots.ok_or_else(|| {
+                            BackendError::InvalidConcrete(vec![format!(
+                                "missing live-root set for collection point {function:?} {block:?}"
+                            )])
+                        })?;
+                        let partial = _partial_list_root.ok_or_else(|| {
+                            BackendError::Builder(
+                                "allocating map has no partial-map root".to_owned(),
+                            )
+                        })?;
+                        self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                        set_volatile(built(builder.build_store(partial, null))?)?;
+                        let node_type = self.map_node_type(*ty)?;
+                        let native_size = node_type
+                            .size_of()
+                            .ok_or(BackendError::UnsupportedType(*ty))?;
+                        let size = if native_size.get_type() == self.context.i64_type() {
+                            native_size
+                        } else {
+                            built(builder.build_int_cast(
+                                native_size,
+                                self.context.i64_type(),
+                                &format!("v{}.node_size", result.0),
+                            ))?
+                        };
+                        let source = FailureOrigin::from_span(*origin)
+                            .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                        let Some(Type::Map { key: key_ty, .. }) =
+                            self.core.types.get(ty.0 as usize)
+                        else {
+                            return Err(BackendError::UnsupportedType(*ty));
+                        };
+                        let key_ty = *key_ty;
+                        let llvm_function = builder
+                            .get_insert_block()
+                            .and_then(|block| block.get_parent())
+                            .ok_or_else(|| {
+                                BackendError::Builder("builder has no function".to_owned())
+                            })?;
+                        let seed_call = built(builder.build_call(
+                            self.hash_seed,
+                            &[],
+                            &format!("v{}.map_seed", result.0),
+                        ))?;
+                        let seed = seed_call
+                            .try_as_basic_value()
+                            .basic()
+                            .ok_or_else(|| {
+                                BackendError::Builder("hash seed returned void".to_owned())
+                            })?
+                            .into_int_value();
+                        let mut head = null;
+                        for (index, (key, entry_value)) in entries.iter().enumerate() {
+                            let key_hash = self.map_key_hash(
+                                builder,
+                                value(values, *key)?,
+                                key_ty,
+                                seed,
+                                &format!("v{}.map{index}.key_hash", result.0),
+                            )?;
+                            let preheader = builder.get_insert_block().ok_or_else(|| {
+                                BackendError::Builder("builder has no block".to_owned())
+                            })?;
+                            let search = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.search", result.0),
+                            );
+                            let inspect = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.inspect", result.0),
+                            );
+                            let advance = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.advance", result.0),
+                            );
+                            let replace = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.replace", result.0),
+                            );
+                            let append = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.append", result.0),
+                            );
+                            let install_head = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.install_head", result.0),
+                            );
+                            let link_tail = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.link_tail", result.0),
+                            );
+                            let done = self.context.append_basic_block(
+                                llvm_function,
+                                &format!("v{}.map{index}.done", result.0),
+                            );
+                            built(builder.build_unconditional_branch(search))?;
+
+                            builder.position_at_end(search);
+                            let cursor = built(builder.build_phi(
+                                pointer_ty,
+                                &format!("v{}.map{index}.cursor", result.0),
+                            ))?;
+                            let previous = built(builder.build_phi(
+                                pointer_ty,
+                                &format!("v{}.map{index}.previous", result.0),
+                            ))?;
+                            cursor.add_incoming(&[(&head, preheader)]);
+                            previous.add_incoming(&[(&null, preheader)]);
+                            let exhausted = built(builder.build_is_null(
+                                cursor.as_basic_value().into_pointer_value(),
+                                &format!("v{}.map{index}.exhausted", result.0),
+                            ))?;
+                            built(builder.build_conditional_branch(exhausted, append, inspect))?;
+
+                            builder.position_at_end(inspect);
+                            let current = cursor.as_basic_value().into_pointer_value();
+                            let stored_hash_pointer = built(builder.build_struct_gep(
+                                node_type,
+                                current,
+                                0,
+                                &format!("v{}.map{index}.hash_ptr", result.0),
+                            ))?;
+                            let stored_key_pointer = built(builder.build_struct_gep(
+                                node_type,
+                                current,
+                                1,
+                                &format!("v{}.map{index}.key_ptr", result.0),
+                            ))?;
+                            let stored_key = built(builder.build_load(
+                                self.basic_type(key_ty)?,
+                                stored_key_pointer,
+                                &format!("v{}.map{index}.key", result.0),
+                            ))?;
+                            let stored_hash = built(builder.build_load(
+                                self.usize_type()?,
+                                stored_hash_pointer,
+                                &format!("v{}.map{index}.hash", result.0),
+                            ))?
+                            .into_int_value();
+                            let same_hash = built(builder.build_int_compare(
+                                IntPredicate::EQ,
+                                stored_hash,
+                                key_hash,
+                                &format!("v{}.map{index}.same_hash", result.0),
+                            ))?;
+                            let same_key = self.map_key_equal(
+                                builder,
+                                stored_key,
+                                value(values, *key)?,
+                                key_ty,
+                                &format!("v{}.map{index}.same_key", result.0),
+                            )?;
+                            let equal = built(builder.build_and(
+                                same_hash,
+                                same_key,
+                                &format!("v{}.map{index}.equal", result.0),
+                            ))?;
+                            built(builder.build_conditional_branch(equal, replace, advance))?;
+
+                            builder.position_at_end(replace);
+                            let stored_value = built(builder.build_struct_gep(
+                                node_type,
+                                current,
+                                2,
+                                &format!("v{}.map{index}.value_ptr", result.0),
+                            ))?;
+                            built(builder.build_store(stored_value, value(values, *entry_value)?))?;
+                            let replace_end = builder.get_insert_block().ok_or_else(|| {
+                                BackendError::Builder("builder has no block".to_owned())
+                            })?;
+                            built(builder.build_unconditional_branch(done))?;
+
+                            builder.position_at_end(advance);
+                            let next_pointer = built(builder.build_struct_gep(
+                                node_type,
+                                current,
+                                3,
+                                &format!("v{}.map{index}.next_ptr", result.0),
+                            ))?;
+                            let next = built(builder.build_load(
+                                pointer_ty,
+                                next_pointer,
+                                &format!("v{}.map{index}.next", result.0),
+                            ))?
+                            .into_pointer_value();
+                            let advance_end = builder.get_insert_block().ok_or_else(|| {
+                                BackendError::Builder("builder has no block".to_owned())
+                            })?;
+                            built(builder.build_unconditional_branch(search))?;
+                            cursor.add_incoming(&[(&next, advance_end)]);
+                            previous.add_incoming(&[(&current, advance_end)]);
+
+                            builder.position_at_end(append);
+                            let call = built(
+                                builder.build_call(
+                                    self.allocate_scanned,
+                                    &[
+                                        size.into(),
+                                        self.context
+                                            .i32_type()
+                                            .const_int(u64::from(source.file), false)
+                                            .into(),
+                                        self.context
+                                            .i64_type()
+                                            .const_int(source.start, false)
+                                            .into(),
+                                        self.context.i64_type().const_int(source.end, false).into(),
+                                    ],
+                                    &format!("v{}.map_node{index}", result.0),
+                                ),
+                            )?;
+                            let node = call
+                                .try_as_basic_value()
+                                .basic()
+                                .ok_or(BackendError::MissingValue(*result))?
+                                .into_pointer_value();
+                            for (field, field_value) in [
+                                key_hash.into(),
+                                value(values, *key)?,
+                                value(values, *entry_value)?,
+                                null.into(),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let destination = built(builder.build_struct_gep(
+                                    node_type,
+                                    node,
+                                    field as u32,
+                                    &format!("v{}.map_node{index}.field{field}", result.0),
+                                ))?;
+                                built(builder.build_store(destination, field_value))?;
+                            }
+                            let was_empty = built(builder.build_is_null(
+                                head,
+                                &format!("v{}.map{index}.was_empty", result.0),
+                            ))?;
+                            built(builder.build_conditional_branch(
+                                was_empty,
+                                install_head,
+                                link_tail,
+                            ))?;
+
+                            builder.position_at_end(install_head);
+                            set_volatile(built(builder.build_store(partial, node))?)?;
+                            let install_end = builder.get_insert_block().ok_or_else(|| {
+                                BackendError::Builder("builder has no block".to_owned())
+                            })?;
+                            built(builder.build_unconditional_branch(done))?;
+
+                            builder.position_at_end(link_tail);
+                            let tail_next = built(builder.build_struct_gep(
+                                node_type,
+                                previous.as_basic_value().into_pointer_value(),
+                                3,
+                                &format!("v{}.map{index}.tail_next", result.0),
+                            ))?;
+                            built(builder.build_store(tail_next, node))?;
+                            let link_end = builder.get_insert_block().ok_or_else(|| {
+                                BackendError::Builder("builder has no block".to_owned())
+                            })?;
+                            built(builder.build_unconditional_branch(done))?;
+
+                            builder.position_at_end(done);
+                            let next_head =
+                                built(builder.build_phi(
+                                    pointer_ty,
+                                    &format!("v{}.map{index}.head", result.0),
+                                ))?;
+                            next_head.add_incoming(&[
+                                (&head, replace_end),
+                                (&node, install_end),
+                                (&head, link_end),
+                            ]);
+                            head = next_head.as_basic_value().into_pointer_value();
+                            set_volatile(built(builder.build_store(partial, head))?)?;
+                        }
+                        self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                        set_volatile(built(builder.build_store(partial, null))?)?;
+                        values.insert(*result, head.into());
+                    }
+                }
+            }
+            Operation::MapPut {
+                result,
+                map,
+                key,
+                value: replacement,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, map, key, replacement, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "map_put",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("map put has no partial-map root".to_owned())
+                    })?;
+                    let origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let output = self.lower_map_change(
+                        function,
+                        block,
+                        builder,
+                        pointer_value(values, *map)?,
+                        value(values, *key)?,
+                        Some(value(values, *replacement)?),
+                        *ty,
+                        origin,
+                        roots,
+                        values,
+                        slots,
+                        root_slots,
+                        value_types,
+                        slot_types,
+                        partial,
+                        &format!("v{}.put", result.0),
+                    )?;
+                    values.insert(*result, output.into());
+                }
+            }
+            Operation::MapRemove {
+                result,
+                map,
+                key,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, map, key, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "map_remove",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("map remove has no partial-map root".to_owned())
+                    })?;
+                    let origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let output = self.lower_map_change(
+                        function,
+                        block,
+                        builder,
+                        pointer_value(values, *map)?,
+                        value(values, *key)?,
+                        None,
+                        *ty,
+                        origin,
+                        roots,
+                        values,
+                        slots,
+                        root_slots,
+                        value_types,
+                        slot_types,
+                        partial,
+                        &format!("v{}.remove", result.0),
+                    )?;
+                    values.insert(*result, output.into());
+                }
+            }
+            Operation::MapFetch {
+                result,
+                map,
+                key,
+                map_ty,
+                ty,
+                ..
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, map, key, map_ty, ty);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "map_fetch",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let Some(Type::Map {
+                        key: key_ty,
+                        value: value_ty,
+                    }) = self.core.types.get(map_ty.0 as usize)
+                    else {
+                        return Err(BackendError::UnsupportedType(*map_ty));
+                    };
+                    let (key_ty, value_ty) = (*key_ty, *value_ty);
+                    let Some(Type::Union(members)) = self.core.types.get(ty.0 as usize) else {
+                        return Err(BackendError::UnsupportedType(*ty));
+                    };
+                    let none_ty = members
+                        .iter()
+                        .copied()
+                        .find(|member| {
+                            matches!(self.core.types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none")
+                        })
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let some_ty = members
+                        .iter()
+                        .copied()
+                        .find(|member| {
+                            matches!(self.core.types.get(member.0 as usize), Some(Type::Tuple(items)) if items.len() == 2
+                                && items[1] == value_ty
+                                && matches!(self.core.types.get(items[0].0 as usize), Some(Type::Atom(name)) if name == "some"))
+                        })
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let node_type = self.map_node_type(*map_ty)?;
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let seed_call = built(builder.build_call(
+                        self.hash_seed,
+                        &[],
+                        &format!("v{}.fetch_seed", result.0),
+                    ))?;
+                    let seed = seed_call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or_else(|| BackendError::Builder("hash seed returned void".to_owned()))?
+                        .into_int_value();
+                    let key_hash = self.map_key_hash(
+                        builder,
+                        value(values, *key)?,
+                        key_ty,
+                        seed,
+                        &format!("v{}.fetch_hash", result.0),
+                    )?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let search = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_search", result.0));
+                    let inspect = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_inspect", result.0));
+                    let advance = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_advance", result.0));
+                    let found = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_found", result.0));
+                    let missing = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_missing", result.0));
+                    let done = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.fetch_done", result.0));
+                    built(builder.build_unconditional_branch(search))?;
+
+                    builder.position_at_end(search);
+                    let cursor = built(
+                        builder.build_phi(pointer_ty, &format!("v{}.fetch_cursor", result.0)),
+                    )?;
+                    cursor.add_incoming(&[(&pointer_value(values, *map)?, preheader)]);
+                    let exhausted = built(builder.build_is_null(
+                        cursor.as_basic_value().into_pointer_value(),
+                        &format!("v{}.fetch_exhausted", result.0),
+                    ))?;
+                    built(builder.build_conditional_branch(exhausted, missing, inspect))?;
+
+                    builder.position_at_end(inspect);
+                    let current = cursor.as_basic_value().into_pointer_value();
+                    let stored_hash_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        current,
+                        0,
+                        &format!("v{}.fetch_hash_ptr", result.0),
+                    ))?;
+                    let stored_key_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        current,
+                        1,
+                        &format!("v{}.fetch_key_ptr", result.0),
+                    ))?;
+                    let stored_key = built(builder.build_load(
+                        self.basic_type(key_ty)?,
+                        stored_key_pointer,
+                        &format!("v{}.fetch_key", result.0),
+                    ))?;
+                    let stored_hash = built(builder.build_load(
+                        self.usize_type()?,
+                        stored_hash_pointer,
+                        &format!("v{}.fetch_stored_hash", result.0),
+                    ))?
+                    .into_int_value();
+                    let same_hash = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        stored_hash,
+                        key_hash,
+                        &format!("v{}.fetch_same_hash", result.0),
+                    ))?;
+                    let same_key = self.map_key_equal(
+                        builder,
+                        stored_key,
+                        value(values, *key)?,
+                        key_ty,
+                        &format!("v{}.fetch_same_key", result.0),
+                    )?;
+                    let equal = built(builder.build_and(
+                        same_hash,
+                        same_key,
+                        &format!("v{}.fetch_equal", result.0),
+                    ))?;
+                    built(builder.build_conditional_branch(equal, found, advance))?;
+
+                    builder.position_at_end(advance);
+                    let next_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        current,
+                        3,
+                        &format!("v{}.fetch_next_ptr", result.0),
+                    ))?;
+                    let next = built(builder.build_load(
+                        pointer_ty,
+                        next_pointer,
+                        &format!("v{}.fetch_next", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let advance_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(search))?;
+                    cursor.add_incoming(&[(&next, advance_end)]);
+
+                    builder.position_at_end(found);
+                    let stored_value_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        current,
+                        2,
+                        &format!("v{}.fetch_value_ptr", result.0),
+                    ))?;
+                    let stored_value = built(builder.build_load(
+                        self.basic_type(value_ty)?,
+                        stored_value_pointer,
+                        &format!("v{}.fetch_value", result.0),
+                    ))?;
+                    let mut some = AggregateValueEnum::StructValue(
+                        self.basic_type(some_ty)?.into_struct_type().get_undef(),
+                    );
+                    some = built(builder.build_insert_value(
+                        some,
+                        self.context.i8_type().const_zero(),
+                        0,
+                        &format!("v{}.fetch_some_tag", result.0),
+                    ))?;
+                    some = built(builder.build_insert_value(
+                        some,
+                        stored_value,
+                        1,
+                        &format!("v{}.fetch_some_value", result.0),
+                    ))?;
+                    let mut some_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let some_tag = self.union_tag(*ty, some_ty)?;
+                    some_union = built(
+                        builder.build_insert_value(
+                            some_union,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(some_tag), false),
+                            0,
+                            &format!("v{}.fetch_some_union_tag", result.0),
+                        ),
+                    )?;
+                    some_union = built(builder.build_insert_value(
+                        some_union,
+                        some.into_struct_value(),
+                        some_tag + 1,
+                        &format!("v{}.fetch_some_payload", result.0),
+                    ))?;
+                    let found_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done))?;
+
+                    builder.position_at_end(missing);
+                    let mut none_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let none_tag = self.union_tag(*ty, none_ty)?;
+                    none_union = built(
+                        builder.build_insert_value(
+                            none_union,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(none_tag), false),
+                            0,
+                            &format!("v{}.fetch_none_union_tag", result.0),
+                        ),
+                    )?;
+                    none_union = built(builder.build_insert_value(
+                        none_union,
+                        self.context.i8_type().const_zero(),
+                        none_tag + 1,
+                        &format!("v{}.fetch_none_payload", result.0),
+                    ))?;
+                    let missing_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done))?;
+
+                    builder.position_at_end(done);
+                    let output =
+                        built(builder.build_phi(self.basic_type(*ty)?, &format!("v{}", result.0)))?;
+                    let some_value = some_union.into_struct_value();
+                    let none_value = none_union.into_struct_value();
+                    output.add_incoming(&[(&some_value, found_end), (&none_value, missing_end)]);
+                    values.insert(*result, output.as_basic_value());
+                }
+            }
+            Operation::MapToList {
+                result,
+                map,
+                map_ty,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, map, map_ty, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "map_to_list",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("map to-list has no partial-list root".to_owned())
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let Some(Type::Map {
+                        key: key_ty,
+                        value: value_ty,
+                    }) = self.core.types.get(map_ty.0 as usize)
+                    else {
+                        return Err(BackendError::UnsupportedType(*map_ty));
+                    };
+                    let Some(Type::List(pair_ty)) = self.core.types.get(ty.0 as usize) else {
+                        return Err(BackendError::UnsupportedType(*ty));
+                    };
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let null = pointer_ty.const_null();
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    let head_slot = built(
+                        builder.build_alloca(pointer_ty, &format!("v{}.to_list_head", result.0)),
+                    )?;
+                    let tail_slot = built(
+                        builder.build_alloca(pointer_ty, &format!("v{}.to_list_tail", result.0)),
+                    )?;
+                    built(builder.build_store(head_slot, null))?;
+                    built(builder.build_store(tail_slot, null))?;
+                    let map_node = self.map_node_type(*map_ty)?;
+                    let list_node = self.list_node_type(*ty)?;
+                    let native_size = list_node
+                        .size_of()
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let size = if native_size.get_type() == self.context.i64_type() {
+                        native_size
+                    } else {
+                        built(builder.build_int_cast(
+                            native_size,
+                            self.context.i64_type(),
+                            &format!("v{}.to_list_size", result.0),
+                        ))?
+                    };
+                    let source = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.to_list_loop", result.0));
+                    let body_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.to_list_body", result.0));
+                    let install_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.to_list_install", result.0),
+                    );
+                    let link_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.to_list_link", result.0));
+                    let continue_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.to_list_continue", result.0),
+                    );
+                    let done_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.to_list_done", result.0));
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    builder.position_at_end(loop_block);
+                    let cursor = built(
+                        builder.build_phi(pointer_ty, &format!("v{}.to_list_cursor", result.0)),
+                    )?;
+                    cursor.add_incoming(&[(&pointer_value(values, *map)?, preheader)]);
+                    let exhausted = built(builder.build_is_null(
+                        cursor.as_basic_value().into_pointer_value(),
+                        &format!("v{}.to_list_empty", result.0),
+                    ))?;
+                    built(builder.build_conditional_branch(exhausted, done_block, body_block))?;
+
+                    builder.position_at_end(body_block);
+                    let current = cursor.as_basic_value().into_pointer_value();
+                    let key_ptr = built(builder.build_struct_gep(
+                        map_node,
+                        current,
+                        1,
+                        "map.to_list.key_ptr",
+                    ))?;
+                    let value_ptr = built(builder.build_struct_gep(
+                        map_node,
+                        current,
+                        2,
+                        "map.to_list.value_ptr",
+                    ))?;
+                    let next_ptr = built(builder.build_struct_gep(
+                        map_node,
+                        current,
+                        3,
+                        "map.to_list.next_ptr",
+                    ))?;
+                    let key = built(builder.build_load(
+                        self.basic_type(*key_ty)?,
+                        key_ptr,
+                        "map.to_list.key",
+                    ))?;
+                    let item_value = built(builder.build_load(
+                        self.basic_type(*value_ty)?,
+                        value_ptr,
+                        "map.to_list.value",
+                    ))?;
+                    let next = built(builder.build_load(pointer_ty, next_ptr, "map.to_list.next"))?
+                        .into_pointer_value();
+                    let mut pair = AggregateValueEnum::StructValue(
+                        self.basic_type(*pair_ty)?.into_struct_type().get_undef(),
+                    );
+                    pair = built(builder.build_insert_value(pair, key, 0, "map.to_list.pair_key"))?;
+                    pair = built(builder.build_insert_value(
+                        pair,
+                        item_value,
+                        1,
+                        "map.to_list.pair_value",
+                    ))?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_scanned,
+                            &[
+                                size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source.start, false)
+                                    .into(),
+                                self.context.i64_type().const_int(source.end, false).into(),
+                            ],
+                            &format!("v{}.to_list_node", result.0),
+                        ),
+                    )?;
+                    let node = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    let item_ptr = built(builder.build_struct_gep(
+                        list_node,
+                        node,
+                        0,
+                        "map.to_list.item_ptr",
+                    ))?;
+                    let node_next = built(builder.build_struct_gep(
+                        list_node,
+                        node,
+                        1,
+                        "map.to_list.node_next",
+                    ))?;
+                    built(builder.build_store(item_ptr, pair.into_struct_value()))?;
+                    built(builder.build_store(node_next, null))?;
+                    let head =
+                        built(builder.build_load(pointer_ty, head_slot, "map.to_list.head"))?
+                            .into_pointer_value();
+                    let empty = built(builder.build_is_null(head, "map.to_list.output_empty"))?;
+                    built(builder.build_conditional_branch(empty, install_block, link_block))?;
+                    builder.position_at_end(install_block);
+                    built(builder.build_store(head_slot, node))?;
+                    built(builder.build_store(tail_slot, node))?;
+                    set_volatile(built(builder.build_store(partial, node))?)?;
+                    built(builder.build_unconditional_branch(continue_block))?;
+                    builder.position_at_end(link_block);
+                    let tail =
+                        built(builder.build_load(pointer_ty, tail_slot, "map.to_list.tail"))?
+                            .into_pointer_value();
+                    let tail_next = built(builder.build_struct_gep(
+                        list_node,
+                        tail,
+                        1,
+                        "map.to_list.tail_next",
+                    ))?;
+                    built(builder.build_store(tail_next, node))?;
+                    built(builder.build_store(tail_slot, node))?;
+                    built(builder.build_unconditional_branch(continue_block))?;
+                    builder.position_at_end(continue_block);
+                    let continue_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    cursor.add_incoming(&[(&next, continue_end)]);
+                    builder.position_at_end(done_block);
+                    let output = built(builder.build_load(
+                        pointer_ty,
+                        head_slot,
+                        &format!("v{}", result.0),
+                    ))?
+                    .into_pointer_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    values.insert(*result, output.into());
+                }
+            }
             Operation::Tuple {
+                result,
+                elements,
+                ty,
+                ..
+            }
+            | Operation::Array {
                 result,
                 elements,
                 ty,
@@ -773,6 +3423,22 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 }
                 values.insert(*result, aggregate.into_struct_value().into());
             }
+            Operation::Struct {
+                result, fields, ty, ..
+            } => {
+                let mut aggregate = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                for (index, field) in fields {
+                    aggregate = built(builder.build_insert_value(
+                        aggregate,
+                        value(values, *field)?,
+                        *index as u32,
+                        &format!("v{}.field{index}", result.0),
+                    ))?;
+                }
+                values.insert(*result, aggregate.into_struct_value().into());
+            }
             Operation::TupleProject {
                 result,
                 tuple,
@@ -785,6 +3451,1004 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &format!("v{}", result.0),
                 ))?;
                 values.insert(*result, projected);
+            }
+            Operation::StructProject {
+                result,
+                structure,
+                index,
+                ..
+            } => {
+                let projected = built(builder.build_extract_value(
+                    struct_value(values, *structure)?,
+                    *index as u32,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, projected);
+            }
+            Operation::ArrayIndex {
+                result,
+                array,
+                index,
+                length,
+                failure,
+                ty,
+                ..
+            } => {
+                let index_value = integer_value(values, *index)?;
+                let source = struct_value(values, *array)?;
+                let bound = if let Some(length) = length {
+                    index_value.get_type().const_int(*length, false)
+                } else {
+                    built(builder.build_extract_value(source, 2, &format!("v{}.length", result.0)))?
+                        .into_int_value()
+                };
+                let out_of_bounds = built(builder.build_int_compare(
+                    IntPredicate::UGE,
+                    index_value,
+                    bound,
+                    &format!("v{}.out_of_bounds", result.0),
+                ))?;
+                let continuation = self.context.append_basic_block(
+                    builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?,
+                    &format!("v{}.index_ok", result.0),
+                );
+                built(builder.build_conditional_branch(
+                    out_of_bounds,
+                    self.block(blocks, *failure)?,
+                    continuation,
+                ))?;
+                builder.position_at_end(continuation);
+
+                if let Some(length) = length {
+                    let mut selected = self.basic_type(*ty)?.const_zero();
+                    for candidate in 0..*length {
+                        let element = built(builder.build_extract_value(
+                            source,
+                            candidate as u32,
+                            &format!("v{}.candidate{candidate}", result.0),
+                        ))?;
+                        let matches = built(builder.build_int_compare(
+                            IntPredicate::EQ,
+                            index_value,
+                            index_value.get_type().const_int(candidate, false),
+                            &format!("v{}.is{candidate}", result.0),
+                        ))?;
+                        selected = built(builder.build_select(
+                            matches,
+                            element,
+                            selected,
+                            &format!("v{}.select{candidate}", result.0),
+                        ))?;
+                    }
+                    values.insert(*result, selected);
+                } else {
+                    let data = built(builder.build_extract_value(
+                        source,
+                        1,
+                        &format!("v{}.data", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let pointer = self.element_pointer(
+                        builder,
+                        self.basic_type(*ty)?,
+                        data,
+                        index_value,
+                        &format!("v{}.pointer", result.0),
+                    )?;
+                    let loaded = built(builder.build_load(
+                        self.basic_type(*ty)?,
+                        pointer,
+                        &format!("v{}", result.0),
+                    ))?;
+                    values.insert(*result, loaded);
+                }
+            }
+            Operation::SliceFromArray {
+                result,
+                array,
+                length,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, array, length, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "slice_from_array",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let item_ty = match self.core.types.get(ty.0 as usize) {
+                        Some(Type::Slice(item)) => self.basic_type(*item)?,
+                        _ => return Err(BackendError::UnsupportedType(*ty)),
+                    };
+                    let base = if *length == 0 {
+                        self.context.ptr_type(AddressSpace::default()).const_null()
+                    } else {
+                        let item_size = item_ty
+                            .size_of()
+                            .ok_or(BackendError::UnsupportedType(*ty))?;
+                        let size = built(builder.build_int_mul(
+                            item_size,
+                            item_size.get_type().const_int(*length, false),
+                            &format!("v{}.bytes", result.0),
+                        ))?;
+                        let is_zero = built(builder.build_int_compare(
+                            IntPredicate::EQ,
+                            size,
+                            size.get_type().const_zero(),
+                            &format!("v{}.empty_storage", result.0),
+                        ))?;
+                        let size = built(builder.build_select(
+                            is_zero,
+                            size.get_type().const_int(1, false),
+                            size,
+                            &format!("v{}.allocation_size", result.0),
+                        ))?
+                        .into_int_value();
+                        let size = if size.get_type() == self.context.i64_type() {
+                            size
+                        } else {
+                            built(builder.build_int_cast(
+                                size,
+                                self.context.i64_type(),
+                                "slice.bytes.i64",
+                            ))?
+                        };
+                        let source = FailureOrigin::from_span(*origin)
+                            .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                        let call = built(
+                            builder.build_call(
+                                self.allocate_scanned,
+                                &[
+                                    size.into(),
+                                    self.context
+                                        .i32_type()
+                                        .const_int(u64::from(source.file), false)
+                                        .into(),
+                                    self.context
+                                        .i64_type()
+                                        .const_int(source.start, false)
+                                        .into(),
+                                    self.context.i64_type().const_int(source.end, false).into(),
+                                ],
+                                &format!("v{}.base", result.0),
+                            ),
+                        )?;
+                        let base = call
+                            .try_as_basic_value()
+                            .basic()
+                            .ok_or(BackendError::MissingValue(*result))?
+                            .into_pointer_value();
+                        let aggregate = struct_value(values, *array)?;
+                        for candidate in 0..*length {
+                            let pointer = self.element_pointer(
+                                builder,
+                                item_ty,
+                                base,
+                                self.usize_type()?.const_int(candidate, false),
+                                &format!("v{}.item{candidate}", result.0),
+                            )?;
+                            let item = built(builder.build_extract_value(
+                                aggregate,
+                                candidate as u32,
+                                &format!("v{}.source{candidate}", result.0),
+                            ))?;
+                            built(builder.build_store(pointer, item))?;
+                        }
+                        base
+                    };
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let slice_ty = self.basic_type(*ty)?.into_struct_type();
+                    let mut slice = AggregateValueEnum::StructValue(slice_ty.get_undef());
+                    let fields: [BasicValueEnum<'ctx>; 3] = [
+                        base.into(),
+                        base.into(),
+                        self.usize_type()?.const_int(*length, false).into(),
+                    ];
+                    for (field, value) in fields.into_iter().enumerate() {
+                        slice = built(builder.build_insert_value(
+                            slice,
+                            value,
+                            field as u32,
+                            "slice.field",
+                        ))?;
+                    }
+                    values.insert(*result, slice.into_struct_value().into());
+                }
+            }
+            Operation::SliceSubslice {
+                result,
+                slice,
+                start,
+                length,
+                failure,
+                ty,
+                ..
+            } => {
+                let source = struct_value(values, *slice)?;
+                let source_length = built(builder.build_extract_value(
+                    source,
+                    2,
+                    &format!("v{}.source_length", result.0),
+                ))?
+                .into_int_value();
+                let start = integer_value(values, *start)?;
+                let length = integer_value(values, *length)?;
+                let start_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    start,
+                    source_length,
+                    &format!("v{}.start_invalid", result.0),
+                ))?;
+                let remaining = built(builder.build_int_sub(
+                    source_length,
+                    start,
+                    &format!("v{}.remaining", result.0),
+                ))?;
+                let length_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    length,
+                    remaining,
+                    &format!("v{}.length_invalid", result.0),
+                ))?;
+                let invalid = built(builder.build_or(
+                    start_invalid,
+                    length_invalid,
+                    &format!("v{}.out_of_bounds", result.0),
+                ))?;
+                let continuation = self.context.append_basic_block(
+                    builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?,
+                    &format!("v{}.subslice_ok", result.0),
+                );
+                built(builder.build_conditional_branch(
+                    invalid,
+                    self.block(blocks, *failure)?,
+                    continuation,
+                ))?;
+                builder.position_at_end(continuation);
+                let base = built(builder.build_extract_value(source, 0, "slice.base"))?;
+                let data = built(builder.build_extract_value(source, 1, "slice.data"))?
+                    .into_pointer_value();
+                let item = match self.core.types.get(ty.0 as usize) {
+                    Some(Type::Slice(item)) => self.basic_type(*item)?,
+                    _ => return Err(BackendError::UnsupportedType(*ty)),
+                };
+                let new_data =
+                    self.element_pointer(builder, item, data, start, "slice.new_data")?;
+                let mut output = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                let fields: [BasicValueEnum<'ctx>; 3] = [base, new_data.into(), length.into()];
+                for (field, value) in fields.into_iter().enumerate() {
+                    output = built(builder.build_insert_value(
+                        output,
+                        value,
+                        field as u32,
+                        "slice.field",
+                    ))?;
+                }
+                values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::SliceCopy {
+                result,
+                slice,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, slice, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "slice_copy",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *slice)?;
+                    let data = built(builder.build_extract_value(source, 1, "slice.data"))?
+                        .into_pointer_value();
+                    let length = built(builder.build_extract_value(source, 2, "slice.length"))?
+                        .into_int_value();
+                    let item_ty = match self.core.types.get(ty.0 as usize) {
+                        Some(Type::Slice(item)) => self.basic_type(*item)?,
+                        _ => return Err(BackendError::UnsupportedType(*ty)),
+                    };
+                    let item_size = item_ty
+                        .size_of()
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let item_size = if item_size.get_type() == length.get_type() {
+                        item_size
+                    } else {
+                        built(builder.build_int_cast(
+                            item_size,
+                            length.get_type(),
+                            "slice.item_size",
+                        ))?
+                    };
+                    let bytes =
+                        built(builder.build_int_mul(item_size, length, "slice.copy_bytes"))?;
+                    let one = bytes.get_type().const_int(1, false);
+                    let is_empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        "slice.empty",
+                    ))?;
+                    let allocation_size =
+                        built(builder.build_select(is_empty, one, bytes, "slice.allocation_size"))?
+                            .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "slice.bytes.i64",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_scanned,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.base", result.0),
+                        ),
+                    )?;
+                    let new_base = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    built(builder.build_memcpy(new_base, 1, data, 1, bytes))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let fields: [BasicValueEnum<'ctx>; 3] =
+                        [new_base.into(), new_base.into(), length.into()];
+                    for (field, value) in fields.into_iter().enumerate() {
+                        output = built(builder.build_insert_value(
+                            output,
+                            value,
+                            field as u32,
+                            "slice.field",
+                        ))?;
+                    }
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::StringBytes {
+                result, string, ty, ..
+            } => {
+                let source = struct_value(values, *string)?;
+                let data =
+                    built(builder.build_extract_value(source, 0, &format!("v{}.data", result.0)))?;
+                let source_length = built(builder.build_extract_value(
+                    source,
+                    1,
+                    &format!("v{}.source_length", result.0),
+                ))?
+                .into_int_value();
+                let length = if source_length.get_type() == self.usize_type()? {
+                    source_length
+                } else {
+                    built(builder.build_int_cast(
+                        source_length,
+                        self.usize_type()?,
+                        &format!("v{}.length", result.0),
+                    ))?
+                };
+                let mut output = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                let fields: [BasicValueEnum<'ctx>; 3] = [data, data, length.into()];
+                for (field, value) in fields.into_iter().enumerate() {
+                    output = built(builder.build_insert_value(
+                        output,
+                        value,
+                        field as u32,
+                        "bytes.field",
+                    ))?;
+                }
+                values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::BytesFromList {
+                result,
+                list,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, list, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "bytes_from_list",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let source = pointer_value(values, *list)?;
+                    let source_ty = value_types
+                        .get(list)
+                        .copied()
+                        .ok_or(BackendError::MissingValue(*list))?;
+                    let node_ty = self.list_node_type(source_ty)?;
+                    let usize_ty = self.usize_type()?;
+                    let function_value = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let count_loop = self
+                        .context
+                        .append_basic_block(function_value, &format!("v{}.bytes_count", result.0));
+                    let count_body = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_count_body", result.0),
+                    );
+                    let allocate_block = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_allocate", result.0),
+                    );
+                    built(builder.build_unconditional_branch(count_loop))?;
+                    builder.position_at_end(count_loop);
+                    let cursor_phi = built(builder.build_phi(pointer_ty, "bytes.count.cursor"))?;
+                    let count_phi = built(builder.build_phi(usize_ty, "bytes.count"))?;
+                    cursor_phi.add_incoming(&[(&source, preheader)]);
+                    count_phi.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+                    let cursor = cursor_phi.as_basic_value().into_pointer_value();
+                    let count = count_phi.as_basic_value().into_int_value();
+                    let done = built(builder.build_is_null(cursor, "bytes.count.done"))?;
+                    built(builder.build_conditional_branch(done, allocate_block, count_body))?;
+                    builder.position_at_end(count_body);
+                    let next_ptr = built(builder.build_struct_gep(
+                        node_ty,
+                        cursor,
+                        1,
+                        "bytes.count.next_ptr",
+                    ))?;
+                    let next = built(builder.build_load(pointer_ty, next_ptr, "bytes.count.next"))?
+                        .into_pointer_value();
+                    let next_count = built(builder.build_int_add(
+                        count,
+                        usize_ty.const_int(1, false),
+                        "bytes.count.next_count",
+                    ))?;
+                    let count_body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(count_loop))?;
+                    cursor_phi.add_incoming(&[(&next, count_body_end)]);
+                    count_phi.add_incoming(&[(&next_count, count_body_end)]);
+
+                    builder.position_at_end(allocate_block);
+                    let one = usize_ty.const_int(1, false);
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        count,
+                        usize_ty.const_zero(),
+                        "bytes.empty",
+                    ))?;
+                    let allocation_size =
+                        built(builder.build_select(empty, one, count, "bytes.allocation_size"))?
+                            .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "bytes.allocation_size.i64",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.base", result.0),
+                        ),
+                    )?;
+                    let base = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+
+                    let copy_loop = self
+                        .context
+                        .append_basic_block(function_value, &format!("v{}.bytes_copy", result.0));
+                    let copy_body = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_copy_body", result.0),
+                    );
+                    let copy_done = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_copy_done", result.0),
+                    );
+                    let allocation_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(copy_loop))?;
+                    builder.position_at_end(copy_loop);
+                    let copy_cursor_phi =
+                        built(builder.build_phi(pointer_ty, "bytes.copy.cursor"))?;
+                    let index_phi = built(builder.build_phi(usize_ty, "bytes.copy.index"))?;
+                    copy_cursor_phi.add_incoming(&[(&source, allocation_end)]);
+                    index_phi.add_incoming(&[(&usize_ty.const_zero(), allocation_end)]);
+                    let copy_cursor = copy_cursor_phi.as_basic_value().into_pointer_value();
+                    let copy_finished =
+                        built(builder.build_is_null(copy_cursor, "bytes.copy.done"))?;
+                    built(builder.build_conditional_branch(copy_finished, copy_done, copy_body))?;
+                    builder.position_at_end(copy_body);
+                    let item_ptr = built(builder.build_struct_gep(
+                        node_ty,
+                        copy_cursor,
+                        0,
+                        "bytes.copy.item_ptr",
+                    ))?;
+                    let byte = built(builder.build_load(
+                        self.context.i8_type(),
+                        item_ptr,
+                        "bytes.copy.item",
+                    ))?;
+                    let destination = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        base,
+                        index_phi.as_basic_value().into_int_value(),
+                        "bytes.copy.destination",
+                    )?;
+                    built(builder.build_store(destination, byte))?;
+                    let next_ptr = built(builder.build_struct_gep(
+                        node_ty,
+                        copy_cursor,
+                        1,
+                        "bytes.copy.next_ptr",
+                    ))?;
+                    let next = built(builder.build_load(pointer_ty, next_ptr, "bytes.copy.next"))?
+                        .into_pointer_value();
+                    let next_index = built(builder.build_int_add(
+                        index_phi.as_basic_value().into_int_value(),
+                        usize_ty.const_int(1, false),
+                        "bytes.copy.next_index",
+                    ))?;
+                    let copy_body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(copy_loop))?;
+                    copy_cursor_phi.add_incoming(&[(&next, copy_body_end)]);
+                    index_phi.add_incoming(&[(&next_index, copy_body_end)]);
+                    builder.position_at_end(copy_done);
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    for (field, value) in [
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(count),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        output = built(builder.build_insert_value(
+                            output,
+                            value,
+                            field as u32,
+                            "bytes.field",
+                        ))?;
+                    }
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::BytesToList {
+                result,
+                bytes,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, bytes, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "bytes_to_list",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("bytes to-list has no partial-result root".to_owned())
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let null = pointer_ty.const_null();
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    let source = struct_value(values, *bytes)?;
+                    let data = built(builder.build_extract_value(source, 1, "bytes.to_list.data"))?
+                        .into_pointer_value();
+                    let length =
+                        built(builder.build_extract_value(source, 2, "bytes.to_list.length"))?
+                            .into_int_value();
+                    let function_value = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_to_list_loop", result.0),
+                    );
+                    let body_block = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_to_list_body", result.0),
+                    );
+                    let done_block = self.context.append_basic_block(
+                        function_value,
+                        &format!("v{}.bytes_to_list_done", result.0),
+                    );
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    builder.position_at_end(loop_block);
+                    let index_phi =
+                        built(builder.build_phi(length.get_type(), "bytes.to_list.index"))?;
+                    let head_phi = built(builder.build_phi(pointer_ty, "bytes.to_list.head"))?;
+                    index_phi.add_incoming(&[(&length, preheader)]);
+                    head_phi.add_incoming(&[(&null, preheader)]);
+                    let index = index_phi.as_basic_value().into_int_value();
+                    let head = head_phi.as_basic_value().into_pointer_value();
+                    let done = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        index,
+                        index.get_type().const_zero(),
+                        "bytes.to_list.empty",
+                    ))?;
+                    built(builder.build_conditional_branch(done, done_block, body_block))?;
+                    builder.position_at_end(body_block);
+                    let source_index = built(builder.build_int_sub(
+                        index,
+                        index.get_type().const_int(1, false),
+                        "bytes.to_list.source_index",
+                    ))?;
+                    let source_ptr = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        data,
+                        source_index,
+                        "bytes.to_list.source_ptr",
+                    )?;
+                    let byte = built(builder.build_load(
+                        self.context.i8_type(),
+                        source_ptr,
+                        "bytes.to_list.byte",
+                    ))?;
+                    let node_ty = self.list_node_type(*ty)?;
+                    let native_size = node_ty
+                        .size_of()
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let size = if native_size.get_type() == self.context.i64_type() {
+                        native_size
+                    } else {
+                        built(builder.build_int_cast(
+                            native_size,
+                            self.context.i64_type(),
+                            "bytes.to_list.node_size",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_scanned,
+                            &[
+                                size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.node", result.0),
+                        ),
+                    )?;
+                    let node = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    let item_ptr = built(builder.build_struct_gep(
+                        node_ty,
+                        node,
+                        0,
+                        "bytes.to_list.item_ptr",
+                    ))?;
+                    let next_ptr = built(builder.build_struct_gep(
+                        node_ty,
+                        node,
+                        1,
+                        "bytes.to_list.next_ptr",
+                    ))?;
+                    built(builder.build_store(item_ptr, byte))?;
+                    built(builder.build_store(next_ptr, head))?;
+                    set_volatile(built(builder.build_store(partial, node))?)?;
+                    let body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    index_phi.add_incoming(&[(&source_index, body_end)]);
+                    head_phi.add_incoming(&[(&node, body_end)]);
+                    builder.position_at_end(done_block);
+                    let output = head_phi.as_basic_value().into_pointer_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    values.insert(*result, output.into());
+                }
+            }
+            Operation::BytesSlice {
+                result,
+                bytes,
+                start,
+                length,
+                failure,
+                ty,
+                ..
+            } => {
+                let source = struct_value(values, *bytes)?;
+                let source_length = built(builder.build_extract_value(
+                    source,
+                    2,
+                    &format!("v{}.source_length", result.0),
+                ))?
+                .into_int_value();
+                let start = integer_value(values, *start)?;
+                let length = integer_value(values, *length)?;
+                let start_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    start,
+                    source_length,
+                    &format!("v{}.start_invalid", result.0),
+                ))?;
+                let remaining = built(builder.build_int_sub(
+                    source_length,
+                    start,
+                    &format!("v{}.remaining", result.0),
+                ))?;
+                let length_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    length,
+                    remaining,
+                    &format!("v{}.length_invalid", result.0),
+                ))?;
+                let invalid = built(builder.build_or(
+                    start_invalid,
+                    length_invalid,
+                    &format!("v{}.out_of_bounds", result.0),
+                ))?;
+                let continuation = self.context.append_basic_block(
+                    builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?,
+                    &format!("v{}.bytes_slice_ok", result.0),
+                );
+                built(builder.build_conditional_branch(
+                    invalid,
+                    self.block(blocks, *failure)?,
+                    continuation,
+                ))?;
+                builder.position_at_end(continuation);
+                let base = built(builder.build_extract_value(source, 0, "bytes.base"))?;
+                let data = built(builder.build_extract_value(source, 1, "bytes.data"))?
+                    .into_pointer_value();
+                let new_data = self.element_pointer(
+                    builder,
+                    self.context.i8_type().into(),
+                    data,
+                    start,
+                    "bytes.new_data",
+                )?;
+                let mut output = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                let fields: [BasicValueEnum<'ctx>; 3] = [base, new_data.into(), length.into()];
+                for (field, value) in fields.into_iter().enumerate() {
+                    output = built(builder.build_insert_value(
+                        output,
+                        value,
+                        field as u32,
+                        "bytes.field",
+                    ))?;
+                }
+                values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::CollectionLength {
+                result,
+                value,
+                known_length,
+                ..
+            } => {
+                let source_ty = value_types
+                    .get(value)
+                    .copied()
+                    .ok_or(BackendError::MissingValue(*value))?;
+                let length = if let Some(length) = known_length {
+                    self.usize_type()?.const_int(*length, false)
+                } else if matches!(
+                    self.core.types.get(source_ty.0 as usize),
+                    Some(Type::Map { .. })
+                ) {
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.size_loop", result.0));
+                    let body_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.size_body", result.0));
+                    let done_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.size_done", result.0));
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    builder.position_at_end(loop_block);
+                    let cursor = built(builder.build_phi(
+                        self.context.ptr_type(AddressSpace::default()),
+                        &format!("v{}.cursor", result.0),
+                    ))?;
+                    let count = built(
+                        builder.build_phi(self.usize_type()?, &format!("v{}.count", result.0)),
+                    )?;
+                    let initial = pointer_value(values, *value)?;
+                    let zero = self.usize_type()?.const_zero();
+                    cursor.add_incoming(&[(&initial, preheader)]);
+                    count.add_incoming(&[(&zero, preheader)]);
+                    let empty = built(builder.build_is_null(
+                        cursor.as_basic_value().into_pointer_value(),
+                        &format!("v{}.empty", result.0),
+                    ))?;
+                    built(builder.build_conditional_branch(empty, done_block, body_block))?;
+                    builder.position_at_end(body_block);
+                    let node_type = self.map_node_type(source_ty)?;
+                    let next_pointer = built(builder.build_struct_gep(
+                        node_type,
+                        cursor.as_basic_value().into_pointer_value(),
+                        3,
+                        &format!("v{}.next_ptr", result.0),
+                    ))?;
+                    let next = built(builder.build_load(
+                        self.context.ptr_type(AddressSpace::default()),
+                        next_pointer,
+                        &format!("v{}.next", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let next_count = built(builder.build_int_add(
+                        count.as_basic_value().into_int_value(),
+                        self.usize_type()?.const_int(1, false),
+                        &format!("v{}.next_count", result.0),
+                    ))?;
+                    let body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    cursor.add_incoming(&[(&next, body_end)]);
+                    count.add_incoming(&[(&next_count, body_end)]);
+                    builder.position_at_end(done_block);
+                    count.as_basic_value().into_int_value()
+                } else if matches!(
+                    self.core.types.get(source_ty.0 as usize),
+                    Some(Type::String)
+                ) {
+                    built(builder.build_extract_value(
+                        struct_value(values, *value)?,
+                        1,
+                        &format!("v{}", result.0),
+                    ))?
+                    .into_int_value()
+                } else {
+                    built(builder.build_extract_value(
+                        struct_value(values, *value)?,
+                        2,
+                        &format!("v{}", result.0),
+                    ))?
+                    .into_int_value()
+                };
+                values.insert(*result, length.into());
             }
             Operation::ListHead {
                 result, list, ty, ..
@@ -845,11 +4509,51 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 operator,
                 left,
                 right,
+                operand_ty,
                 ..
             } => {
+                if matches!(
+                    operator,
+                    ComparisonOperator::Equal | ComparisonOperator::NotEqual
+                ) && !matches!(
+                    self.core.types.get(operand_ty.0 as usize),
+                    Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool)
+                ) {
+                    #[cfg(not(feature = "managed-runtime"))]
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "structural_equal",
+                    });
+                    #[cfg(feature = "managed-runtime")]
+                    {
+                        let equal = self.map_key_equal(
+                            builder,
+                            value(values, *left)?,
+                            value(values, *right)?,
+                            *operand_ty,
+                            &format!("v{}.equal", result.0),
+                        )?;
+                        let compared = if matches!(operator, ComparisonOperator::NotEqual) {
+                            built(builder.build_not(equal, &format!("v{}", result.0)))?
+                        } else {
+                            equal
+                        };
+                        values.insert(*result, compared.into());
+                        return Ok(());
+                    }
+                }
+                let unsigned = matches!(
+                    self.core.types.get(operand_ty.0 as usize),
+                    Some(Type::U8 | Type::Usize)
+                );
                 let predicate = match operator {
                     ComparisonOperator::Equal => IntPredicate::EQ,
                     ComparisonOperator::NotEqual => IntPredicate::NE,
+                    ComparisonOperator::Less if unsigned => IntPredicate::ULT,
+                    ComparisonOperator::LessEqual if unsigned => IntPredicate::ULE,
+                    ComparisonOperator::Greater if unsigned => IntPredicate::UGT,
+                    ComparisonOperator::GreaterEqual if unsigned => IntPredicate::UGE,
                     ComparisonOperator::Less => IntPredicate::SLT,
                     ComparisonOperator::LessEqual => IntPredicate::SLE,
                     ComparisonOperator::Greater => IntPredicate::SGT,
@@ -955,13 +4659,6 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     .copied()
                     .ok_or(BackendError::MissingSlot(*slot))?;
                 built(builder.build_store(pointer, value(values, *id)?))?;
-            }
-            other => {
-                return Err(BackendError::UnsupportedOperation {
-                    function,
-                    block,
-                    operation: operation_name(other),
-                });
             }
         }
         Ok(())
@@ -1070,6 +4767,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let category = match category {
                     CoreFailureCategory::IntegerOverflow => FailureCategory::IntegerOverflow,
                     CoreFailureCategory::DivisionByZero => FailureCategory::DivisionByZero,
+                    CoreFailureCategory::IndexOutOfBounds => FailureCategory::IndexOutOfBounds,
                 };
                 let i32_type = self.context.i32_type();
                 let i64_type = self.context.i64_type();
@@ -1355,6 +5053,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         ty: TypeId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match (constant, self.core.types.get(ty.0 as usize)) {
+            (Constant::Integer(value), Some(Type::U8)) => {
+                let value = u8::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .context
+                    .i8_type()
+                    .const_int(u64::from(value), false)
+                    .into())
+            }
             (Constant::Integer(value), Some(Type::I32)) => {
                 let value = i32::try_from(*value)
                     .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
@@ -1372,6 +5079,11 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     .i64_type()
                     .const_int(value as u64, false)
                     .into())
+            }
+            (Constant::Integer(value), Some(Type::Usize)) => {
+                let value = usize::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self.usize_type()?.const_int(value as u64, false).into())
             }
             (Constant::Boolean(value), Some(Type::Bool)) => Ok(self
                 .context
@@ -1433,9 +5145,24 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                 .filter_map(|operation| match operation {
                     Operation::Constant { result, ty, .. }
                     | Operation::List { result, ty, .. }
+                    | Operation::ListReverse { result, ty, .. }
                     | Operation::Array { result, ty, .. }
+                    | Operation::ArrayIndex { result, ty, .. }
+                    | Operation::SliceFromArray { result, ty, .. }
+                    | Operation::SliceSubslice { result, ty, .. }
+                    | Operation::SliceCopy { result, ty, .. }
+                    | Operation::StringBytes { result, ty, .. }
+                    | Operation::BytesFromList { result, ty, .. }
+                    | Operation::BytesToList { result, ty, .. }
+                    | Operation::BytesSlice { result, ty, .. }
+                    | Operation::CollectionLength { result, ty, .. }
                     | Operation::Map { result, ty, .. }
+                    | Operation::MapPut { result, ty, .. }
+                    | Operation::MapRemove { result, ty, .. }
+                    | Operation::MapFetch { result, ty, .. }
+                    | Operation::MapToList { result, ty, .. }
                     | Operation::Tuple { result, ty, .. }
+                    | Operation::Struct { result, ty, .. }
                     | Operation::TupleProject { result, ty, .. }
                     | Operation::StructProject { result, ty, .. }
                     | Operation::ListHead { result, ty, .. }
@@ -1502,27 +5229,6 @@ fn pointer_value<'ctx>(
     }
 }
 
-fn operation_name(operation: &Operation) -> &'static str {
-    match operation {
-        Operation::Constant { .. } => "constant",
-        Operation::List { .. } => "list",
-        Operation::Array { .. } => "array",
-        Operation::Map { .. } => "map",
-        Operation::Tuple { .. } => "tuple",
-        Operation::TupleProject { .. } => "tuple_project",
-        Operation::StructProject { .. } => "struct_project",
-        Operation::ListHead { .. } => "list_head",
-        Operation::ListTail { .. } => "list_tail",
-        Operation::CheckedArithmetic { .. } => "checked_arithmetic",
-        Operation::Compare { .. } => "compare",
-        Operation::Call { .. } => "call",
-        Operation::UnionInject { .. } => "union_inject",
-        Operation::UnionProject { .. } => "union_project",
-        Operation::Load { .. } => "load",
-        Operation::Store { .. } => "store",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1573,6 +5279,19 @@ mod tests {
     }
 
     #[test]
+    fn lowers_fixed_arrays_usize_indices_and_bounds_failures() {
+        let core = concrete(
+            "defmodule Main do\n  def get(values: [i32; 2], index: usize) -> i32 do\n    values[index]\n  end\n  def main() -> i32 do\n    get(#[40, 2], 1)\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("array indexing lowers and verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("{ i32, i32 }"));
+        assert!(text.contains("icmp uge i64"));
+        assert!(text.contains("call void @__el_runtime_fail(i32 5"));
+    }
+
+    #[test]
     fn checks_division_zero_before_signed_overflow_with_the_same_origin() {
         let core = concrete(
             "defmodule Main do\n  def divide(value: i32, divisor: i32) -> i32 do\n    value / divisor\n  end\n  def main() -> i32 do\n    divide(10, 2)\n  end\nend\n",
@@ -1619,6 +5338,19 @@ mod tests {
         assert!(text.contains("extractvalue"), "{text}");
         assert!(text.contains("switch"), "{text}");
         assert!(text.contains("{ i32, i8, { i8, i32 } }"), "{text}");
+    }
+
+    #[test]
+    fn lowers_struct_values_projections_and_reconstruction() {
+        let core = concrete(
+            "defmodule Main do\n  defstruct Pair(a) do\n    first: a\n    second: i32\n  end\n  def main() -> i32 do\n    mut pair: Pair(i32) = %Pair{second: 2, first: 40}\n    copy = pair\n    pair.second := pair.second + copy.second\n    pair.first + pair.second\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("struct lowering verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("insertvalue { i32, i32 }"), "{text}");
+        assert!(text.contains("extractvalue { i32, i32 }"), "{text}");
+        assert!(text.contains("store { i32, i32 }"), "{text}");
     }
 
     #[test]
@@ -1781,6 +5513,81 @@ mod tests {
             text.contains("gc.partial") && text.contains("store volatile ptr"),
             "partially constructed list spines must remain rooted:\n{text}"
         );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_list_reverse_with_a_rooted_partial_result_loop() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    reversed: [i32] = List.reverse([1, 42])\n    match reversed do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("list reverse lowers and verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("reverse_loop"), "{text}");
+        assert!(text.contains("reverse_body"), "{text}");
+        assert!(text.contains("gc.partial"), "{text}");
+        assert!(
+            text.matches("call ptr @__el_runtime_alloc_scanned").count() >= 2,
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_seeded_composite_maps_order_views_and_structural_equality() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    first: Map({i32, i32}, i32) = %{{1, 2} => 10, {3, 4} => 20}\n    second: Map({i32, i32}, i32) = %{{3, 4} => 20, {1, 2} => 10}\n    ordered = Enum.to_list(first)\n    if first == second do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("seeded composite maps lower and verify");
+        let text = llvm.as_str();
+        assert!(text.contains("@__el_runtime_hash_seed"), "{text}");
+        assert!(text.contains("to_list_loop"), "{text}");
+        assert!(text.contains("right_search"), "{text}");
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_managed_slice_views_copy_and_checked_indexing() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    array: [i32; 3] = #[10, 20, 30]\n    whole = Slice.from_array(array)\n    part = Slice.subslice(whole, 1, 2)\n    copy = Slice.copy(part)\n    copy[1]\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("managed slices lower and verify");
+        let text = llvm.as_str();
+        assert!(
+            text.matches("call ptr @__el_runtime_alloc_scanned").count() >= 2,
+            "{text}"
+        );
+        assert!(text.contains("slice.new_data"), "{text}");
+        assert!(text.contains("llvm.memcpy"), "{text}");
+        assert!(
+            text.contains("call void @__el_runtime_fail(i32 5"),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_fresh_bytes_list_conversions_with_correct_scan_classes() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    values = Bytes.to_list(Bytes.from_list([0, 127, 255]))\n    if values == [0, 127, 255] do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("byte/list conversions lower and verify");
+        let text = llvm.as_str();
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_atomic"),
+            "{text}"
+        );
+        assert!(text.contains("bytes_count"), "{text}");
+        assert!(text.contains("bytes_copy"), "{text}");
+        assert!(text.contains("bytes_to_list_loop"), "{text}");
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_scanned"),
+            "{text}"
+        );
+        assert!(text.contains("gc.partial"), "{text}");
     }
 
     #[test]

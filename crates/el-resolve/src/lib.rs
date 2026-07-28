@@ -55,6 +55,10 @@ pub enum TypeSyntax {
         length: u64,
         span: Span,
     },
+    Slice {
+        item: Box<TypeSyntax>,
+        span: Span,
+    },
     Map {
         key: Box<TypeSyntax>,
         value: Box<TypeSyntax>,
@@ -82,6 +86,7 @@ impl TypeSyntax {
             | Self::Atom { span, .. }
             | Self::List { span, .. }
             | Self::Array { span, .. }
+            | Self::Slice { span, .. }
             | Self::Map { span, .. }
             | Self::Tuple { span, .. }
             | Self::Function { span, .. } => *span,
@@ -972,6 +977,28 @@ fn parse_type(
         "named_type" => {
             let path = node.children.first()?;
             let written = path_name(path);
+            if written == "Slice" {
+                if node.children.len() != 2 {
+                    diagnostics.push(Diagnostic::error(
+                        "E2007",
+                        node.span,
+                        format!(
+                            "type `Slice` expects 1 argument but received {}",
+                            node.children.len() - 1
+                        ),
+                    ));
+                    return None;
+                }
+                return Some(TypeSyntax::Slice {
+                    item: Box::new(parse_type(
+                        &node.children[1],
+                        aliases,
+                        module_name,
+                        diagnostics,
+                    )?),
+                    span: node.span,
+                });
+            }
             if written == "Map" {
                 if node.children.len() != 3 {
                     diagnostics.push(Diagnostic::error(
@@ -1067,7 +1094,9 @@ fn collect_type_parameter(ty: &TypeSyntax, parameters: &mut Vec<String>) {
                 collect_type_parameter(member, parameters);
             }
         }
-        TypeSyntax::List { item, .. } => collect_type_parameter(item, parameters),
+        TypeSyntax::List { item, .. } | TypeSyntax::Slice { item, .. } => {
+            collect_type_parameter(item, parameters)
+        }
         TypeSyntax::Tuple { elements, .. } => {
             for element in elements {
                 collect_type_parameter(element, parameters);
@@ -1161,7 +1190,9 @@ fn collect_alias_references(ty: &TypeSyntax, output: &mut Vec<DeclId>) {
                 collect_alias_references(member, output);
             }
         }
-        TypeSyntax::List { item, .. } => collect_alias_references(item, output),
+        TypeSyntax::List { item, .. } | TypeSyntax::Slice { item, .. } => {
+            collect_alias_references(item, output)
+        }
         TypeSyntax::Tuple { elements, .. } => {
             for element in elements {
                 collect_alias_references(element, output);
@@ -1248,7 +1279,7 @@ fn collect_inline_structs(
                 collect_inline_structs(element, structs, aliases, output);
             }
         }
-        TypeSyntax::List { .. } | TypeSyntax::Function { .. } => {}
+        TypeSyntax::List { .. } | TypeSyntax::Slice { .. } | TypeSyntax::Function { .. } => {}
         _ => {}
     }
 }
@@ -1297,6 +1328,7 @@ fn type_name(ty: &TypeSyntax) -> &str {
         TypeSyntax::Atom { name, .. } => name,
         TypeSyntax::List { .. } => "list",
         TypeSyntax::Array { .. } => "array",
+        TypeSyntax::Slice { .. } => "slice",
         TypeSyntax::Map { .. } => "map",
         TypeSyntax::Tuple { .. } => "tuple",
         TypeSyntax::Function { .. } => "function",

@@ -24,6 +24,7 @@ pub struct SlotId(pub u32);
 pub enum CoreFailureCategory {
     IntegerOverflow,
     DivisionByZero,
+    IndexOutOfBounds,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,9 +119,80 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    ListReverse {
+        result: ValueId,
+        list: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
     Array {
         result: ValueId,
         elements: Vec<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
+    ArrayIndex {
+        result: ValueId,
+        array: ValueId,
+        index: ValueId,
+        length: Option<u64>,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    SliceFromArray {
+        result: ValueId,
+        array: ValueId,
+        length: u64,
+        ty: TypeId,
+        origin: Span,
+    },
+    SliceSubslice {
+        result: ValueId,
+        slice: ValueId,
+        start: ValueId,
+        length: ValueId,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    SliceCopy {
+        result: ValueId,
+        slice: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringBytes {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BytesFromList {
+        result: ValueId,
+        list: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BytesToList {
+        result: ValueId,
+        bytes: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BytesSlice {
+        result: ValueId,
+        bytes: ValueId,
+        start: ValueId,
+        length: ValueId,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    CollectionLength {
+        result: ValueId,
+        value: ValueId,
+        known_length: Option<u64>,
         ty: TypeId,
         origin: Span,
     },
@@ -130,9 +202,46 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    MapPut {
+        result: ValueId,
+        map: ValueId,
+        key: ValueId,
+        value: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    MapRemove {
+        result: ValueId,
+        map: ValueId,
+        key: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    MapFetch {
+        result: ValueId,
+        map: ValueId,
+        key: ValueId,
+        map_ty: TypeId,
+        ty: TypeId,
+        origin: Span,
+    },
+    MapToList {
+        result: ValueId,
+        map: ValueId,
+        map_ty: TypeId,
+        ty: TypeId,
+        origin: Span,
+    },
     Tuple {
         result: ValueId,
         elements: Vec<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
+    Struct {
+        result: ValueId,
+        declaration: DeclId,
+        fields: Vec<(usize, ValueId)>,
         ty: TypeId,
         origin: Span,
     },
@@ -462,6 +571,60 @@ impl<'a> Lowerer<'a> {
                         origin: *span,
                     });
                 }
+                TypedItem::StructFieldAssign {
+                    symbol,
+                    declaration,
+                    field,
+                    field_types,
+                    value,
+                    span,
+                } => {
+                    let Some(updated) = self.lower_expr(value) else {
+                        break;
+                    };
+                    let Binding::Slot(slot) = self.bindings[symbol] else {
+                        panic!("verified mutable struct binding")
+                    };
+                    let structure_ty = self.slots[slot.0 as usize].ty;
+                    let old = self.value();
+                    self.operations.push(Operation::Load {
+                        result: old,
+                        slot,
+                        ty: structure_ty,
+                        origin: *span,
+                    });
+                    let mut fields = Vec::with_capacity(field_types.len());
+                    for (index, ty) in field_types.iter().enumerate() {
+                        let field_value = if index == *field {
+                            updated
+                        } else {
+                            let projected = self.value();
+                            self.operations.push(Operation::StructProject {
+                                result: projected,
+                                structure: old,
+                                declaration: *declaration,
+                                index,
+                                ty: *ty,
+                                origin: *span,
+                            });
+                            projected
+                        };
+                        fields.push((index, field_value));
+                    }
+                    let reconstructed = self.value();
+                    self.operations.push(Operation::Struct {
+                        result: reconstructed,
+                        declaration: *declaration,
+                        fields,
+                        ty: structure_ty,
+                        origin: *span,
+                    });
+                    self.operations.push(Operation::Store {
+                        slot,
+                        value: reconstructed,
+                        origin: *span,
+                    });
+                }
                 TypedItem::Expr(expression) => {
                     let Some(value) = self.lower_expr(expression) else {
                         result = None;
@@ -604,6 +767,17 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::ListReverse(value) => {
+                let list = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::ListReverse {
+                    result,
+                    list,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::Tuple(elements) => {
                 let elements = elements
                     .iter()
@@ -613,6 +787,42 @@ impl<'a> Lowerer<'a> {
                 self.operations.push(Operation::Tuple {
                     result,
                     elements,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::Struct {
+                declaration,
+                fields: source_fields,
+                ..
+            } => {
+                let mut fields = Vec::with_capacity(source_fields.len());
+                for (index, value) in source_fields {
+                    fields.push((*index, self.lower_expr(value)?));
+                }
+                let result = self.value();
+                self.operations.push(Operation::Struct {
+                    result,
+                    declaration: *declaration,
+                    fields,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StructProject {
+                value,
+                declaration,
+                field,
+            } => {
+                let structure = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StructProject {
+                    result,
+                    structure,
+                    declaration: *declaration,
+                    index: *field,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -632,6 +842,142 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::Index {
+                value,
+                index,
+                length,
+            } => {
+                let array = self.lower_expr(value)?;
+                let index = self.lower_expr(index)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::IndexOutOfBounds, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::ArrayIndex {
+                    result,
+                    array,
+                    index,
+                    length: *length,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::SliceFromArray { value, length } => {
+                let array = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::SliceFromArray {
+                    result,
+                    array,
+                    length: *length,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::SliceSubslice {
+                value,
+                start,
+                length,
+            } => {
+                let slice = self.lower_expr(value)?;
+                let start = self.lower_expr(start)?;
+                let length = self.lower_expr(length)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::IndexOutOfBounds, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::SliceSubslice {
+                    result,
+                    slice,
+                    start,
+                    length,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::SliceCopy(value) => {
+                let slice = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::SliceCopy {
+                    result,
+                    slice,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringBytes(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringBytes {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BytesFromList(value) => {
+                let list = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BytesFromList {
+                    result,
+                    list,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BytesToList(value) => {
+                let bytes = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BytesToList {
+                    result,
+                    bytes,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BytesSlice {
+                value,
+                start,
+                length,
+            } => {
+                let bytes = self.lower_expr(value)?;
+                let start = self.lower_expr(start)?;
+                let length = self.lower_expr(length)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::IndexOutOfBounds, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::BytesSlice {
+                    result,
+                    bytes,
+                    start,
+                    length,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::CollectionLength {
+                value,
+                known_length,
+            } => {
+                let source = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::CollectionLength {
+                    result,
+                    value: source,
+                    known_length: *known_length,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::Map(source_entries) => {
                 let mut entries = Vec::new();
                 for (key, value) in source_entries {
@@ -643,6 +989,62 @@ impl<'a> Lowerer<'a> {
                 self.operations.push(Operation::Map {
                     result,
                     entries,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::MapPut { map, key, value } => {
+                let map = self.lower_expr(map)?;
+                let key = self.lower_expr(key)?;
+                let value = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::MapPut {
+                    result,
+                    map,
+                    key,
+                    value,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::MapRemove { map, key } => {
+                let map = self.lower_expr(map)?;
+                let key = self.lower_expr(key)?;
+                let result = self.value();
+                self.operations.push(Operation::MapRemove {
+                    result,
+                    map,
+                    key,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::MapFetch { map, key } => {
+                let map_ty = map.ty;
+                let map = self.lower_expr(map)?;
+                let key = self.lower_expr(key)?;
+                let result = self.value();
+                self.operations.push(Operation::MapFetch {
+                    result,
+                    map,
+                    key,
+                    map_ty,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::MapToList(map) => {
+                let map_ty = map.ty;
+                let map = self.lower_expr(map)?;
+                let result = self.value();
+                self.operations.push(Operation::MapToList {
+                    result,
+                    map,
+                    map_ty,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -867,6 +1269,58 @@ impl<'a> Lowerer<'a> {
                         origin: *span,
                     });
                 }
+                TypedItem::StructFieldAssign {
+                    symbol,
+                    declaration,
+                    field,
+                    field_types,
+                    value,
+                    span,
+                } => {
+                    let updated = self.lower_expr(value)?;
+                    let Binding::Slot(slot) = self.bindings[symbol] else {
+                        panic!("verified mutable struct binding")
+                    };
+                    let structure_ty = self.slots[slot.0 as usize].ty;
+                    let old = self.value();
+                    self.operations.push(Operation::Load {
+                        result: old,
+                        slot,
+                        ty: structure_ty,
+                        origin: *span,
+                    });
+                    let mut fields = Vec::with_capacity(field_types.len());
+                    for (index, ty) in field_types.iter().enumerate() {
+                        let field_value = if index == *field {
+                            updated
+                        } else {
+                            let projected = self.value();
+                            self.operations.push(Operation::StructProject {
+                                result: projected,
+                                structure: old,
+                                declaration: *declaration,
+                                index,
+                                ty: *ty,
+                                origin: *span,
+                            });
+                            projected
+                        };
+                        fields.push((index, field_value));
+                    }
+                    let reconstructed = self.value();
+                    self.operations.push(Operation::Struct {
+                        result: reconstructed,
+                        declaration: *declaration,
+                        fields,
+                        ty: structure_ty,
+                        origin: *span,
+                    });
+                    self.operations.push(Operation::Store {
+                        slot,
+                        value: reconstructed,
+                        origin: *span,
+                    });
+                }
                 TypedItem::Expr(value) => result = Some(self.lower_expr(value)?),
                 TypedItem::Return(expression) => {
                     let value = self.lower_expr(expression)?;
@@ -959,6 +1413,17 @@ impl<'a> Lowerer<'a> {
                 (category, block)
             })
             .collect()
+    }
+
+    fn failure_target(&mut self, category: CoreFailureCategory, origin: Span) -> BlockId {
+        let block = self.new_block();
+        self.blocks.push(Block {
+            id: block,
+            parameters: Vec::new(),
+            operations: Vec::new(),
+            terminator: Terminator::Failure { category, origin },
+        });
+        block
     }
 
     fn read_binding(&mut self, symbol: SymbolId, ty: TypeId, origin: Span) -> Option<ValueId> {
@@ -1531,13 +1996,29 @@ pub enum CollectionEffect {
     MayCollect,
 }
 
-/// Every EL call is a possible collection point. A non-empty list construction
-/// allocates one or more scanned nodes. Private runtime operations carry their
-/// explicit effects when they enter the representation.
+/// Every EL call is a possible collection point. Non-empty list and map
+/// construction allocate one or more scanned nodes. Private runtime operations
+/// carry their explicit effects when they enter the representation.
 #[must_use]
 pub const fn operation_collection_effect(operation: &Operation) -> CollectionEffect {
     if matches!(operation, Operation::Call { .. })
         || matches!(operation, Operation::List { elements, .. } if !elements.is_empty())
+        || matches!(operation, Operation::Map { entries, .. } if !entries.is_empty())
+        || matches!(
+            operation,
+            Operation::MapPut { .. } | Operation::MapRemove { .. }
+        )
+        || matches!(
+            operation,
+            Operation::ListReverse { .. }
+                | Operation::MapToList { .. }
+                | Operation::BytesFromList { .. }
+                | Operation::BytesToList { .. }
+        )
+        || matches!(
+            operation,
+            Operation::SliceFromArray { .. } | Operation::SliceCopy { .. }
+        )
     {
         CollectionEffect::MayCollect
     } else {
@@ -1735,12 +2216,70 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
             live.values.extend(elements);
             live.values.extend(tail);
         }
+        Operation::ListReverse { list, .. } => {
+            live.values.insert(*list);
+        }
         Operation::Array { elements, .. } | Operation::Tuple { elements, .. } => {
             live.values.extend(elements);
+        }
+        Operation::ArrayIndex { array, index, .. } => {
+            live.values.insert(*array);
+            live.values.insert(*index);
+        }
+        Operation::SliceFromArray { array, .. } => {
+            live.values.insert(*array);
+        }
+        Operation::SliceSubslice {
+            slice,
+            start,
+            length,
+            ..
+        } => {
+            live.values.extend([*slice, *start, *length]);
+        }
+        Operation::SliceCopy { slice, .. } => {
+            live.values.insert(*slice);
+        }
+        Operation::StringBytes { string, .. } => {
+            live.values.insert(*string);
+        }
+        Operation::BytesFromList { list, .. } => {
+            live.values.insert(*list);
+        }
+        Operation::BytesToList { bytes, .. } => {
+            live.values.insert(*bytes);
+        }
+        Operation::BytesSlice {
+            bytes,
+            start,
+            length,
+            ..
+        } => {
+            live.values.extend([*bytes, *start, *length]);
+        }
+        Operation::CollectionLength { value, .. } => {
+            live.values.insert(*value);
+        }
+        Operation::Struct { fields, .. } => {
+            live.values.extend(fields.iter().map(|(_, value)| value));
         }
         Operation::Map { entries, .. } => {
             live.values
                 .extend(entries.iter().flat_map(|(key, value)| [*key, *value]));
+        }
+        Operation::MapPut {
+            map, key, value, ..
+        } => {
+            live.values.extend([*map, *key, *value]);
+        }
+        Operation::MapRemove { map, key, .. } => {
+            live.values.extend([*map, *key]);
+        }
+        Operation::MapFetch { map, key, .. } => {
+            live.values.extend([*map, *key]);
+        }
+        Operation::MapToList { map, .. } => {
+            live.values.insert(*map);
         }
         Operation::TupleProject { tuple, .. } => {
             live.values.insert(*tuple);
@@ -1776,9 +2315,24 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
     match operation {
         Operation::Constant { result, .. }
         | Operation::List { result, .. }
+        | Operation::ListReverse { result, .. }
         | Operation::Array { result, .. }
+        | Operation::ArrayIndex { result, .. }
+        | Operation::SliceFromArray { result, .. }
+        | Operation::SliceSubslice { result, .. }
+        | Operation::SliceCopy { result, .. }
+        | Operation::StringBytes { result, .. }
+        | Operation::BytesFromList { result, .. }
+        | Operation::BytesToList { result, .. }
+        | Operation::BytesSlice { result, .. }
+        | Operation::CollectionLength { result, .. }
         | Operation::Map { result, .. }
+        | Operation::MapPut { result, .. }
+        | Operation::MapRemove { result, .. }
+        | Operation::MapFetch { result, .. }
+        | Operation::MapToList { result, .. }
         | Operation::Tuple { result, .. }
+        | Operation::Struct { result, .. }
         | Operation::TupleProject { result, .. }
         | Operation::StructProject { result, .. }
         | Operation::ListHead { result, .. }
@@ -1810,11 +2364,16 @@ fn classify_managed_type(
         return Some(ManagedValueClass::ContainsBaseReferences);
     }
     let class = match value {
-        Type::I32 | Type::I64 | Type::Bool | Type::Unit | Type::Atom(_) | Type::Function { .. } => {
-            ManagedValueClass::Unmanaged
-        }
+        Type::I32
+        | Type::I64
+        | Type::Usize
+        | Type::U8
+        | Type::Bool
+        | Type::Unit
+        | Type::Atom(_)
+        | Type::Function { .. } => ManagedValueClass::Unmanaged,
         // String is a view-like pointer/length value and must retain its base.
-        Type::String => ManagedValueClass::ContainsBaseReferences,
+        Type::String | Type::Bytes | Type::Slice(_) => ManagedValueClass::ContainsBaseReferences,
         Type::List(_) | Type::Map { .. } => ManagedValueClass::BaseReference,
         Type::Array { item, .. } => aggregate_managed_class(module, [*item], visiting)?,
         Type::Tuple(elements) | Type::Union(elements) => {
@@ -1868,15 +2427,19 @@ pub enum MonomorphizationError {
 enum NormalizedType {
     I32,
     I64,
+    Usize,
     Bool,
     Unit,
     String,
+    Bytes,
+    U8,
     Atom(String),
     List(Box<Self>),
     Array {
         item: Box<Self>,
         length: u64,
     },
+    Slice(Box<Self>),
     Map {
         key: Box<Self>,
         value: Box<Self>,
@@ -2187,9 +2750,12 @@ impl<'a> Monomorphizer<'a> {
         {
             Type::I32 => NormalizedType::I32,
             Type::I64 => NormalizedType::I64,
+            Type::Usize => NormalizedType::Usize,
             Type::Bool => NormalizedType::Bool,
             Type::Unit => NormalizedType::Unit,
             Type::String => NormalizedType::String,
+            Type::Bytes => NormalizedType::Bytes,
+            Type::U8 => NormalizedType::U8,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
                 NormalizedType::List(Box::new(self.normalize(*item, substitution)?))
@@ -2198,6 +2764,9 @@ impl<'a> Monomorphizer<'a> {
                 item: Box::new(self.normalize(*item, substitution)?),
                 length: *length,
             },
+            Type::Slice(item) => {
+                NormalizedType::Slice(Box::new(self.normalize(*item, substitution)?))
+            }
             Type::Map { key, value } => NormalizedType::Map {
                 key: Box::new(self.normalize(*key, substitution)?),
                 value: Box::new(self.normalize(*value, substitution)?),
@@ -2321,9 +2890,22 @@ impl<'a> Monomorphizer<'a> {
         match operation {
             Operation::Constant { ty, .. }
             | Operation::List { ty, .. }
+            | Operation::ListReverse { ty, .. }
             | Operation::Array { ty, .. }
+            | Operation::ArrayIndex { ty, .. }
+            | Operation::SliceFromArray { ty, .. }
+            | Operation::SliceSubslice { ty, .. }
+            | Operation::SliceCopy { ty, .. }
+            | Operation::StringBytes { ty, .. }
+            | Operation::BytesFromList { ty, .. }
+            | Operation::BytesToList { ty, .. }
+            | Operation::BytesSlice { ty, .. }
+            | Operation::CollectionLength { ty, .. }
             | Operation::Map { ty, .. }
+            | Operation::MapPut { ty, .. }
+            | Operation::MapRemove { ty, .. }
             | Operation::Tuple { ty, .. }
+            | Operation::Struct { ty, .. }
             | Operation::TupleProject { ty, .. }
             | Operation::StructProject { ty, .. }
             | Operation::ListHead { ty, .. }
@@ -2334,6 +2916,14 @@ impl<'a> Monomorphizer<'a> {
             }
             Operation::Compare { operand_ty, .. } => {
                 *operand_ty = self.materialize_type(*operand_ty, substitution)?;
+            }
+            Operation::MapFetch { map_ty, ty, .. } => {
+                *map_ty = self.materialize_type(*map_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::MapToList { map_ty, ty, .. } => {
+                *map_ty = self.materialize_type(*map_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
             }
             Operation::Call {
                 function,
@@ -2382,15 +2972,19 @@ impl<'a> Monomorphizer<'a> {
         let materialized = match ty {
             NormalizedType::I32 => return TypeId(0),
             NormalizedType::I64 => return TypeId(1),
+            NormalizedType::Usize => Type::Usize,
             NormalizedType::Bool => return TypeId(2),
             NormalizedType::Unit => return TypeId(3),
             NormalizedType::String => Type::String,
+            NormalizedType::Bytes => Type::Bytes,
+            NormalizedType::U8 => Type::U8,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
             NormalizedType::Array { item, length } => Type::Array {
                 item: self.intern_normalized(item),
                 length: *length,
             },
+            NormalizedType::Slice(item) => Type::Slice(self.intern_normalized(item)),
             NormalizedType::Map { key, value } => Type::Map {
                 key: self.intern_normalized(key),
                 value: self.intern_normalized(value),
@@ -2474,7 +3068,9 @@ impl<'a> Monomorphizer<'a> {
 
 fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecializationKey>) {
     match ty {
-        NormalizedType::List(item) | NormalizedType::Array { item, .. } => {
+        NormalizedType::List(item)
+        | NormalizedType::Array { item, .. }
+        | NormalizedType::Slice(item) => {
             collect_layout_keys(item, layouts);
         }
         NormalizedType::Map { key, value } => {
@@ -2506,9 +3102,12 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         }
         NormalizedType::I32
         | NormalizedType::I64
+        | NormalizedType::Usize
         | NormalizedType::Bool
         | NormalizedType::Unit
         | NormalizedType::String
+        | NormalizedType::Bytes
+        | NormalizedType::U8
         | NormalizedType::Atom(_) => {}
     }
 }
@@ -2517,9 +3116,22 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
     match operation {
         Operation::Constant { ty, .. }
         | Operation::List { ty, .. }
+        | Operation::ListReverse { ty, .. }
         | Operation::Array { ty, .. }
+        | Operation::ArrayIndex { ty, .. }
+        | Operation::SliceFromArray { ty, .. }
+        | Operation::SliceSubslice { ty, .. }
+        | Operation::SliceCopy { ty, .. }
+        | Operation::StringBytes { ty, .. }
+        | Operation::BytesFromList { ty, .. }
+        | Operation::BytesToList { ty, .. }
+        | Operation::BytesSlice { ty, .. }
+        | Operation::CollectionLength { ty, .. }
         | Operation::Map { ty, .. }
+        | Operation::MapPut { ty, .. }
+        | Operation::MapRemove { ty, .. }
         | Operation::Tuple { ty, .. }
+        | Operation::Struct { ty, .. }
         | Operation::TupleProject { ty, .. }
         | Operation::StructProject { ty, .. }
         | Operation::ListHead { ty, .. }
@@ -2528,6 +3140,14 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::Call { ty, .. }
         | Operation::Load { ty, .. } => output.push(*ty),
         Operation::Compare { operand_ty, .. } => output.push(*operand_ty),
+        Operation::MapFetch { map_ty, ty, .. } => {
+            output.push(*map_ty);
+            output.push(*ty);
+        }
+        Operation::MapToList { map_ty, ty, .. } => {
+            output.push(*map_ty);
+            output.push(*ty);
+        }
         Operation::UnionInject { member, ty, .. } => {
             output.push(*member);
             output.push(*ty);
@@ -2811,9 +3431,24 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                 .filter_map(|operation| match operation {
                     Operation::Constant { result, ty, .. }
                     | Operation::List { result, ty, .. }
+                    | Operation::ListReverse { result, ty, .. }
                     | Operation::Array { result, ty, .. }
+                    | Operation::ArrayIndex { result, ty, .. }
+                    | Operation::SliceFromArray { result, ty, .. }
+                    | Operation::SliceSubslice { result, ty, .. }
+                    | Operation::SliceCopy { result, ty, .. }
+                    | Operation::StringBytes { result, ty, .. }
+                    | Operation::BytesFromList { result, ty, .. }
+                    | Operation::BytesToList { result, ty, .. }
+                    | Operation::BytesSlice { result, ty, .. }
+                    | Operation::CollectionLength { result, ty, .. }
                     | Operation::Map { result, ty, .. }
+                    | Operation::MapPut { result, ty, .. }
+                    | Operation::MapRemove { result, ty, .. }
+                    | Operation::MapFetch { result, ty, .. }
+                    | Operation::MapToList { result, ty, .. }
                     | Operation::Tuple { result, ty, .. }
+                    | Operation::Struct { result, ty, .. }
                     | Operation::TupleProject { result, ty, .. }
                     | Operation::StructProject { result, ty, .. }
                     | Operation::ListHead { result, ty, .. }
@@ -2966,6 +3601,13 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                     predecessors.extend(failures.iter().map(|(_, target)| *target));
                     failure_predecessors.extend(failures.iter().map(|(_, target)| *target));
                 }
+                if let Operation::ArrayIndex { failure, .. }
+                | Operation::SliceSubslice { failure, .. }
+                | Operation::BytesSlice { failure, .. } = operation
+                {
+                    predecessors.insert(*failure);
+                    failure_predecessors.insert(*failure);
+                }
             }
             match &block.terminator {
                 Terminator::Branch { target, .. } => {
@@ -3063,6 +3705,33 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                         }
                     }
                 }
+                if let Operation::ArrayIndex {
+                    failure, origin, ..
+                }
+                | Operation::SliceSubslice {
+                    failure, origin, ..
+                }
+                | Operation::BytesSlice {
+                    failure, origin, ..
+                } = operation
+                {
+                    match blocks.get(failure) {
+                        Some(target_block)
+                            if target_block.parameters.is_empty()
+                                && target_block.operations.is_empty()
+                                && matches!(
+                                    target_block.terminator,
+                                    Terminator::Failure {
+                                        category: CoreFailureCategory::IndexOutOfBounds,
+                                        origin: found_origin,
+                                    } if found_origin == *origin
+                                ) => {}
+                        _ => errors.push(format!(
+                            "bounds-checked operation in {:?} has an invalid failure target",
+                            block.id
+                        )),
+                    }
+                }
             }
             let mut propagate = |target: BlockId| {
                 initialized_by_block
@@ -3128,7 +3797,7 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                         }
                         let compatible = match (case, module.types.get(subject_ty.0 as usize)) {
                             (SwitchValue::Boolean(_), Some(Type::Bool))
-                            | (SwitchValue::Integer(_), Some(Type::I32 | Type::I64))
+                            | (SwitchValue::Integer(_), Some(Type::I32 | Type::I64 | Type::U8))
                             | (
                                 SwitchValue::ListEmpty | SwitchValue::ListCons,
                                 Some(Type::List(_)),
@@ -3263,7 +3932,7 @@ fn verify_operation(
             ..
         } => {
             let valid = match (constant, types.get(ty.0 as usize)) {
-                (Constant::Integer(_), Some(Type::I32 | Type::I64))
+                (Constant::Integer(_), Some(Type::I32 | Type::I64 | Type::Usize | Type::U8))
                 | (Constant::Boolean(_), Some(Type::Bool))
                 | (Constant::Unit, Some(Type::Unit))
                 | (Constant::String(_), Some(Type::String)) => true,
@@ -3297,6 +3966,16 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::ListReverse {
+            result, list, ty, ..
+        } => {
+            if values.get(list) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::List(_)))
+            {
+                errors.push(format!("list reverse {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Tuple {
             result,
             elements,
@@ -3315,6 +3994,35 @@ fn verify_operation(
                     .any(|(element, ty)| values.get(element) != Some(ty))
             {
                 errors.push(format!("tuple {result:?} has incorrectly typed elements"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::Struct {
+            result,
+            declaration,
+            fields,
+            ty,
+            ..
+        } => {
+            let field_count = structs
+                .get(declaration)
+                .map(|structure| structure.fields.len());
+            if !matches!(types.get(ty.0 as usize), Some(Type::Struct { declaration: found, .. }) if found == declaration)
+                || field_count.is_none()
+            {
+                errors.push(format!("struct {result:?} has an invalid nominal type"));
+            }
+            let mut seen = BTreeSet::new();
+            for (index, value) in fields {
+                if field_count.is_none_or(|count| *index >= count)
+                    || !seen.insert(*index)
+                    || !values.contains_key(value)
+                {
+                    errors.push(format!("struct {result:?} has an invalid field"));
+                }
+            }
+            if field_count.is_some_and(|count| seen.len() != count) {
+                errors.push(format!("struct {result:?} does not initialize every field"));
             }
             define(*result, *ty, values, errors);
         }
@@ -3391,6 +4099,175 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::ArrayIndex {
+            result,
+            array,
+            index,
+            length,
+            ty,
+            ..
+        } => {
+            let source = values
+                .get(array)
+                .and_then(|source| types.get(source.0 as usize));
+            let valid = match (source, length) {
+                (
+                    Some(Type::Array {
+                        item,
+                        length: source_length,
+                    }),
+                    Some(length),
+                ) => item == ty && source_length == length,
+                (Some(Type::Slice(item)), None) => item == ty,
+                (Some(Type::Bytes), None) => matches!(types.get(ty.0 as usize), Some(Type::U8)),
+                _ => false,
+            };
+            if !valid {
+                errors.push(format!("index {result:?} has an invalid source or length"));
+            }
+            if !matches!(
+                values.get(index).and_then(|ty| types.get(ty.0 as usize)),
+                Some(Type::Usize)
+            ) {
+                errors.push(format!("array index {result:?} has a non-usize index"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::SliceFromArray {
+            result,
+            array,
+            length,
+            ty,
+            ..
+        } => {
+            let valid = matches!(
+                (values.get(array).and_then(|source| types.get(source.0 as usize)), types.get(ty.0 as usize)),
+                (Some(Type::Array { item: source, length: source_length }), Some(Type::Slice(item)))
+                    if source == item && source_length == length
+            );
+            if !valid {
+                errors.push(format!("slice construction {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::SliceSubslice {
+            result,
+            slice,
+            start,
+            length,
+            ty,
+            ..
+        } => {
+            if values.get(slice) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Slice(_)))
+                || !matches!(
+                    values.get(start).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+                || !matches!(
+                    values.get(length).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+            {
+                errors.push(format!("subslice {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::SliceCopy {
+            result, slice, ty, ..
+        } => {
+            if values.get(slice) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Slice(_)))
+            {
+                errors.push(format!("slice copy {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringBytes {
+            result, string, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(string)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::String)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push(format!("string bytes {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BytesFromList {
+            result, list, ty, ..
+        } => {
+            if !matches!(
+                values.get(list).and_then(|source| types.get(source.0 as usize)),
+                Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::U8))
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push(format!("bytes from-list {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BytesToList {
+            result, bytes, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(bytes)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Bytes)
+            ) || !matches!(
+                types.get(ty.0 as usize),
+                Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::U8))
+            ) {
+                errors.push(format!("bytes to-list {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BytesSlice {
+            result,
+            bytes,
+            start,
+            length,
+            ty,
+            ..
+        } => {
+            if values.get(bytes) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Bytes))
+                || !matches!(
+                    values.get(start).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+                || !matches!(
+                    values.get(length).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+            {
+                errors.push(format!("bytes slice {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::CollectionLength {
+            result,
+            value,
+            known_length,
+            ty,
+            ..
+        } => {
+            let source = values.get(value).and_then(|ty| types.get(ty.0 as usize));
+            let valid_source = match (source, known_length) {
+                (Some(Type::Array { length, .. }), Some(known)) => length == known,
+                (Some(Type::String | Type::Bytes | Type::Slice(_) | Type::Map { .. }), None) => {
+                    true
+                }
+                _ => false,
+            };
+            if !valid_source || !matches!(types.get(ty.0 as usize), Some(Type::Usize)) {
+                errors.push(format!("collection length {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Map {
             result,
             entries,
@@ -3406,6 +4283,99 @@ fn verify_operation(
                 values.get(entry_key) != Some(key) || values.get(entry_value) != Some(value)
             }) {
                 errors.push(format!("map {result:?} has incorrectly typed entries"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::MapPut {
+            result,
+            map,
+            key,
+            value,
+            ty,
+            ..
+        } => {
+            let valid = matches!(
+                types.get(ty.0 as usize),
+                Some(Type::Map {
+                    key: expected_key,
+                    value: expected_value,
+                }) if values.get(map) == Some(ty)
+                    && values.get(key) == Some(expected_key)
+                    && values.get(value) == Some(expected_value)
+            );
+            if !valid {
+                errors.push(format!("map put {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::MapRemove {
+            result,
+            map,
+            key,
+            ty,
+            ..
+        } => {
+            let valid = matches!(
+                types.get(ty.0 as usize),
+                Some(Type::Map { key: expected_key, .. })
+                    if values.get(map) == Some(ty) && values.get(key) == Some(expected_key)
+            );
+            if !valid {
+                errors.push(format!("map remove {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::MapFetch {
+            result,
+            map,
+            key,
+            map_ty,
+            ty,
+            ..
+        } => {
+            let map_value = match types.get(map_ty.0 as usize) {
+                Some(Type::Map {
+                    key: expected_key,
+                    value,
+                }) if values.get(map) == Some(map_ty) && values.get(key) == Some(expected_key) => {
+                    Some(*value)
+                }
+                _ => None,
+            };
+            let valid_map = map_value.is_some();
+            let valid_result = map_value.is_some_and(|value| {
+                matches!(types.get(ty.0 as usize), Some(Type::Union(members)) if members.len() == 2
+                    && members.iter().any(|member| {
+                        matches!(types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none")
+                    })
+                    && members.iter().any(|member| {
+                        matches!(types.get(member.0 as usize), Some(Type::Tuple(items)) if items.len() == 2
+                            && items[1] == value
+                            && matches!(types.get(items[0].0 as usize), Some(Type::Atom(name)) if name == "some"))
+                    }))
+            });
+            if !valid_map || !valid_result {
+                errors.push(format!("map fetch {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::MapToList {
+            result,
+            map,
+            map_ty,
+            ty,
+            ..
+        } => {
+            let valid = match (types.get(map_ty.0 as usize), types.get(ty.0 as usize)) {
+                (Some(Type::Map { key, value }), Some(Type::List(pair)))
+                    if values.get(map) == Some(map_ty) =>
+                {
+                    matches!(types.get(pair.0 as usize), Some(Type::Tuple(items)) if items.as_slice() == [*key, *value])
+                }
+                _ => false,
+            };
+            if !valid {
+                errors.push(format!("map to-list {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -3438,9 +4408,8 @@ fn verify_operation(
             );
             let supported = matches!(
                 types.get(operand_ty.0 as usize),
-                Some(Type::I32 | Type::I64)
-            ) || (!ordered
-                && matches!(types.get(operand_ty.0 as usize), Some(Type::Bool)));
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
+            ) || (!ordered && standard_eq_type(types, *operand_ty));
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
                 || !supported
@@ -3530,6 +4499,41 @@ fn verify_operation(
             (None, _) => errors.push(format!("store references unknown slot {slot:?}")),
             (_, None) => errors.push(format!("store uses undefined value {value:?}")),
         },
+    }
+}
+
+fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(
+            Type::I32
+            | Type::I64
+            | Type::Usize
+            | Type::Bool
+            | Type::Unit
+            | Type::String
+            | Type::Bytes
+            | Type::U8
+            | Type::Atom(_),
+        ) => true,
+        Some(Type::List(item) | Type::Slice(item)) => standard_eq_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_eq_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_eq_type(types, *item)),
+        Some(Type::Map { key, value }) => {
+            standard_hash_type(types, *key) && standard_eq_type(types, *value)
+        }
+        _ => false,
+    }
+}
+
+fn standard_hash_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(Type::Map { .. } | Type::Function { .. } | Type::Union(_) | Type::Struct { .. })
+        | Some(Type::Parameter { .. })
+        | None => false,
+        Some(Type::List(item) | Type::Slice(item)) => standard_hash_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_hash_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_hash_type(types, *item)),
+        Some(_) => true,
     }
 }
 
@@ -3660,6 +4664,26 @@ fn display_operation(operation: &Operation) -> String {
             tail.map_or_else(String::new, |tail| format!(" | v{}", tail.0)),
             ty.0
         ),
+        Operation::ListReverse {
+            result, list, ty, ..
+        } => format!("v{} = list_reverse v{}: t{}", result.0, list.0, ty.0),
+        Operation::Struct {
+            result,
+            declaration,
+            fields,
+            ty,
+            ..
+        } => format!(
+            "v{} = struct d{} {{{}}}: t{}",
+            result.0,
+            declaration.0,
+            fields
+                .iter()
+                .map(|(index, value)| format!("{index}: v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            ty.0
+        ),
         Operation::TupleProject {
             result,
             tuple,
@@ -3717,6 +4741,76 @@ fn display_operation(operation: &Operation) -> String {
                 .join(", "),
             ty.0
         ),
+        Operation::ArrayIndex {
+            result,
+            array,
+            index,
+            length,
+            failure,
+            ty,
+            ..
+        } => format!(
+            "v{} = index v{}[v{}] length {:?}: t{} [IndexOutOfBounds => b{}]",
+            result.0, array.0, index.0, length, ty.0, failure.0
+        ),
+        Operation::SliceFromArray {
+            result,
+            array,
+            length,
+            ty,
+            ..
+        } => format!(
+            "v{} = slice_from_array v{} length {}: t{}",
+            result.0, array.0, length, ty.0
+        ),
+        Operation::SliceSubslice {
+            result,
+            slice,
+            start,
+            length,
+            failure,
+            ty,
+            ..
+        } => format!(
+            "v{} = subslice v{} v{} v{}: t{} [IndexOutOfBounds => b{}]",
+            result.0, slice.0, start.0, length.0, ty.0, failure.0
+        ),
+        Operation::SliceCopy {
+            result, slice, ty, ..
+        } => {
+            format!("v{} = slice_copy v{}: t{}", result.0, slice.0, ty.0)
+        }
+        Operation::StringBytes {
+            result, string, ty, ..
+        } => format!("v{} = string_bytes v{}: t{}", result.0, string.0, ty.0),
+        Operation::BytesFromList {
+            result, list, ty, ..
+        } => format!("v{} = bytes_from_list v{}: t{}", result.0, list.0, ty.0),
+        Operation::BytesToList {
+            result, bytes, ty, ..
+        } => format!("v{} = bytes_to_list v{}: t{}", result.0, bytes.0, ty.0),
+        Operation::BytesSlice {
+            result,
+            bytes,
+            start,
+            length,
+            failure,
+            ty,
+            ..
+        } => format!(
+            "v{} = bytes_slice v{} v{} v{}: t{} [IndexOutOfBounds => b{}]",
+            result.0, bytes.0, start.0, length.0, ty.0, failure.0
+        ),
+        Operation::CollectionLength {
+            result,
+            value,
+            known_length,
+            ty,
+            ..
+        } => format!(
+            "v{} = collection_length v{} known {:?}: t{}",
+            result.0, value.0, known_length, ty.0
+        ),
         Operation::Map {
             result,
             entries,
@@ -3731,6 +4825,48 @@ fn display_operation(operation: &Operation) -> String {
                 .collect::<Vec<_>>()
                 .join(", "),
             ty.0
+        ),
+        Operation::MapPut {
+            result,
+            map,
+            key,
+            value,
+            ty,
+            ..
+        } => format!(
+            "v{} = map_put v{} v{} v{}: t{}",
+            result.0, map.0, key.0, value.0, ty.0
+        ),
+        Operation::MapRemove {
+            result,
+            map,
+            key,
+            ty,
+            ..
+        } => format!(
+            "v{} = map_remove v{} v{}: t{}",
+            result.0, map.0, key.0, ty.0
+        ),
+        Operation::MapFetch {
+            result,
+            map,
+            key,
+            map_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = map_fetch v{} v{}: t{} -> t{}",
+            result.0, map.0, key.0, map_ty.0, ty.0
+        ),
+        Operation::MapToList {
+            result,
+            map,
+            map_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = map_to_list v{}: t{} -> t{}",
+            result.0, map.0, map_ty.0, ty.0
         ),
         Operation::CheckedArithmetic {
             result,

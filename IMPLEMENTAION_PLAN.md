@@ -640,12 +640,12 @@ verified managed runtime.
 
 **Deliverable groups**
 
-1. [ ] **Structs:** nominal identity, all-fields construction, field projection,
+1. [x] **Structs:** nominal identity, all-fields construction, field projection,
    generic specialization, immutable value semantics, and direct mutable-root
    field update by reconstruction.
-2. [ ] **Sequential data:** lists, fixed arrays, slices, indexing, managed backing
+2. [x] **Sequential data:** lists, fixed arrays, slices, indexing, managed backing
    retention, O(1) subslicing, and explicit copying.
-3. [ ] **Maps:** immutable operations, `Eq`/`Hash` key requirements, seeded hashing,
+3. [x] **Maps:** immutable operations, `Eq`/`Hash` key requirements, seeded hashing,
    deterministic insertion order, duplicate replacement, and order-independent
    equality.
 4. [ ] **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
@@ -669,18 +669,128 @@ verified managed runtime.
 
 - [ ] Construction, inference, layout, access, and immutable-copy semantics for
   every data category.
-- [ ] Fixed-array length inference and rejection of symbolic/derived lengths.
-- [ ] Map insertion order across seeds and all update/remove/reinsert cases.
+- [x] Fixed-array length inference and rejection of symbolic/derived lengths.
+- [x] Map insertion order across seeds and all update/remove/reinsert cases.
 - [ ] Bounds and numeric failure categories in debug and release.
 - [ ] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
 - [ ] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
   length APIs.
 - [ ] GC stress for nested composite graphs, views, base retention, immutable
   sharing, and function values.
-- [ ] Compile-time rejection of `string[index]`.
+- [x] Compile-time rejection of `string[index]`.
 
 - [ ] **Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
   graphs under GC stress, and diagnose integer indexing on `string`.
+
+**Implementation progress (2026-07-28)**
+
+- [x] Completed the struct value slice end to end: nominal and generic all-fields
+  construction, direct field projection, source-order initializer evaluation,
+  deterministic Generic/Concrete Core struct operations, specialized LLVM layouts,
+  and direct mutable-root field update lowered to shallow reconstruction and slot
+  rebinding.
+- [x] Added accepted and rejected type-checker coverage for inferred and expected
+  generic applications, missing/duplicate/unknown fields, immutable update roots,
+  and Typed AST verification; added Core verifier and specialization coverage plus
+  LLVM and development/release native regressions proving immutable-copy semantics.
+- [x] Completed the fixed-array construction and read-indexing slice: literal lengths
+  remain part of the canonical type, concrete arrays have specialized LLVM layouts,
+  indices require target-width `usize`, and checked reads lower through a verified
+  `index_out_of_bounds` failure edge in development and release builds. Calls and
+  literals can feed an index expression without changing left-to-right evaluation.
+- [x] Added compile-time diagnostics for indexing `string`, lists, and other
+  unsupported categories, including the Milestone 6 exit-gate regression for
+  `string[index]`; added Typed AST, Generic/Concrete Core, LLVM, and native tests for
+  successful reads, invalid index types, and out-of-bounds category 5 behavior.
+- [x] Added the first managed-slice implementation end to end: canonical `Slice(a)` types,
+  `Slice.from_array`, O(1) bounds-checked `Slice.subslice`, explicit `Slice.copy`,
+  `Array.length`, `Slice.length`, and checked slice indexing. Concrete slices retain
+  the collector-visible allocation base separately from their derived data pointer
+  and length, while copies allocate independent compact backing storage.
+- [x] Added Typed AST and Core verifier coverage for slice source/item/bound types,
+  specialized managed-value classification, LLVM lowering tests for allocation,
+  derived views and copy, and development/release native GC-stress regressions that
+  retain nested list elements through shared views and independent copies. Subslice
+  and slice-index failures use the stable `index_out_of_bounds` failure edge.
+- [x] Completed the sequential-data deliverable with generic `List.reverse`,
+  including expected-type inference for empty lists, a dedicated verified Core
+  operation, deterministic O(n) LLVM loop lowering, and fresh immutable list-node
+  allocation without mutating or reusing the source spine.
+- [x] Rooted both the source list and partially constructed reversed prefix across
+  every allocation. Development/release collection-at-every-allocation tests reverse
+  lists containing managed list elements, apply subsequent allocation pressure, and
+  verify source order reversal and retained nested payloads.
+- [x] Added the first managed-map runtime slice without prematurely closing the map
+  deliverable: nonempty literals lower to collector-scanned key/value nodes,
+  partially built maps remain rooted across every allocation, empty maps use the
+  canonical null representation, primitive-key duplicates replace values in place
+  without changing their first position, and `Map.size` traverses the immutable
+  structure without allocating. Typed AST and Core verifiers accept only map inputs
+  and a `usize` result.
+- [x] Added frontend rejection for non-map `Map.size` inputs, Core allocation-effect
+  coverage, LLVM lowering validation, and development/release
+  collection-at-every-allocation native tests with managed list values, establishing
+  the representation and rooting foundation used by the immutable API slice below.
+- [x] Completed the primitive-key immutable map API slice: context-typed `Map.new`,
+  option-returning `Map.fetch`, reconstruction-based `Map.put`, `Map.remove`, and
+  `Map.size` now have explicit Typed AST and verified Core operations. Put replaces
+  in place or appends an absent key, remove preserves survivor order, and all
+  operations evaluate their inputs once from left to right without mutating the
+  source map.
+- [x] Added LLVM lowering that roots both the source and partially reconstructed map
+  across every allocation, plus development/release GC-stress tests covering empty
+  insertion, replacement, append, removal, absent removal, remove-and-reinsert,
+  source immutability, option lookup, cardinality, and nested managed values. Seeded
+  hashing, composite-key equality, observable iteration-order tests, and
+  order-independent map equality remained before the final map slice below.
+- [x] Closed the Milestone 6 map deliverable: map nodes now retain opaque hashes
+  derived from a process-local runtime seed while their separate linked spine remains
+  deterministic insertion order. Hash filtering never affects traversal order, and
+  primitive, tuple, list, fixed-array, slice, string, and bytes keys use structural
+  `Eq`/`Hash` behavior rather than pointer identity.
+- [x] Added structural map `==`/`!=` independent of insertion order, including nested
+  map values, and exposed the already-specified observable order through the map
+  specialization of `Enum.to_list`. Development/release native GC-stress regressions
+  cover literal duplicate replacement, stable replacement position, removal and
+  reinsertion at the tail, three forced hash seeds, every standard composite-key
+  category available in this milestone, and unequal values. The private runtime ABI
+  is now revision 2 for the seeded-hasher entry point and map-node layout.
+- [x] Added the first Milestone 6 text API slice with O(1) `String.byte_size`.
+  The type checker recognizes only a `string` input and a `usize` result, Typed AST
+  and Core verifiers enforce that contract, and LLVM reads the byte length already
+  carried by the immutable UTF-8 string representation without allocation.
+  Frontend/Core tests cover invalid input types and multibyte UTF-8, while native
+  development/release tests distinguish encoded byte length from scalar or
+  grapheme counts. The broader text/binary and Unicode groups remain open.
+- [x] Introduced the first immutable `bytes` representation and retained-view API:
+  `String.bytes` exposes a string's exact UTF-8 storage, `Bytes.byte_size` reads
+  its structural length in O(1), and bounds-checked `Bytes.slice` produces an
+  O(1) view with a collector-visible backing base, derived data pointer, and byte
+  length. Typed AST and Core verifiers enforce exact string/bytes/`usize` types;
+  Concrete Core classifies byte views as containing base references; and LLVM
+  preserves the base across nested views without allocation. Frontend/Core and
+  development/release native tests cover multibyte storage, nested slice lengths,
+  invalid argument types, and category 5 out-of-bounds behavior. Byte indexing,
+  `bits`, source bitstrings, and UTF-8 validation remain open.
+- [x] Added checked `bytes[index: usize] -> u8` access and the required narrow `u8`
+  foundation across canonical types, literal range checking, Typed AST/Core
+  verification, monomorphization, target layouts, and LLVM. Byte reads address the
+  visible view rather than its backing start, preserve category 5 bounds failures,
+  and treat `u8`/`usize` ordered comparisons as unsigned. Frontend tests reject
+  out-of-range `u8` literals; Core tests verify the result and failure edge; and
+  development/release native tests read exact ASCII, combining-mark, and
+  supplementary-code-point UTF-8 bytes through source and sliced views. The
+  remaining integer widths, arithmetic, shifts, bitwise operations, and explicit
+  conversions remain in the numbers group.
+- [x] Completed the required fresh `bytes`/list conversions: `Bytes.from_list`
+  context-types literals as `[u8]`, counts the source once, allocates independent
+  pointer-free byte storage, and copies in source order; `Bytes.to_list` rebuilds a
+  fresh scanned `[u8]` spine without sharing mutable representation details.
+  Typed AST and Core verifiers enforce the exact signatures and classify both as
+  collection points. LLVM roots the source and partially built output across every
+  allocation, and development/release collection-at-every-allocation native tests
+  cover empty-capable loops, boundary byte values, order, source immutability, and
+  retained byte storage under subsequent allocation pressure.
 
 ### Milestone 7 — Protocols and iteration
 

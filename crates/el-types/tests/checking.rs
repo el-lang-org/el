@@ -23,6 +23,105 @@ fn checks_bindings_mutation_calls_returns_and_generic_inference() {
 }
 
 #[test]
+fn checks_generic_struct_construction_projection_and_mutable_root_update() {
+    let source = "defmodule Main do\n  defstruct Pair(a) do\n    first: a\n    second: i32\n  end\n  def main() -> i32 do\n    mut pair: Pair(i32) = %Pair{second: 2, first: 40}\n    copy = pair\n    pair.second := pair.second + copy.second\n    pair.first + pair.second\n  end\nend\n";
+
+    let typed = checked(source).expect("struct expressions type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("struct d0: Pair(i32)"));
+    assert!(debug.contains("struct project d0 .1: i32"));
+    assert!(debug.contains("field assign"));
+    verify(&typed).expect("struct Typed AST verifies");
+}
+
+#[test]
+fn rejects_incomplete_duplicate_unknown_and_immutable_struct_updates() {
+    let cases = [
+        ("value = %Pair{first: 1}\n    value.first", "E2148"),
+        (
+            "value = %Pair{first: 1, first: 2, second: 3}\n    value.first",
+            "E2147",
+        ),
+        (
+            "value = %Pair{first: 1, missing: 2, second: 3}\n    value.first",
+            "E2144",
+        ),
+        (
+            "value = %Pair{first: 1, second: 2}\n    value.first := 3\n    value.first",
+            "E2104",
+        ),
+    ];
+    for (body, code) in cases {
+        let source = format!(
+            "defmodule Main do\n  defstruct Pair do\n    first: i32\n    second: i32\n  end\n  def main() -> i32 do\n    {body}\n  end\nend\n"
+        );
+        let diagnostics = checked(&source).expect_err("invalid struct use is rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "missing {code}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn checks_fixed_array_indexing_with_a_usize_index() {
+    let source = "defmodule Main do\n  def get(values: [i32; 2], index: usize) -> i32 do\n    values[index]\n  end\n  def make() -> [i64; 2] do\n    #[1, 2]\n  end\n  def direct() -> i64 do\n    #[1, 2][1] + make()[0]\n  end\n  def main() -> i32 do\n    get(#[40, 2], 0)\n  end\nend\n";
+
+    let typed = checked(source).expect("fixed-array indexing type checks");
+    assert!(typed.debug_tree().contains("index: i32"));
+    verify(&typed).expect("indexed Typed AST verifies");
+}
+
+#[test]
+fn checks_managed_slice_construction_subslicing_copy_length_and_indexing() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    array: [i32; 3] = #[10, 20, 30]\n    whole: Slice(i32) = Slice.from_array(array)\n    part = Slice.subslice(whole, 1, 2)\n    copy = Slice.copy(part)\n    if Array.length(array) == 3 and Slice.length(copy) == 2 do\n      copy[1]\n    else\n      0\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("slice operations type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("slice from array: Slice(i32)"));
+    assert!(debug.contains("subslice: Slice(i32)"));
+    assert!(debug.contains("slice copy: Slice(i32)"));
+    assert!(debug.contains("index: i32"));
+    verify(&typed).expect("slice Typed AST verifies");
+
+    checked(
+        "defmodule Main do\n  def empty() -> Slice(i32) do\n    Slice.from_array(#[])\n  end\nend\n",
+    )
+    .expect("the expected slice item type infers an empty array item type");
+}
+
+#[test]
+fn rejects_invalid_slice_intrinsic_inputs() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    index: i32 = 0\n    slice = Slice.from_array(#[1, 2])\n    Slice.subslice(slice, index, 1)[0]\n  end\nend\n";
+
+    let diagnostics = checked(source).expect_err("non-usize slice bounds are rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2113")
+    );
+}
+
+#[test]
+fn rejects_indexing_strings_lists_and_non_usize_indices() {
+    let cases = [
+        ("\"abc\"[0]", "E2150"),
+        ("[1, 2][0]", "E2150"),
+        ("#[1, 2][index]", "E2113"),
+    ];
+    for (expression, code) in cases {
+        let source = format!(
+            "defmodule Main do\n  def main() -> i32 do\n    index: i32 = 0\n    {expression}\n  end\nend\n"
+        );
+        let diagnostics = checked(&source).expect_err("invalid indexing is rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "missing {code}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn desugars_left_associative_pipelines_into_first_call_arguments() {
     let source = "defmodule Main do\n  def add(value: i32, extra: i32) -> i32 do\n    value + extra\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    40 |> add(2) |> identity()\n  end\nend\n";
 
@@ -328,6 +427,27 @@ fn checks_expected_and_inferred_lists_including_an_improper_tail() {
 
     assert!(debug.contains("function d2 main -> [i32]"));
     assert!(debug.contains("call d0 [a=i32]: [i32]"));
+}
+
+#[test]
+fn checks_list_reverse_and_expected_empty_list_inference() {
+    let source = "defmodule Main do\n  def reverse(values: [a]) -> [a] do\n    List.reverse(values)\n  end\n  def empty() -> [i32] do\n    List.reverse([])\n  end\n  def main() -> i32 do\n    reversed: [i32] = reverse([42, 1])\n    match reversed do\n      [1 | _] -> 0\n      [_ | tail] -> match tail do\n        [value | _] -> value\n        [] -> 0\n      end\n      [] -> 0\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("list reverse type checks and specializes");
+    assert!(typed.debug_tree().contains("list reverse: [a]"));
+    assert!(typed.debug_tree().contains("list reverse: [i32]"));
+    verify(&typed).expect("list reverse Typed AST verifies");
+}
+
+#[test]
+fn rejects_list_reverse_for_non_list_values() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    List.reverse(42)\n  end\nend\n";
+    let diagnostics = checked(source).expect_err("List.reverse requires a list");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
 }
 
 #[test]
@@ -683,4 +803,154 @@ fn checks_string_literals_and_exhaustive_integer_string_unions() {
     assert!(debug.contains("string \"forty-two\": string"), "{debug}");
     assert!(debug.contains("inject string"), "{debug}");
     assert!(debug.contains("match exhaustive=true"), "{debug}");
+}
+
+#[test]
+fn checks_utf8_string_byte_size_and_rejects_non_string_inputs() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    if String.byte_size(\"é🙂\") == 7 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("String.byte_size accepts valid UTF-8 text");
+    assert!(typed.debug_tree().contains("collection length: usize"));
+
+    let invalid = source.replace("String.byte_size(\"é🙂\")", "String.byte_size(1)");
+    assert!(
+        checked(&invalid)
+            .expect_err("String.byte_size rejects non-string inputs")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_string_bytes_and_bounds_checked_byte_views() {
+    let source = "defmodule Main do\n  def view(text: string) -> bytes do\n    Bytes.slice(String.bytes(text), 1, 2)\n  end\n  def main() -> i32 do\n    if Bytes.byte_size(view(\"é🙂\")) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("string bytes and byte slicing type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string bytes: bytes"), "{debug}");
+    assert!(debug.contains("bytes slice: bytes"), "{debug}");
+    verify(&typed).expect("byte-view Typed AST verifies");
+
+    for invalid in [
+        source.replace("String.bytes(text)", "String.bytes(1)"),
+        source.replace(
+            "Bytes.slice(String.bytes(text), 1, 2)",
+            "Bytes.slice(text, 1, 2)",
+        ),
+        source.replace(
+            "Bytes.slice(String.bytes(text), 1, 2)",
+            "Bytes.slice(String.bytes(text), true, 2)",
+        ),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("invalid byte-view input is rejected")
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code.as_str(), "E2113" | "E2151"))
+        );
+    }
+}
+
+#[test]
+fn checks_fresh_bytes_list_conversions() {
+    let source = "defmodule Main do\n  def round_trip(values: [u8]) -> [u8] do\n    Bytes.to_list(Bytes.from_list(values))\n  end\nend\n";
+    let typed = checked(source).expect("byte/list conversions type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("bytes from list: bytes"), "{debug}");
+    assert!(debug.contains("bytes to list: [u8]"), "{debug}");
+    verify(&typed).expect("byte/list conversion Typed AST verifies");
+
+    for invalid in [
+        source.replace("Bytes.from_list(values)", "Bytes.from_list([256])"),
+        source.replace("Bytes.from_list(values)", "Bytes.from_list(\"bad\")"),
+        source.replace(
+            "Bytes.to_list(Bytes.from_list(values))",
+            "Bytes.to_list(values)",
+        ),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("invalid byte/list conversion input is rejected")
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code.as_str(), "E2113" | "E2151"))
+        );
+    }
+}
+
+#[test]
+fn checks_byte_indexing_as_u8_and_literal_range() {
+    let source = "defmodule Main do\n  def first(data: bytes) -> u8 do\n    data[0]\n  end\n  def main() -> i32 do\n    if first(String.bytes(\"abc\")) == 97 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("bytes indexing returns u8");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("index: u8"), "{debug}");
+    verify(&typed).expect("byte-index Typed AST verifies");
+
+    let out_of_range = "defmodule Main do\n  def invalid() -> u8 do\n    256\n  end\nend\n";
+    assert!(
+        checked(out_of_range)
+            .expect_err("u8 literals are range checked")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2106")
+    );
+}
+
+#[test]
+fn checks_map_size_and_rejects_non_map_inputs() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    if Map.size(values) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("Map.size accepts an immutable map");
+    assert!(typed.debug_tree().contains("collection length: usize"));
+
+    let invalid = source.replace("Map.size(values)", "Map.size(1)");
+    assert!(
+        checked(&invalid)
+            .expect_err("Map.size rejects non-map inputs")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_immutable_map_put_and_remove_inputs() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    empty: Map(i32, string) = Map.new()\n    original: Map(i32, string) = %{1 => \"one\"}\n    updated = Map.put(original, 1, \"uno\")\n    removed = Map.remove(updated, 1)\n    fetched = Map.fetch(updated, 1)\n    if Map.size(empty) == 0 and Map.size(original) == 1 and Map.size(removed) == 0 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("map updates preserve the map type");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("map put: Map(i32, string)"), "{debug}");
+    assert!(debug.contains("map remove: Map(i32, string)"), "{debug}");
+    assert!(debug.contains("map fetch:"), "{debug}");
+
+    let ambiguous = source.replace("empty: Map(i32, string) = Map.new()", "empty = Map.new()");
+    assert!(
+        checked(&ambiguous)
+            .expect_err("Map.new requires an expected map type")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2107")
+    );
+
+    for invalid in [
+        source.replace(
+            "Map.put(original, 1, \"uno\")",
+            "Map.put(original, true, \"uno\")",
+        ),
+        source.replace("Map.put(original, 1, \"uno\")", "Map.put(original, 1, 2)"),
+        source.replace("Map.remove(updated, 1)", "Map.remove(updated, true)"),
+        source.replace("Map.fetch(updated, 1)", "Map.fetch(updated, true)"),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("map key and value types are exact")
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E2113")
+        );
+    }
+}
+
+#[test]
+fn checks_composite_map_keys_structural_equality_and_insertion_order_view() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map({i32, i32}, string) = %{{1, 2} => \"first\", {3, 4} => \"second\"}\n    ordered = Enum.to_list(Map.put(values, {1, 2}, \"updated\"))\n    same: Map({i32, i32}, string) = %{{3, 4} => \"second\", {1, 2} => \"updated\"}\n    if values != same and Map.put(values, {1, 2}, \"updated\") == same do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("composite map keys and structural map equality type check");
+    let debug = typed.debug_tree();
+    assert!(
+        debug.contains("map to list: [{{i32, i32}, string}]"),
+        "{debug}"
+    );
+    assert!(debug.contains("comparison Equal: bool"), "{debug}");
+    verify(&typed).expect("map equality and insertion-order view verify");
 }

@@ -15,15 +15,19 @@ pub struct TypeId(pub u32);
 pub enum Type {
     I32,
     I64,
+    Usize,
     Bool,
     Unit,
     String,
+    Bytes,
+    U8,
     Atom(String),
     List(TypeId),
     Array {
         item: TypeId,
         length: u64,
     },
+    Slice(TypeId),
     Map {
         key: TypeId,
         value: TypeId,
@@ -180,6 +184,14 @@ pub enum TypedItem {
         value: TypedExpr,
         span: Span,
     },
+    StructFieldAssign {
+        symbol: SymbolId,
+        declaration: DeclId,
+        field: usize,
+        field_types: Vec<TypeId>,
+        value: TypedExpr,
+        span: Span,
+    },
     Expr(TypedExpr),
     Return(TypedExpr),
     While {
@@ -218,9 +230,61 @@ pub enum TypedExprKind {
         elements: Vec<TypedExpr>,
         tail: Option<Box<TypedExpr>>,
     },
+    ListReverse(Box<TypedExpr>),
     Array(Vec<TypedExpr>),
     Map(Vec<(TypedExpr, TypedExpr)>),
+    MapPut {
+        map: Box<TypedExpr>,
+        key: Box<TypedExpr>,
+        value: Box<TypedExpr>,
+    },
+    MapRemove {
+        map: Box<TypedExpr>,
+        key: Box<TypedExpr>,
+    },
+    MapFetch {
+        map: Box<TypedExpr>,
+        key: Box<TypedExpr>,
+    },
+    MapToList(Box<TypedExpr>),
     Tuple(Vec<TypedExpr>),
+    Struct {
+        declaration: DeclId,
+        field_count: usize,
+        fields: Vec<(usize, TypedExpr)>,
+    },
+    StructProject {
+        value: Box<TypedExpr>,
+        declaration: DeclId,
+        field: usize,
+    },
+    Index {
+        value: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        length: Option<u64>,
+    },
+    SliceFromArray {
+        value: Box<TypedExpr>,
+        length: u64,
+    },
+    SliceSubslice {
+        value: Box<TypedExpr>,
+        start: Box<TypedExpr>,
+        length: Box<TypedExpr>,
+    },
+    SliceCopy(Box<TypedExpr>),
+    StringBytes(Box<TypedExpr>),
+    BytesFromList(Box<TypedExpr>),
+    BytesToList(Box<TypedExpr>),
+    BytesSlice {
+        value: Box<TypedExpr>,
+        start: Box<TypedExpr>,
+        length: Box<TypedExpr>,
+    },
+    CollectionLength {
+        value: Box<TypedExpr>,
+        known_length: Option<u64>,
+    },
     If {
         condition: Box<TypedExpr>,
         then_block: TypedBlock,
@@ -581,9 +645,12 @@ impl<'a> Checker<'a> {
             TypeSyntax::Primitive { name, span } => match name.as_str() {
                 "i32" => Some(TypeId(0)),
                 "i64" => Some(TypeId(1)),
+                "usize" => Some(self.intern(Type::Usize)),
                 "bool" => Some(TypeId(2)),
                 "unit" => Some(TypeId(3)),
                 "string" => Some(self.intern(Type::String)),
+                "bytes" => Some(self.intern(Type::Bytes)),
+                "u8" => Some(self.intern(Type::U8)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
                         "E2100",
@@ -654,6 +721,10 @@ impl<'a> Checker<'a> {
                     item,
                     length: *length,
                 }))
+            }
+            TypeSyntax::Slice { item, .. } => {
+                let item = self.resolve_type(item, parameters)?;
+                Some(self.intern(Type::Slice(item)))
             }
             TypeSyntax::Map { key, value, .. } => {
                 let key = self.resolve_type(key, parameters)?;
@@ -1099,6 +1170,23 @@ impl<'a> Checker<'a> {
                         span: node.span,
                     });
                 }
+                if written == "Slice" {
+                    if node.children.len() != 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2118",
+                            node.span,
+                            format!(
+                                "type `Slice` expects 1 argument but received {}",
+                                node.children.len() - 1
+                            ),
+                        ));
+                        return None;
+                    }
+                    return Some(TypeSyntax::Slice {
+                        item: Box::new(self.annotation_syntax(&node.children[1], module)?),
+                        span: node.span,
+                    });
+                }
                 let declaration = self
                     .aliases
                     .values()
@@ -1162,12 +1250,22 @@ impl<'a> Checker<'a> {
         scopes: &mut Vec<BTreeMap<String, Local>>,
     ) -> Option<TypedItem> {
         let target = node.children.first()?;
-        let name = unqualified_name(target)?;
-        let Some(local) = lookup(scopes, &name).cloned() else {
+        let (root, field) = if target.kind.as_str() == "postfix_expr" {
+            let root = target.children.first().and_then(unqualified_name)?;
+            let field = target
+                .children
+                .get(1)
+                .and_then(|access| access.children.first())
+                .map(text)?;
+            (root, Some(field))
+        } else {
+            (unqualified_name(target)?, None)
+        };
+        let Some(local) = lookup(scopes, &root).cloned() else {
             self.diagnostics.push(Diagnostic::error(
                 "E2103",
                 target.span,
-                format!("unknown local `{name}`"),
+                format!("unknown local `{root}`"),
             ));
             return None;
         };
@@ -1175,16 +1273,68 @@ impl<'a> Checker<'a> {
             self.diagnostics.push(Diagnostic::error(
                 "E2104",
                 target.span,
-                format!("cannot assign to immutable local `{name}`"),
+                format!("cannot assign to immutable local `{root}`"),
             ));
             return None;
         }
-        let value = self.check_expr(node.children.last()?, Some(local.ty), owner, scopes)?;
-        Some(TypedItem::Assign {
-            symbol: local.symbol,
-            value,
-            span: node.span,
-        })
+        if let Some(field_name) = field {
+            let Type::Struct {
+                declaration,
+                arguments,
+            } = self.types[local.ty.0 as usize].clone()
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2143",
+                    target.span,
+                    "direct field update requires a struct local",
+                ));
+                return None;
+            };
+            let structure = self.structs.get(&declaration)?.clone();
+            let Some(field) = structure
+                .fields
+                .iter()
+                .position(|candidate| candidate.name == field_name)
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2144",
+                    target.span,
+                    format!("unknown field `{field_name}` on `{}`", structure.name),
+                ));
+                return None;
+            };
+            let substitutions = structure
+                .parameters
+                .iter()
+                .cloned()
+                .zip(arguments)
+                .collect::<BTreeMap<_, _>>();
+            let field_ty = self.resolve_type(&structure.fields[field].ty, &substitutions)?;
+            let field_types = structure
+                .fields
+                .iter()
+                .filter_map(|candidate| self.resolve_type(&candidate.ty, &substitutions))
+                .collect::<Vec<_>>();
+            if field_types.len() != structure.fields.len() {
+                return None;
+            }
+            let value = self.check_expr(node.children.last()?, Some(field_ty), owner, scopes)?;
+            Some(TypedItem::StructFieldAssign {
+                symbol: local.symbol,
+                declaration,
+                field,
+                field_types,
+                value,
+                span: node.span,
+            })
+        } else {
+            let value = self.check_expr(node.children.last()?, Some(local.ty), owner, scopes)?;
+            Some(TypedItem::Assign {
+                symbol: local.symbol,
+                value,
+                span: node.span,
+            })
+        }
     }
 
     fn check_expr(
@@ -1226,6 +1376,7 @@ impl<'a> Checker<'a> {
             "if_expr" => self.check_if(node, expected, owner, scopes),
             "match_expr" => self.check_match(node, expected, owner, scopes),
             "tuple_literal" => self.check_tuple(node, expected, owner, scopes),
+            "struct_literal" => self.check_struct_literal(node, expected, owner, scopes),
             "ascription_expr" => self.check_ascription(node, owner, scopes),
             "qualified_value" | "identifier" => self.check_name(node, scopes),
             "additive_expr" | "multiplicative_expr" => {
@@ -1234,7 +1385,7 @@ impl<'a> Checker<'a> {
             "equality_expr" | "comparison_expr" => self.check_comparison(node, owner, scopes),
             "logical_and_expr" | "logical_or_expr" => self.check_logical(node, owner, scopes),
             "pipeline_expr" => self.check_pipeline(node, expected, owner, scopes),
-            "postfix_expr" => self.check_call(node, expected, owner, scopes),
+            "postfix_expr" => self.check_postfix(node, expected, owner, scopes),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
                     "E2105",
@@ -1270,7 +1421,7 @@ impl<'a> Checker<'a> {
             "integer" | "additive_expr" | "multiplicative_expr" => members
                 .iter()
                 .copied()
-                .filter(|member| matches!(self.types[member.0 as usize], Type::I32 | Type::I64))
+                .filter(|member| matches!(self.types[member.0 as usize], Type::I32 | Type::I64 | Type::U8))
                 .collect::<Vec<_>>(),
             "kw_true" | "kw_false" => members
                 .iter()
@@ -1707,7 +1858,12 @@ impl<'a> Checker<'a> {
                     PatternShape::Atom(name.clone()),
                 )
             }
-            "integer" if matches!(self.types[subject.0 as usize], Type::I32 | Type::I64) => {
+            "integer"
+                if matches!(
+                    self.types[subject.0 as usize],
+                    Type::I32 | Type::I64 | Type::U8
+                ) =>
+            {
                 let value = integer_value(node)?;
                 (
                     TypedPatternKind::Integer(value),
@@ -1967,7 +2123,12 @@ impl<'a> Checker<'a> {
 
     fn check_integer(&mut self, node: &Node, expected: Option<TypeId>) -> Option<TypedExpr> {
         let ty = expected
-            .filter(|ty| matches!(self.types[ty.0 as usize], Type::I32 | Type::I64))
+            .filter(|ty| {
+                matches!(
+                    self.types[ty.0 as usize],
+                    Type::I32 | Type::I64 | Type::Usize | Type::U8
+                )
+            })
             .unwrap_or(TypeId(1));
         let Some(Value::Integer { radix, digits, .. }) = &node.value else {
             return None;
@@ -1976,6 +2137,8 @@ impl<'a> Checker<'a> {
         let limit = match self.types[ty.0 as usize] {
             Type::I32 => i32::MAX as u128,
             Type::I64 => i64::MAX as u128,
+            Type::Usize => usize::MAX as u128,
+            Type::U8 => u8::MAX as u128,
             _ => unreachable!(),
         };
         if value.is_none_or(|value| value > limit) {
@@ -2081,8 +2244,10 @@ impl<'a> Checker<'a> {
             operator,
             ComparisonOperator::Equal | ComparisonOperator::NotEqual
         );
-        let supported = matches!(self.types[left.ty.0 as usize], Type::I32 | Type::I64)
-            || (!ordered && matches!(self.types[left.ty.0 as usize], Type::Bool));
+        let supported = matches!(
+            self.types[left.ty.0 as usize],
+            Type::I32 | Type::I64 | Type::Usize | Type::U8
+        ) || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
         if !supported {
             self.diagnostics.push(Diagnostic::error(
                 "E2139",
@@ -2090,7 +2255,7 @@ impl<'a> Checker<'a> {
                 if ordered {
                     "ordered comparison requires matching integer operands"
                 } else {
-                    "equality requires matching integer or bool operands"
+                    "equality requires matching operands that implement `Eq`"
                 },
             ));
             return None;
@@ -2141,6 +2306,277 @@ impl<'a> Checker<'a> {
         self.check_call_with_input(node, None, node.span, expected, owner, scopes)
     }
 
+    fn check_postfix(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let call = node
+            .children
+            .iter()
+            .skip(1)
+            .position(|part| part.kind.as_str() == "call_arguments")
+            .map(|index| index + 1);
+        let (mut value, suffix_start) = if let Some(call) = call {
+            if node.children[call + 1..]
+                .iter()
+                .any(|part| part.kind.as_str() == "call_arguments")
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2109",
+                    node.span,
+                    "indirect calls are not implemented in this slice",
+                ));
+                return None;
+            }
+            let final_expected = (call + 1 == node.children.len())
+                .then_some(expected)
+                .flatten();
+            (
+                self.check_call(node, final_expected, owner, scopes)?,
+                call + 1,
+            )
+        } else {
+            (
+                self.check_expr(node.children.first()?, None, owner, scopes)?,
+                1,
+            )
+        };
+        for access in &node.children[suffix_start..] {
+            if access.kind.as_str() == "index_access" {
+                let (item, length) = match self.types[value.ty.0 as usize] {
+                    Type::Array { item, length } => (item, Some(length)),
+                    Type::Slice(item) => (item, None),
+                    Type::Bytes => (self.intern(Type::U8), None),
+                    Type::String => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2150",
+                            access.span,
+                            "`string` does not support integer indexing",
+                        ));
+                        return None;
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2150",
+                            access.span,
+                            format!(
+                                "`{}` does not support integer indexing",
+                                self.type_name(value.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                };
+                let usize_ty = self.intern(Type::Usize);
+                let index =
+                    self.check_expr(access.children.first()?, Some(usize_ty), owner, scopes)?;
+                value = TypedExpr {
+                    kind: TypedExprKind::Index {
+                        value: Box::new(value),
+                        index: Box::new(index),
+                        length,
+                    },
+                    ty: item,
+                    span: access.span,
+                };
+                continue;
+            }
+            if access.kind.as_str() != "field_access" {
+                return None;
+            }
+            let Type::Struct {
+                declaration,
+                arguments,
+            } = self.types[value.ty.0 as usize].clone()
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2143",
+                    access.span,
+                    "field access requires a struct value",
+                ));
+                return None;
+            };
+            let structure = self.structs.get(&declaration)?.clone();
+            let name = access.children.first().map(text)?;
+            let Some(field) = structure
+                .fields
+                .iter()
+                .position(|candidate| candidate.name == name)
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2144",
+                    access.span,
+                    format!("unknown field `{name}` on `{}`", structure.name),
+                ));
+                return None;
+            };
+            let substitutions = structure
+                .parameters
+                .iter()
+                .cloned()
+                .zip(arguments)
+                .collect::<BTreeMap<_, _>>();
+            let ty = self.resolve_type(&structure.fields[field].ty, &substitutions)?;
+            value = TypedExpr {
+                kind: TypedExprKind::StructProject {
+                    value: Box::new(value),
+                    declaration,
+                    field,
+                },
+                ty,
+                span: access.span,
+            };
+        }
+        if let Some(expected) = expected
+            && value.ty != expected
+        {
+            self.type_mismatch(node.span, expected, value.ty);
+            return None;
+        }
+        Some(value)
+    }
+
+    fn check_struct_literal(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let path = node.children.first()?;
+        let written = path.children.iter().map(text).collect::<Vec<_>>().join(".");
+        let owner_module = self
+            .program
+            .functions
+            .iter()
+            .find(|function| function.id == owner)
+            .map(|function| function.module_name.as_str())?;
+        let structure = self
+            .structs
+            .values()
+            .find(|candidate| {
+                written == format!("{}.{}", candidate.module_name, candidate.name)
+                    || (written == candidate.name && candidate.module_name == owner_module)
+            })
+            .cloned();
+        let Some(structure) = structure else {
+            self.diagnostics.push(Diagnostic::error(
+                "E2146",
+                path.span,
+                format!("unknown struct `{written}`"),
+            ));
+            return None;
+        };
+        let parameters = structure
+            .parameters
+            .iter()
+            .map(|name| {
+                let ty = self.intern(Type::Parameter {
+                    owner: structure.id,
+                    name: name.clone(),
+                });
+                (name.clone(), ty)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut substitutions = BTreeMap::new();
+        if let Some(expected) = expected
+            && let Type::Struct {
+                declaration,
+                arguments,
+            } = self.types[expected.0 as usize].clone()
+            && declaration == structure.id
+        {
+            for (parameter, argument) in parameters.values().zip(arguments) {
+                substitutions.insert(*parameter, argument);
+            }
+        }
+        let mut seen = BTreeMap::<String, Span>::new();
+        let mut fields = Vec::new();
+        for field_node in &node.children[1..] {
+            let name_node = field_node.children.first()?;
+            let name = text(name_node);
+            if let Some(previous) = seen.insert(name.clone(), name_node.span) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E2147",
+                        name_node.span,
+                        format!("duplicate struct field `{name}`"),
+                    )
+                    .with_label(previous, "first field here"),
+                );
+                return None;
+            }
+            let Some(index) = structure.fields.iter().position(|field| field.name == name) else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2144",
+                    name_node.span,
+                    format!("unknown field `{name}` on `{}`", structure.name),
+                ));
+                return None;
+            };
+            let declared = self.resolve_type(&structure.fields[index].ty, &parameters)?;
+            let field_expected = self.apply_substitutions(declared, &substitutions);
+            let expected_is_parameter = matches!(
+                self.types[field_expected.0 as usize],
+                Type::Parameter { .. }
+            );
+            let value = self.check_expr(
+                field_node.children.get(1)?,
+                (!expected_is_parameter).then_some(field_expected),
+                owner,
+                scopes,
+            )?;
+            if !unify_types(&self.types, declared, value.ty, &mut substitutions) {
+                self.type_mismatch(value.span, field_expected, value.ty);
+                return None;
+            }
+            fields.push((index, value));
+        }
+        let missing = structure
+            .fields
+            .iter()
+            .filter(|field| !seen.contains_key(&field.name))
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                "E2148",
+                node.span,
+                format!("missing struct fields: {}", missing.join(", ")),
+            ));
+            return None;
+        }
+        let mut arguments = Vec::new();
+        for parameter in parameters.values() {
+            let argument = self.apply_substitutions(*parameter, &substitutions);
+            if matches!(self.types[argument.0 as usize], Type::Parameter { .. }) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2149",
+                    node.span,
+                    format!("cannot infer all type arguments for `{}`", structure.name),
+                ));
+                return None;
+            }
+            arguments.push(argument);
+        }
+        let ty = self.intern(Type::Struct {
+            declaration: structure.id,
+            arguments,
+        });
+        Some(TypedExpr {
+            kind: TypedExprKind::Struct {
+                declaration: structure.id,
+                field_count: structure.fields.len(),
+                fields,
+            },
+            ty,
+            span: node.span,
+        })
+    }
+
     fn check_pipeline(
         &mut self,
         node: &Node,
@@ -2172,6 +2608,54 @@ impl<'a> Checker<'a> {
         scopes: &mut Vec<BTreeMap<String, Local>>,
     ) -> Option<TypedExpr> {
         let callee = node.children.first()?;
+        let written = (callee.kind.as_str() == "qualified_value").then(|| {
+            callee
+                .children
+                .iter()
+                .map(text)
+                .collect::<Vec<_>>()
+                .join(".")
+        });
+        if written.as_deref().is_some_and(|name| {
+            matches!(
+                name,
+                "Array.length"
+                    | "List.reverse"
+                    | "Map.put"
+                    | "Map.remove"
+                    | "Map.fetch"
+                    | "Map.new"
+                    | "Map.size"
+                    | "Enum.to_list"
+                    | "Slice.from_array"
+                    | "Slice.subslice"
+                    | "Slice.copy"
+                    | "Slice.length"
+                    | "String.byte_size"
+                    | "String.bytes"
+                    | "Bytes.byte_size"
+                    | "Bytes.slice"
+                    | "Bytes.from_list"
+                    | "Bytes.to_list"
+            )
+        }) {
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let arguments = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            return self.check_collection_intrinsic(
+                written.as_deref()?,
+                &arguments,
+                span,
+                expected,
+                owner,
+                scopes,
+            );
+        }
         let name = self.call_name(callee, owner)?;
         let qualified = callee.kind.as_str() == "qualified_value" && callee.children.len() > 1;
         let local_name = unqualified_name(callee);
@@ -2298,6 +2782,296 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_collection_intrinsic(
+        &mut self,
+        name: &str,
+        arguments: &[&Node],
+        span: Span,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        if name == "Map.new" {
+            if !arguments.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2111",
+                    span,
+                    format!(
+                        "function `{name}` expects 0 arguments but received {}",
+                        arguments.len()
+                    ),
+                ));
+                return None;
+            }
+            let Some(ty) = expected
+                .filter(|ty| matches!(self.types.get(ty.0 as usize), Some(Type::Map { .. })))
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2107",
+                    span,
+                    "cannot infer the key and value types of an empty map",
+                ));
+                return None;
+            };
+            let Some(Type::Map { key, .. }) = self.types.get(ty.0 as usize) else {
+                unreachable!("expected map type was checked above")
+            };
+            let key = *key;
+            if !self.type_satisfies(key, "Eq", owner) || !self.type_satisfies(key, "Hash", owner) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2108",
+                    span,
+                    format!(
+                        "map key type `{}` must implement `Eq` and `Hash`",
+                        self.type_name(key)
+                    ),
+                ));
+                return None;
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Map(Vec::new()),
+                ty,
+                span,
+            });
+        }
+        let required = match name {
+            "Slice.subslice" | "Bytes.slice" | "Map.put" => 3,
+            "Map.remove" | "Map.fetch" => 2,
+            _ => 1,
+        };
+        if arguments.len() != required {
+            self.diagnostics.push(Diagnostic::error(
+                "E2111",
+                span,
+                format!(
+                    "function `{name}` expects {required} arguments but received {}",
+                    arguments.len()
+                ),
+            ));
+            return None;
+        }
+        let usize_ty = self.intern(Type::Usize);
+        let first_expected = if matches!(name, "Map.put" | "Map.remove")
+            && let Some(expected) = expected
+            && matches!(self.types[expected.0 as usize], Type::Map { .. })
+        {
+            Some(expected)
+        } else if name == "List.reverse"
+            && let Some(expected) = expected
+            && matches!(self.types[expected.0 as usize], Type::List(_))
+        {
+            Some(expected)
+        } else if name == "Slice.from_array"
+            && arguments[0].kind.as_str() == "array_literal"
+            && let Some(expected) = expected
+            && let Type::Slice(item) = self.types[expected.0 as usize]
+        {
+            Some(self.intern(Type::Array {
+                item,
+                length: arguments[0].children.len() as u64,
+            }))
+        } else if name == "Bytes.from_list" {
+            let u8_ty = self.intern(Type::U8);
+            Some(self.intern(Type::List(u8_ty)))
+        } else {
+            None
+        };
+        let first = self.check_expr(arguments[0], first_expected, owner, scopes)?;
+        let (kind, ty) = match (name, self.types[first.ty.0 as usize].clone()) {
+            ("List.reverse", Type::List(_)) => {
+                let ty = first.ty;
+                (TypedExprKind::ListReverse(Box::new(first)), ty)
+            }
+            ("Array.length", Type::Array { length, .. }) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: Some(length),
+                },
+                usize_ty,
+            ),
+            ("Slice.from_array", Type::Array { item, length }) => {
+                let ty = self.intern(Type::Slice(item));
+                (
+                    TypedExprKind::SliceFromArray {
+                        value: Box::new(first),
+                        length,
+                    },
+                    ty,
+                )
+            }
+            ("Slice.subslice", Type::Slice(_)) => {
+                let start = self.check_expr(arguments[1], Some(usize_ty), owner, scopes)?;
+                let length = self.check_expr(arguments[2], Some(usize_ty), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::SliceSubslice {
+                        value: Box::new(first),
+                        start: Box::new(start),
+                        length: Box::new(length),
+                    },
+                    ty,
+                )
+            }
+            ("Slice.copy", Type::Slice(_)) => {
+                let ty = first.ty;
+                (TypedExprKind::SliceCopy(Box::new(first)), ty)
+            }
+            ("Slice.length", Type::Slice(_)) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("String.byte_size", Type::String) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("String.bytes", Type::String) => {
+                let ty = self.intern(Type::Bytes);
+                (TypedExprKind::StringBytes(Box::new(first)), ty)
+            }
+            ("Bytes.byte_size", Type::Bytes) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("Bytes.from_list", Type::List(item))
+                if matches!(self.types[item.0 as usize], Type::U8) =>
+            {
+                let ty = self.intern(Type::Bytes);
+                (TypedExprKind::BytesFromList(Box::new(first)), ty)
+            }
+            ("Bytes.to_list", Type::Bytes) => {
+                let u8_ty = self.intern(Type::U8);
+                let ty = self.intern(Type::List(u8_ty));
+                (TypedExprKind::BytesToList(Box::new(first)), ty)
+            }
+            ("Bytes.slice", Type::Bytes) => {
+                let start = self.check_expr(arguments[1], Some(usize_ty), owner, scopes)?;
+                let length = self.check_expr(arguments[2], Some(usize_ty), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::BytesSlice {
+                        value: Box::new(first),
+                        start: Box::new(start),
+                        length: Box::new(length),
+                    },
+                    ty,
+                )
+            }
+            ("Map.size", Type::Map { .. }) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("Enum.to_list", Type::Map { key, value }) => {
+                let pair = self.intern(Type::Tuple(vec![key, value]));
+                let ty = self.intern(Type::List(pair));
+                (TypedExprKind::MapToList(Box::new(first)), ty)
+            }
+            ("Map.put", Type::Map { key, value }) => {
+                if !self.type_satisfies(key, "Eq", owner)
+                    || !self.type_satisfies(key, "Hash", owner)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        format!(
+                            "map key type `{}` must implement `Eq` and `Hash`",
+                            self.type_name(key)
+                        ),
+                    ));
+                    return None;
+                }
+                let key_expr = self.check_expr(arguments[1], Some(key), owner, scopes)?;
+                let value_expr = self.check_expr(arguments[2], Some(value), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::MapPut {
+                        map: Box::new(first),
+                        key: Box::new(key_expr),
+                        value: Box::new(value_expr),
+                    },
+                    ty,
+                )
+            }
+            ("Map.remove", Type::Map { key, .. }) => {
+                if !self.type_satisfies(key, "Eq", owner)
+                    || !self.type_satisfies(key, "Hash", owner)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        format!(
+                            "map key type `{}` must implement `Eq` and `Hash`",
+                            self.type_name(key)
+                        ),
+                    ));
+                    return None;
+                }
+                let key_expr = self.check_expr(arguments[1], Some(key), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::MapRemove {
+                        map: Box::new(first),
+                        key: Box::new(key_expr),
+                    },
+                    ty,
+                )
+            }
+            ("Map.fetch", Type::Map { key, value }) => {
+                if !self.type_satisfies(key, "Eq", owner)
+                    || !self.type_satisfies(key, "Hash", owner)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        format!(
+                            "map key type `{}` must implement `Eq` and `Hash`",
+                            self.type_name(key)
+                        ),
+                    ));
+                    return None;
+                }
+                let key_expr = self.check_expr(arguments[1], Some(key), owner, scopes)?;
+                let none = self.intern(Type::Atom("none".to_owned()));
+                let some_atom = self.intern(Type::Atom("some".to_owned()));
+                let some = self.intern(Type::Tuple(vec![some_atom, value]));
+                let ty = self.normalize_union(vec![some, none], span)?;
+                (
+                    TypedExprKind::MapFetch {
+                        map: Box::new(first),
+                        key: Box::new(key_expr),
+                    },
+                    ty,
+                )
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2151",
+                    arguments[0].span,
+                    format!("invalid argument type for `{name}`"),
+                ));
+                return None;
+            }
+        };
+        if let Some(expected) = expected
+            && expected != ty
+        {
+            self.type_mismatch(span, expected, ty);
+            return None;
+        }
+        Some(TypedExpr { kind, ty, span })
+    }
+
     fn call_name(&mut self, node: &Node, owner: DeclId) -> Option<String> {
         let caller_module = self.owner_module(owner)?.to_owned();
         if let Some(name) = unqualified_name(node) {
@@ -2355,6 +3129,10 @@ impl<'a> Checker<'a> {
                 let item = self.apply_substitutions(item, substitutions);
                 self.intern(Type::Array { item, length })
             }
+            Type::Slice(item) => {
+                let item = self.apply_substitutions(item, substitutions);
+                self.intern(Type::Slice(item))
+            }
             Type::Map { key, value } => {
                 let key = self.apply_substitutions(key, substitutions);
                 let value = self.apply_substitutions(value, substitutions);
@@ -2407,7 +3185,15 @@ impl<'a> Checker<'a> {
                     .iter()
                     .any(|(parameter, required)| *parameter == ty && required == protocol)
             }),
-            Type::I32 | Type::I64 | Type::Bool | Type::Unit | Type::String | Type::Atom(_) => {
+            Type::I32
+            | Type::I64
+            | Type::Usize
+            | Type::Bool
+            | Type::Unit
+            | Type::String
+            | Type::Bytes
+            | Type::U8
+            | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
             }
             Type::List(item) => match protocol {
@@ -2416,6 +3202,11 @@ impl<'a> Checker<'a> {
                 _ => false,
             },
             Type::Array { item, .. } => match protocol {
+                "Iterable" => true,
+                "Eq" | "Ord" | "Show" | "Hash" => self.type_satisfies(*item, protocol, owner),
+                _ => false,
+            },
+            Type::Slice(item) => match protocol {
                 "Iterable" => true,
                 "Eq" | "Ord" | "Show" | "Hash" => self.type_satisfies(*item, protocol, owner),
                 _ => false,
@@ -2455,12 +3246,16 @@ impl<'a> Checker<'a> {
         match &self.types[id.0 as usize] {
             Type::I32 => "i32".to_owned(),
             Type::I64 => "i64".to_owned(),
+            Type::Usize => "usize".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
             Type::String => "string".to_owned(),
+            Type::Bytes => "bytes".to_owned(),
+            Type::U8 => "u8".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.type_name(*item)),
+            Type::Slice(item) => format!("Slice({})", self.type_name(*item)),
             Type::Map { key, value } => {
                 format!("Map({}, {})", self.type_name(*key), self.type_name(*value))
             }
@@ -2515,12 +3310,16 @@ impl<'a> Checker<'a> {
         match &self.types[id.0 as usize] {
             Type::I32 => "00:i32".to_owned(),
             Type::I64 => "00:i64".to_owned(),
+            Type::Usize => "00:usize".to_owned(),
             Type::Bool => "00:bool".to_owned(),
             Type::Unit => "00:unit".to_owned(),
             Type::String => "00:string".to_owned(),
+            Type::Bytes => "00:bytes".to_owned(),
+            Type::U8 => "00:u8".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
             Type::Array { item, length } => format!("02a:[{};{length}]", self.type_key(*item)),
+            Type::Slice(item) => format!("02s:Slice({})", self.type_key(*item)),
             Type::Map { key, value } => {
                 format!("02m:Map({},{})", self.type_key(*key), self.type_key(*value))
             }
@@ -2588,6 +3387,8 @@ fn unify_types(
     }
     match (&types[left.0 as usize], &types[right.0 as usize]) {
         (Type::String, Type::String) => true,
+        (Type::Bytes, Type::Bytes) => true,
+        (Type::U8, Type::U8) => true,
         (Type::Atom(left), Type::Atom(right)) => left == right,
         (Type::List(left), Type::List(right)) => unify_types(types, *left, *right, substitutions),
         (
@@ -2600,6 +3401,7 @@ fn unify_types(
                 length: right_length,
             },
         ) if left_length == right_length => unify_types(types, *left, *right, substitutions),
+        (Type::Slice(left), Type::Slice(right)) => unify_types(types, *left, *right, substitutions),
         (
             Type::Map {
                 key: left_key,
@@ -2682,9 +3484,9 @@ fn collect_type_variables(ty: &TypeSyntax, output: &mut Vec<String>) {
                 collect_type_variables(ty, output);
             }
         }
-        TypeSyntax::List { item, .. } | TypeSyntax::Array { item, .. } => {
-            collect_type_variables(item, output)
-        }
+        TypeSyntax::List { item, .. }
+        | TypeSyntax::Array { item, .. }
+        | TypeSyntax::Slice { item, .. } => collect_type_variables(item, output),
         TypeSyntax::Map { key, value, .. } => {
             collect_type_variables(key, output);
             collect_type_variables(value, output);
@@ -3205,6 +4007,38 @@ fn verify_item(
                 errors,
             );
         }
+        TypedItem::StructFieldAssign {
+            symbol,
+            declaration,
+            value,
+            ..
+        } => {
+            match symbols.get(symbol).and_then(|ty| types.get(ty.0 as usize)) {
+                Some(Type::Struct {
+                    declaration: found, ..
+                }) if found == declaration => {}
+                Some(_) => errors.push(format!(
+                    "field assignment to {symbol:?} has an incorrect struct type"
+                )),
+                None => errors.push(format!(
+                    "field assignment references unknown symbol {symbol:?}"
+                )),
+            }
+            if !mutable_symbols.contains(symbol) {
+                errors.push(format!(
+                    "field assignment targets immutable symbol {symbol:?}"
+                ));
+            }
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+        }
         TypedItem::Expr(expression) | TypedItem::Return(expression) => {
             verify_expr(
                 expression,
@@ -3346,6 +4180,10 @@ fn collect_block_locals(block: &TypedBlock, output: &mut BTreeSet<SymbolId>) {
                 output.insert(*symbol);
                 collect_expr_locals(value, output);
             }
+            TypedItem::StructFieldAssign { symbol, value, .. } => {
+                output.insert(*symbol);
+                collect_expr_locals(value, output);
+            }
             TypedItem::Expr(expression) | TypedItem::Return(expression) => {
                 collect_expr_locals(expression, output);
             }
@@ -3380,6 +4218,9 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
                 collect_expr_locals(tail, output);
             }
         }
+        TypedExprKind::ListReverse(value) | TypedExprKind::MapToList(value) => {
+            collect_expr_locals(value, output)
+        }
         TypedExprKind::Array(elements) | TypedExprKind::Tuple(elements) => {
             for element in elements {
                 collect_expr_locals(element, output);
@@ -3390,6 +4231,53 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
                 collect_expr_locals(key, output);
                 collect_expr_locals(value, output);
             }
+        }
+        TypedExprKind::MapPut { map, key, value } => {
+            for child in [map.as_ref(), key.as_ref(), value.as_ref()] {
+                collect_expr_locals(child, output);
+            }
+        }
+        TypedExprKind::MapRemove { map, key } => {
+            collect_expr_locals(map, output);
+            collect_expr_locals(key, output);
+        }
+        TypedExprKind::MapFetch { map, key } => {
+            collect_expr_locals(map, output);
+            collect_expr_locals(key, output);
+        }
+        TypedExprKind::Struct { fields, .. } => {
+            for (_, value) in fields {
+                collect_expr_locals(value, output);
+            }
+        }
+        TypedExprKind::StructProject { value, .. } => collect_expr_locals(value, output),
+        TypedExprKind::Index { value, index, .. } => {
+            collect_expr_locals(value, output);
+            collect_expr_locals(index, output);
+        }
+        TypedExprKind::SliceFromArray { value, .. }
+        | TypedExprKind::SliceCopy(value)
+        | TypedExprKind::StringBytes(value)
+        | TypedExprKind::BytesFromList(value)
+        | TypedExprKind::BytesToList(value)
+        | TypedExprKind::CollectionLength { value, .. } => collect_expr_locals(value, output),
+        TypedExprKind::BytesSlice {
+            value,
+            start,
+            length,
+        } => {
+            collect_expr_locals(value, output);
+            collect_expr_locals(start, output);
+            collect_expr_locals(length, output);
+        }
+        TypedExprKind::SliceSubslice {
+            value,
+            start,
+            length,
+        } => {
+            collect_expr_locals(value, output);
+            collect_expr_locals(start, output);
+            collect_expr_locals(length, output);
         }
         TypedExprKind::If {
             condition,
@@ -3449,7 +4337,7 @@ fn verify_expr(
         TypedExprKind::Integer(_)
             if !matches!(
                 types.get(expression.ty.0 as usize),
-                Some(Type::I32 | Type::I64)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
             ) =>
         {
             errors.push("integer expression has a non-integer type".to_owned());
@@ -3515,6 +4403,22 @@ fn verify_expr(
                 }
             }
         }
+        TypedExprKind::ListReverse(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if value.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::List(_)))
+            {
+                errors.push("list reverse has incorrect types".to_owned());
+            }
+        }
         TypedExprKind::Tuple(elements) => {
             let element_types = match types.get(expression.ty.0 as usize) {
                 Some(Type::Tuple(element_types)) if element_types.len() == elements.len() => {
@@ -3538,6 +4442,251 @@ fn verify_expr(
                 if element_types.is_some_and(|types| element.ty != types[index]) {
                     errors.push("tuple element has an incorrect type".to_owned());
                 }
+            }
+        }
+        TypedExprKind::Struct {
+            declaration,
+            field_count,
+            fields,
+        } => {
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::Struct { declaration: found, .. }) if found == declaration)
+            {
+                errors.push("struct expression has an incorrect nominal type".to_owned());
+            }
+            let mut seen = BTreeSet::new();
+            for (index, value) in fields {
+                if *index >= *field_count || !seen.insert(*index) {
+                    errors.push("struct expression has an invalid field index".to_owned());
+                }
+                verify_expr(
+                    value,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            if seen.len() != *field_count {
+                errors.push("struct expression does not initialize every field".to_owned());
+            }
+        }
+        TypedExprKind::StructProject {
+            value, declaration, ..
+        } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Struct { declaration: found, .. }) if found == declaration)
+            {
+                errors.push("struct projection has an incorrect source type".to_owned());
+            }
+        }
+        TypedExprKind::Index {
+            value,
+            index,
+            length,
+        } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                index,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(index.ty.0 as usize), Some(Type::Usize)) {
+                errors.push("index expression has a non-usize index".to_owned());
+            }
+            match (types.get(value.ty.0 as usize), length) {
+                (
+                    Some(Type::Array {
+                        item,
+                        length: source_length,
+                    }),
+                    Some(length),
+                ) if *item == expression.ty && source_length == length => {}
+                (Some(Type::Slice(item)), None) if *item == expression.ty => {}
+                (Some(Type::Bytes), None)
+                    if matches!(types.get(expression.ty.0 as usize), Some(Type::U8)) => {}
+                _ => {
+                    errors.push("index expression has an invalid source or result type".to_owned())
+                }
+            }
+        }
+        TypedExprKind::SliceFromArray { value, length } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!((types.get(value.ty.0 as usize), types.get(expression.ty.0 as usize)),
+                (Some(Type::Array { item: source, length: source_length }), Some(Type::Slice(item)))
+                    if source == item && source_length == length)
+            {
+                errors.push("slice construction has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::SliceSubslice {
+            value,
+            start,
+            length,
+        } => {
+            for child in [value.as_ref(), start.as_ref(), length.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            if value.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Slice(_)))
+                || !matches!(types.get(start.ty.0 as usize), Some(Type::Usize))
+                || !matches!(types.get(length.ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push("subslice expression has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::SliceCopy(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if value.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Slice(_)))
+            {
+                errors.push("slice copy has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::StringBytes(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::String))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push("string bytes conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BytesFromList(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(
+                types.get(value.ty.0 as usize),
+                Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::U8))
+            ) || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push("bytes from-list conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BytesToList(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Bytes))
+                || !matches!(
+                    types.get(expression.ty.0 as usize),
+                    Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::U8))
+                )
+            {
+                errors.push("bytes to-list conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BytesSlice {
+            value,
+            start,
+            length,
+        } => {
+            for child in [value.as_ref(), start.as_ref(), length.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            if value.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bytes))
+                || !matches!(types.get(start.ty.0 as usize), Some(Type::Usize))
+                || !matches!(types.get(length.ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push("bytes slice has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::CollectionLength {
+            value,
+            known_length,
+        } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let valid_source = match (types.get(value.ty.0 as usize), known_length) {
+                (Some(Type::Array { length, .. }), Some(known)) => length == known,
+                (Some(Type::String | Type::Bytes | Type::Slice(_) | Type::Map { .. }), None) => {
+                    true
+                }
+                _ => false,
+            };
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::Usize)) || !valid_source {
+                errors.push("collection length has incorrect types".to_owned());
             }
         }
         TypedExprKind::Array(elements) => {
@@ -3595,6 +4744,104 @@ fn verify_expr(
                 if components.is_some_and(|pair| pair != (key.ty, value.ty)) {
                     errors.push("map entry has incorrect types".to_owned());
                 }
+            }
+        }
+        TypedExprKind::MapPut { map, key, value } => {
+            for child in [map.as_ref(), key.as_ref(), value.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            match types.get(expression.ty.0 as usize) {
+                Some(Type::Map {
+                    key: expected_key,
+                    value: expected_value,
+                }) if map.ty == expression.ty
+                    && key.ty == *expected_key
+                    && value.ty == *expected_value => {}
+                _ => errors.push("map put expression has incorrect types".to_owned()),
+            }
+        }
+        TypedExprKind::MapRemove { map, key } => {
+            for child in [map.as_ref(), key.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            match types.get(expression.ty.0 as usize) {
+                Some(Type::Map {
+                    key: expected_key, ..
+                }) if map.ty == expression.ty && key.ty == *expected_key => {}
+                _ => errors.push("map remove expression has incorrect types".to_owned()),
+            }
+        }
+        TypedExprKind::MapFetch { map, key } => {
+            for child in [map.as_ref(), key.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            let valid = match types.get(map.ty.0 as usize) {
+                Some(Type::Map {
+                    key: expected_key,
+                    value,
+                }) if key.ty == *expected_key => {
+                    matches!(
+                        types.get(expression.ty.0 as usize),
+                        Some(Type::Union(members)) if members.iter().any(|member| {
+                            matches!(types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none")
+                        }) && members.iter().any(|member| {
+                            matches!(types.get(member.0 as usize), Some(Type::Tuple(items)) if items.len() == 2
+                                && items[1] == *value
+                                && matches!(types.get(items[0].0 as usize), Some(Type::Atom(name)) if name == "some"))
+                        })
+                    )
+                }
+                _ => false,
+            };
+            if !valid {
+                errors.push("map fetch expression has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::MapToList(map) => {
+            verify_expr(
+                map,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let valid = match (
+                types.get(map.ty.0 as usize),
+                types.get(expression.ty.0 as usize),
+            ) {
+                (Some(Type::Map { key, value }), Some(Type::List(pair))) => {
+                    matches!(types.get(pair.0 as usize), Some(Type::Tuple(items)) if items.as_slice() == [*key, *value])
+                }
+                _ => false,
+            };
+            if !valid {
+                errors.push("map to-list expression has incorrect types".to_owned());
             }
         }
         TypedExprKind::If {
@@ -3757,8 +5004,10 @@ fn verify_expr(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = matches!(types.get(left.ty.0 as usize), Some(Type::I32 | Type::I64))
-                || (!ordered && matches!(types.get(left.ty.0 as usize), Some(Type::Bool)));
+            let supported = matches!(
+                types.get(left.ty.0 as usize),
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
+            ) || (!ordered && standard_eq_type(types, left.ty));
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
             }
@@ -3825,6 +5074,41 @@ fn verify_expr(
             }
         }
         _ => {}
+    }
+}
+
+fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(
+            Type::I32
+            | Type::I64
+            | Type::Usize
+            | Type::Bool
+            | Type::Unit
+            | Type::String
+            | Type::Bytes
+            | Type::U8
+            | Type::Atom(_),
+        ) => true,
+        Some(Type::List(item) | Type::Slice(item)) => standard_eq_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_eq_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_eq_type(types, *item)),
+        Some(Type::Map { key, value }) => {
+            standard_hash_type(types, *key) && standard_eq_type(types, *value)
+        }
+        _ => false,
+    }
+}
+
+fn standard_hash_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(Type::Map { .. } | Type::Function { .. } | Type::Union(_) | Type::Struct { .. })
+        | Some(Type::Parameter { .. })
+        | None => false,
+        Some(Type::List(item) | Type::Slice(item)) => standard_hash_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_hash_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_hash_type(types, *item)),
+        Some(_) => true,
     }
 }
 
@@ -3935,12 +5219,16 @@ impl TypedProgram {
         match &self.types[id.0 as usize] {
             Type::I32 => "i32".to_owned(),
             Type::I64 => "i64".to_owned(),
+            Type::Usize => "usize".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
             Type::String => "string".to_owned(),
+            Type::Bytes => "bytes".to_owned(),
+            Type::U8 => "u8".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.display_type(*item)),
+            Type::Slice(item) => format!("Slice({})", self.display_type(*item)),
             Type::Map { key, value } => format!(
                 "Map({}, {})",
                 self.display_type(*key),
@@ -4019,6 +5307,15 @@ fn write_items(program: &TypedProgram, output: &mut String, items: &[TypedItem],
                 output.push_str(&format!("{indent}assign s{}\n", symbol.0));
                 write_expr(program, output, value, depth + 1);
             }
+            TypedItem::StructFieldAssign {
+                symbol,
+                field,
+                value,
+                ..
+            } => {
+                output.push_str(&format!("{indent}field assign s{} .{}\n", symbol.0, field));
+                write_expr(program, output, value, depth + 1);
+            }
             TypedItem::Expr(expression) => write_expr(program, output, expression, depth),
             TypedItem::Return(expression) => {
                 output.push_str(&format!("{indent}return\n"));
@@ -4067,9 +5364,27 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::String(value) => format!("string {value:?}"),
         TypedExprKind::Atom(name) => format!("atom :{name}"),
         TypedExprKind::List { .. } => "list".to_owned(),
+        TypedExprKind::ListReverse(_) => "list reverse".to_owned(),
         TypedExprKind::Array(_) => "array".to_owned(),
         TypedExprKind::Map(_) => "map".to_owned(),
+        TypedExprKind::MapPut { .. } => "map put".to_owned(),
+        TypedExprKind::MapRemove { .. } => "map remove".to_owned(),
+        TypedExprKind::MapFetch { .. } => "map fetch".to_owned(),
+        TypedExprKind::MapToList(_) => "map to list".to_owned(),
         TypedExprKind::Tuple(_) => "tuple".to_owned(),
+        TypedExprKind::Struct { declaration, .. } => format!("struct d{}", declaration.0),
+        TypedExprKind::StructProject {
+            declaration, field, ..
+        } => format!("struct project d{} .{}", declaration.0, field),
+        TypedExprKind::Index { .. } => "index".to_owned(),
+        TypedExprKind::SliceFromArray { .. } => "slice from array".to_owned(),
+        TypedExprKind::SliceSubslice { .. } => "subslice".to_owned(),
+        TypedExprKind::SliceCopy(_) => "slice copy".to_owned(),
+        TypedExprKind::StringBytes(_) => "string bytes".to_owned(),
+        TypedExprKind::BytesFromList(_) => "bytes from list".to_owned(),
+        TypedExprKind::BytesToList(_) => "bytes to list".to_owned(),
+        TypedExprKind::BytesSlice { .. } => "bytes slice".to_owned(),
+        TypedExprKind::CollectionLength { .. } => "collection length".to_owned(),
         TypedExprKind::If { .. } => "if".to_owned(),
         TypedExprKind::Match { exhaustive, .. } => format!("match exhaustive={exhaustive}"),
         TypedExprKind::Ascription(_) => "ascription".to_owned(),
@@ -4117,10 +5432,51 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
                 write_expr(program, output, tail, depth + 1);
             }
         }
+        TypedExprKind::ListReverse(value) | TypedExprKind::MapToList(value) => {
+            write_expr(program, output, value, depth + 1);
+        }
         TypedExprKind::Tuple(elements) => {
             for element in elements {
                 write_expr(program, output, element, depth + 1);
             }
+        }
+        TypedExprKind::Struct { fields, .. } => {
+            for (_, value) in fields {
+                write_expr(program, output, value, depth + 1);
+            }
+        }
+        TypedExprKind::StructProject { value, .. } => {
+            write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::Index { value, index, .. } => {
+            write_expr(program, output, value, depth + 1);
+            write_expr(program, output, index, depth + 1);
+        }
+        TypedExprKind::SliceFromArray { value, .. }
+        | TypedExprKind::SliceCopy(value)
+        | TypedExprKind::StringBytes(value)
+        | TypedExprKind::BytesFromList(value)
+        | TypedExprKind::BytesToList(value)
+        | TypedExprKind::CollectionLength { value, .. } => {
+            write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::SliceSubslice {
+            value,
+            start,
+            length,
+        } => {
+            write_expr(program, output, value, depth + 1);
+            write_expr(program, output, start, depth + 1);
+            write_expr(program, output, length, depth + 1);
+        }
+        TypedExprKind::BytesSlice {
+            value,
+            start,
+            length,
+        } => {
+            write_expr(program, output, value, depth + 1);
+            write_expr(program, output, start, depth + 1);
+            write_expr(program, output, length, depth + 1);
         }
         TypedExprKind::Array(elements) => {
             for element in elements {
@@ -4132,6 +5488,19 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
                 write_expr(program, output, key, depth + 1);
                 write_expr(program, output, value, depth + 1);
             }
+        }
+        TypedExprKind::MapPut { map, key, value } => {
+            write_expr(program, output, map, depth + 1);
+            write_expr(program, output, key, depth + 1);
+            write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::MapRemove { map, key } => {
+            write_expr(program, output, map, depth + 1);
+            write_expr(program, output, key, depth + 1);
+        }
+        TypedExprKind::MapFetch { map, key } => {
+            write_expr(program, output, map, depth + 1);
+            write_expr(program, output, key, depth + 1);
         }
         TypedExprKind::If {
             condition,

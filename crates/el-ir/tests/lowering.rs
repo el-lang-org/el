@@ -65,6 +65,7 @@ fn concrete_types_carry_collector_independent_managed_classification() {
         item: string_ty,
         length: 2,
     });
+    let slice = add(Type::Slice(string_ty));
     let function = add(Type::Function {
         parameters: vec![string_ty],
         result: i64_ty,
@@ -90,7 +91,7 @@ fn concrete_types_carry_collector_independent_managed_classification() {
         managed_value_class(&concrete, function),
         Some(ManagedValueClass::Unmanaged)
     );
-    for ty in [string_ty, tuple, union, array, structure] {
+    for ty in [string_ty, tuple, union, array, slice, structure] {
         assert_eq!(
             managed_value_class(&concrete, ty),
             Some(ManagedValueClass::ContainsBaseReferences)
@@ -812,6 +813,30 @@ fn lowers_lists_tagged_tuples_and_union_injection_in_order() {
 }
 
 #[test]
+fn lowers_list_reverse_as_an_allocating_verified_operation() {
+    let module = lowered(
+        "defmodule Main do\n  def reverse(values: [a]) -> [a] do\n    List.reverse(values)\n  end\n  def main() -> i32 do\n    values: [i32] = reverse([1, 42])\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\nend\n",
+    );
+    let reverse = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::ListReverse { .. }))
+        .expect("List.reverse has an explicit Core operation");
+
+    assert_eq!(
+        operation_collection_effect(reverse),
+        CollectionEffect::MayCollect
+    );
+    assert!(module.debug_text().contains("list_reverse"));
+    verify(&module).expect("list reverse Core IR verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("list reverse specializes");
+    verify_concrete(&concrete).expect("specialized list reverse verifies");
+}
+
+#[test]
 fn lowers_arrays_and_maps_in_source_order() {
     let module = lowered(
         "defmodule Main do\n  def array() -> [i64; 2] do\n    #[1, 2]\n  end\n  def map() -> Map(i64, bool) do\n    %{1 => true, 2 => false}\n  end\nend\n",
@@ -820,6 +845,59 @@ fn lowers_arrays_and_maps_in_source_order() {
     assert!(debug.contains("array #[v0, v1]"));
     assert!(debug.contains("map %{v0 => v1, v2 => v3}"));
     verify(&module).expect("collection Core IR verifies");
+}
+
+#[test]
+fn lowers_fixed_array_indexing_with_an_explicit_bounds_failure() {
+    let module = lowered(
+        "defmodule Main do\n  def get(values: [i32; 2], index: usize) -> i32 do\n    values[index]\n  end\n  def main() -> i32 do\n    get(#[40, 2], 1)\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("index"));
+    assert!(debug.contains("IndexOutOfBounds"));
+    assert!(
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .any(|block| matches!(
+                block.terminator,
+                Terminator::Failure {
+                    category: CoreFailureCategory::IndexOutOfBounds,
+                    ..
+                }
+            ))
+    );
+    verify(&module).expect("indexed array Core IR verifies");
+}
+
+#[test]
+fn lowers_managed_slice_views_copy_length_and_indexing() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    array: [i32; 3] = #[10, 20, 30]\n    whole = Slice.from_array(array)\n    part = Slice.subslice(whole, 1, 2)\n    copy = Slice.copy(part)\n    length = Slice.length(copy)\n    copy[1]\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("slice_from_array"));
+    assert!(debug.contains("subslice"));
+    assert!(debug.contains("slice_copy"));
+    assert!(debug.contains("collection_length"));
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .filter(|block| matches!(
+                block.terminator,
+                Terminator::Failure {
+                    category: CoreFailureCategory::IndexOutOfBounds,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "subslice and index share deterministic bounds-failure blocks by origin"
+    );
+    verify(&module).expect("slice Core IR verifies");
 }
 
 #[test]
@@ -995,4 +1073,239 @@ fn lowers_structural_pattern_tests_projections_and_bindings() {
     assert!(debug.contains("tuple_project"));
     assert!(debug.contains("struct_project"));
     verify(&module).expect("structural pattern Core verifies");
+}
+
+#[test]
+fn lowers_struct_construction_projection_and_update_as_reconstruction() {
+    let module = lowered(
+        "defmodule Main do\n  defstruct Pair(a) do\n    first: a\n    second: i32\n  end\n  def main() -> i32 do\n    mut pair: Pair(i32) = %Pair{second: 2, first: 40}\n    copy = pair\n    pair.second := pair.second + copy.second\n    pair.first + pair.second\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::Struct { .. }))
+            .count(),
+        2,
+        "literal construction and field update each construct a value"
+    );
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        Operation::Struct { fields, .. } if fields.iter().map(|(index, _)| *index).collect::<Vec<_>>() == vec![1, 0]
+    )), "literal initializer evaluation order remains source order");
+    verify(&module).expect("struct Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("struct specialization");
+    verify_concrete(&concrete).expect("concrete struct Core verifies");
+}
+
+#[test]
+fn lowers_managed_map_construction_and_size() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    values: Map(i32, i32) = %{1 => 10, 2 => 20}\n    if Map.size(values) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    let map = operations
+        .iter()
+        .find(|operation| matches!(operation, Operation::Map { .. }))
+        .expect("map construction operation");
+    assert_eq!(
+        operation_collection_effect(map),
+        CollectionEffect::MayCollect
+    );
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        Operation::CollectionLength {
+            known_length: None,
+            ..
+        }
+    )));
+    verify(&module).expect("map construction and size Core verifies");
+}
+
+#[test]
+fn lowers_utf8_string_byte_size_as_verified_o1_length() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    if String.byte_size(\"é🙂\") == 7 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        Operation::CollectionLength {
+            known_length: None,
+            ..
+        }
+    )));
+    verify(&module).expect("string byte size Core verifies");
+}
+
+#[test]
+fn lowers_string_bytes_and_byte_slices_as_retained_views() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    data = String.bytes(\"é🙂\")\n    view = Bytes.slice(data, 1, 2)\n    if Bytes.byte_size(view) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("string_bytes"), "{debug}");
+    assert!(debug.contains("bytes_slice"), "{debug}");
+    assert!(debug.contains("IndexOutOfBounds"), "{debug}");
+    verify(&module).expect("byte-view Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("byte views specialize");
+    verify_concrete(&concrete).expect("concrete byte-view Core verifies");
+    let bytes = concrete
+        .types
+        .iter()
+        .position(|ty| matches!(ty, Type::Bytes))
+        .map(|index| TypeId(index as u32))
+        .expect("concrete bytes type");
+    assert_eq!(
+        managed_value_class(&concrete, bytes),
+        Some(ManagedValueClass::ContainsBaseReferences)
+    );
+}
+
+#[test]
+fn lowers_allocating_bytes_list_conversions() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    values = Bytes.to_list(Bytes.from_list([0, 127, 255]))\n    if List.reverse(values) == [255, 127, 0] do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("bytes_from_list"), "{debug}");
+    assert!(debug.contains("bytes_to_list"), "{debug}");
+    for operation in module.functions.iter().flat_map(|function| {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+    }) {
+        if matches!(
+            operation,
+            Operation::BytesFromList { .. } | Operation::BytesToList { .. }
+        ) {
+            assert_eq!(
+                operation_collection_effect(operation),
+                CollectionEffect::MayCollect
+            );
+        }
+    }
+    verify(&module).expect("byte/list conversion Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("byte/list conversions specialize");
+    verify_concrete(&concrete).expect("concrete byte/list conversion Core verifies");
+}
+
+#[test]
+fn lowers_checked_byte_indexing_to_u8() {
+    let module = lowered(
+        "defmodule Main do\n  def first(data: bytes, index: usize) -> u8 do\n    data[index]\n  end\n  def main() -> i32 do\n    if first(String.bytes(\"abc\"), 0) == 97 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("index"), "{debug}");
+    assert!(debug.contains("IndexOutOfBounds"), "{debug}");
+    assert!(module.functions.iter().any(|function| {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|operation| {
+                matches!(
+                    operation,
+                    Operation::ArrayIndex { ty, .. }
+                        if matches!(module.types.get(ty.0 as usize), Some(Type::U8))
+                )
+            })
+    }));
+    verify(&module).expect("byte-index Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("byte index specializes");
+    verify_concrete(&concrete).expect("concrete byte-index Core verifies");
+}
+
+#[test]
+fn lowers_immutable_map_put_and_remove_as_allocating_operations() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    original: Map(i32, i32) = %{1 => 10, 2 => 20}\n    updated = Map.put(original, 2, 22)\n    removed = Map.remove(updated, 1)\n    fetched = Map.fetch(updated, 2)\n    if Map.size(removed) == 1 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    for operation in operations.iter().filter(|operation| {
+        matches!(
+            operation,
+            Operation::MapPut { .. } | Operation::MapRemove { .. }
+        )
+    }) {
+        assert_eq!(
+            operation_collection_effect(operation),
+            CollectionEffect::MayCollect
+        );
+    }
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::MapPut { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::MapRemove { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::MapFetch { .. }))
+            .count(),
+        1
+    );
+    verify(&module).expect("map update Core verifies");
+}
+
+#[test]
+fn lowers_map_order_view_and_structural_equality() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    left: Map({i32, i32}, i32) = %{{1, 2} => 10, {3, 4} => 20}\n    right: Map({i32, i32}, i32) = %{{3, 4} => 20, {1, 2} => 10}\n    ordered = Enum.to_list(left)\n    if left == right do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    let to_list = operations
+        .iter()
+        .find(|operation| matches!(operation, Operation::MapToList { .. }))
+        .expect("map order becomes an explicit Core operation");
+    assert_eq!(
+        operation_collection_effect(to_list),
+        CollectionEffect::MayCollect
+    );
+    assert!(operations.iter().any(|operation| matches!(
+        operation,
+        Operation::Compare {
+            operator: el_ir::ComparisonOperator::Equal,
+            ..
+        }
+    )));
+    verify(&module).expect("map order and equality Core verify");
 }

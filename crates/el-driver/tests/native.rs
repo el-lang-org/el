@@ -60,6 +60,107 @@ fn compile_runtime_failure_stub(directory: &Path) -> PathBuf {
     object
 }
 
+#[test]
+fn utf8_string_byte_size_runs_in_development_and_release() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  def main() -> i32 do\n    if String.byte_size(\"é🙂\") == 7 and String.byte_size(\"\") == 0 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-string-byte-size"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "UTF-8 byte length must count encoded bytes in {label}"
+        );
+    }
+}
+
+#[test]
+fn immutable_byte_views_share_backing_and_check_bounds_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def main() -> i32 do\n    data = String.bytes(\"é🙂\")\n    middle = Bytes.slice(data, 1, 5)\n    tail = Bytes.slice(middle, 2, 3)\n    if Bytes.byte_size(data) == 7 and Bytes.byte_size(middle) == 5 and Bytes.byte_size(tail) == 3 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    Bytes.slice(String.bytes(\"abc\"), 2, 2)\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-byte-views"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "byte views preserve byte lengths in {label}"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-byte-view-bounds"),
+                out_of_bounds,
+                profile,
+            )
+            .code(),
+            Some(105),
+            "Bytes.slice uses index_out_of_bounds in {label}"
+        );
+    }
+}
+
+#[test]
+fn byte_indexing_reads_u8_and_checks_bounds_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def main() -> i32 do\n    data = String.bytes(\"é🙂\")\n    accent = String.bytes(\"é\")\n    tail = Bytes.slice(data, 3, 4)\n    if data[0] == 101 and data[1] == 204 and tail[0] == 240 and accent[0] > 100 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    data = String.bytes(\"abc\")\n    data[3]\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-byte-index"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "byte indexing reads unsigned UTF-8 bytes in {label}"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-byte-index-bounds"),
+                out_of_bounds,
+                profile,
+            )
+            .code(),
+            Some(105),
+            "bytes indexing uses index_out_of_bounds in {label}"
+        );
+    }
+}
+
 fn build_and_run(
     directory: &Path,
     runtime: &Path,
@@ -90,6 +191,19 @@ fn build_and_run_managed(
     source: &str,
     profile: BuildProfile,
 ) -> ExitStatus {
+    let executable = build_managed_executable(directory, name, source, profile);
+    Command::new(executable)
+        .status()
+        .expect("run managed native executable")
+}
+
+#[cfg(feature = "gc-stress-test")]
+fn build_managed_executable(
+    directory: &Path,
+    name: &str,
+    source: &str,
+    profile: BuildProfile,
+) -> PathBuf {
     let mut sources = SourceMap::new();
     let file = sources.add_file("src/main.el", source);
     let generic = analyze_source(file, source).expect("source reaches Generic Core");
@@ -102,9 +216,7 @@ fn build_and_run_managed(
         .expect("emit managed host object");
     link_host_managed_executable(&[object.as_path()], &executable)
         .expect("link managed native executable");
-    Command::new(executable)
-        .status()
-        .expect("run managed native executable")
+    executable
 }
 
 #[cfg(feature = "gc-stress-test")]
@@ -127,6 +239,229 @@ fn managed_lists_survive_every_allocation_collection_in_all_root_positions() {
             .code(),
             Some(42),
             "reachable list graph must survive collection at every allocation in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn list_reverse_preserves_nested_managed_items_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def head(values: [i32]) -> i32 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4]\n      head(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    values: [[i32]] = [[42], [1]]\n    reversed = List.reverse(values)\n    pressure(256)\n    original = match values do\n      [first | _] -> head(first)\n      [] -> 0\n    end\n    answer = match reversed do\n      [_ | tail] -> match tail do\n        [item | _] -> head(item)\n        [] -> 0\n      end\n      [] -> 0\n    end\n    if original == 42 do\n      answer\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-list-reverse-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "List.reverse must preserve nested managed items and order in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn bytes_list_conversions_are_fresh_and_survive_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def head(values: [u8]) -> u8 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [u8] = Bytes.to_list(Bytes.from_list([1, 2, 3, 4]))\n      head(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    original: [u8] = [42, 127, 255]\n    data = Bytes.from_list(original)\n    copy = Bytes.to_list(data)\n    empty = Bytes.from_list([])\n    empty_list: [u8] = Bytes.to_list(empty)\n    pressure(256)\n    if original == copy and data[0] == 42 and data[2] == 255 and Bytes.byte_size(empty) == 0 and empty_list == [] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-bytes-list-conversion-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "byte/list conversions preserve values and roots in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn managed_slices_retain_nested_backing_and_copy_in_both_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def head(values: [i32]) -> i32 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4]\n      head(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    array: [[i32]; 2] = #[[1], [42]]\n    whole = Slice.from_array(array)\n    part = Slice.subslice(whole, 1, 1)\n    copy = Slice.copy(part)\n    pressure(256)\n    head(copy[0])\n  end\nend\n";
+    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    values: [i32; 2] = #[1, 2]\n    Slice.subslice(Slice.from_array(values), 1, 2)[0]\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-managed-slice-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "slice views and copies must retain nested managed elements in {label}"
+        );
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-managed-slice-bounds"),
+                out_of_bounds,
+                profile,
+            )
+            .code(),
+            Some(1),
+            "managed runtime must terminate nonzero on subslice bounds failure in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn managed_map_literals_and_size_survive_gc_stress_in_both_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4]\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    values: Map(i32, [i32]) = %{1 => [1], 2 => [2], 1 => [42], 3 => [3]}\n    pressure(256)\n    if Map.size(values) == 3 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-managed-map-size"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "managed map nodes and duplicate replacement must survive collection at every allocation in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn immutable_map_put_remove_and_reinsert_preserve_sizes_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def head(values: [i32]) -> i32 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def some_value(value: {:some, [i32]}) -> i32 do\n    match value do\n      {:some, values} -> head(values)\n    end\n  end\n  def fetched(map: Map(i32, [i32]), key: i32) -> i32 do\n    match Map.fetch(map, key) do\n      some: {:some, [i32]} -> some_value(some)\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n    empty: Map(i32, [i32]) = Map.new()\n    from_empty = Map.put(empty, 7, [7])\n    original: Map(i32, [i32]) = %{1 => [1], 2 => [2], 3 => [3]}\n    replaced = Map.put(original, 2, [42])\n    appended = Map.put(replaced, 4, [4])\n    removed = Map.remove(appended, 2)\n    reinserted = Map.put(removed, 2, [22])\n    absent_removed = Map.remove(reinserted, 99)\n    if Map.size(empty) == 0 and Map.size(from_empty) == 1 and Map.size(original) == 3 and Map.size(replaced) == 3 and Map.size(appended) == 4 and Map.size(removed) == 3 and Map.size(reinserted) == 4 and Map.size(absent_removed) == 4 and fetched(from_empty, 7) == 7 and fetched(original, 2) == 2 and fetched(replaced, 2) == 42 and fetched(removed, 2) == 0 and fetched(reinserted, 2) == 22 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-immutable-map-updates"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "map updates and fetches must preserve source values and cardinality in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn managed_map_values_survive_each_api_operation() {
+    let temp = TempDir::new();
+    let prefix = "defmodule Main do\n  def head(values: [i32]) -> i32 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def some_value(value: {:some, [i32]}) -> i32 do\n    match value do\n      {:some, values} -> head(values)\n    end\n  end\n  def fetched(map: Map(i32, [i32]), key: i32) -> i32 do\n    match Map.fetch(map, key) do\n      some: {:some, [i32]} -> some_value(some)\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n";
+    let cases = [
+        (
+            "literal",
+            "    map: Map(i32, [i32]) = %{1 => [42]}\n    fetched(map, 1)\n",
+        ),
+        (
+            "put-empty",
+            "    map: Map(i32, [i32]) = Map.put(Map.new(), 7, [42])\n    fetched(map, 7)\n",
+        ),
+        (
+            "replace",
+            "    map: Map(i32, [i32]) = Map.put(%{1 => [1], 2 => [2]}, 2, [42])\n    fetched(map, 2)\n",
+        ),
+        (
+            "remove",
+            "    map: Map(i32, [i32]) = Map.remove(%{1 => [1], 2 => [42]}, 1)\n    fetched(map, 2)\n",
+        ),
+        (
+            "reinsert",
+            "    map: Map(i32, [i32]) = Map.put(Map.remove(%{1 => [1], 2 => [2]}, 1), 1, [42])\n    fetched(map, 1)\n",
+        ),
+    ];
+    for (label, body) in cases {
+        let source = format!("{prefix}{body}  end\nend\n");
+        assert_eq!(
+            build_and_run_managed(&temp.0, label, &source, BuildProfile::Development).code(),
+            Some(42),
+            "managed map value failed after {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn seeded_composite_maps_preserve_order_and_ignore_order_for_equality() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def ordered(values: [{{i32, i32}, i32}]) -> bool do\n    match values do\n      [{{2, 2}, 20} | tail] -> match tail do\n        [{{1, 1}, 13} | rest] -> match rest do\n          [] -> true\n          [_ | _] -> false\n        end\n        [_ | _] -> false\n        [] -> false\n      end\n      [_ | _] -> false\n      [] -> false\n    end\n  end\n  def main() -> i32 do\n    literal: Map({i32, i32}, i32) = %{{1, 1} => 10, {2, 2} => 20, {1, 1} => 11}\n    replaced = Map.put(literal, {1, 1}, 12)\n    reordered = Map.put(Map.remove(replaced, {1, 1}), {1, 1}, 13)\n    equal_different_order: Map({i32, i32}, i32) = %{{1, 1} => 13, {2, 2} => 20}\n    unequal_value: Map({i32, i32}, i32) = %{{1, 1} => 99, {2, 2} => 20}\n    if ordered(Enum.to_list(reordered)) and reordered == equal_different_order and reordered != unequal_value and Map.size(literal) == 2 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        let executable = build_managed_executable(
+            &temp.0,
+            &format!("{label}-seeded-composite-map"),
+            source,
+            profile,
+        );
+        for seed in ["1", "2", "18446744073709551615"] {
+            assert_eq!(
+                Command::new(&executable)
+                    .env("EL_MAP_HASH_SEED", seed)
+                    .status()
+                    .expect("run map conformance executable")
+                    .code(),
+                Some(42),
+                "map order and equality must be stable for seed {seed} in {label}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn every_standard_composite_map_key_uses_structural_hash_and_equality() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def main() -> i32 do\n    list_keys: Map([i32], i32) = %{[1, 2] => 1, [1, 2] => 2}\n    array_keys: Map([i32; 2], i32) = %{#[1, 2] => 1, #[1, 2] => 2}\n    first_array: [i32; 2] = #[1, 2]\n    second_array: [i32; 2] = #[1, 2]\n    first_slice = Slice.from_array(first_array)\n    second_slice = Slice.from_array(second_array)\n    slice_keys: Map(Slice(i32), i32) = %{first_slice => 1, second_slice => 2}\n    first_bytes = String.bytes(\"same\")\n    second_bytes = String.bytes(\"same\")\n    byte_keys: Map(bytes, i32) = %{first_bytes => 1, second_bytes => 2}\n    string_keys: Map(string, i32) = %{\"same\" => 1, \"same\" => 2}\n    inner_left: Map(i32, i32) = %{1 => 10, 2 => 20}\n    inner_right: Map(i32, i32) = %{2 => 20, 1 => 10}\n    outer_left: Map(i32, Map(i32, i32)) = %{7 => inner_left}\n    outer_right: Map(i32, Map(i32, i32)) = %{7 => inner_right}\n    if Map.size(list_keys) == 1 and Map.size(array_keys) == 1 and Map.size(slice_keys) == 1 and Map.size(byte_keys) == 1 and Map.size(string_keys) == 1 and outer_left == outer_right do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-all-composite-map-keys"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "all standard composite keys must use structural Eq/Hash in {label}"
         );
     }
 }
@@ -204,6 +539,69 @@ fn development_and_release_preserve_arithmetic_exit_semantics() {
             .code(),
             Some(101),
             "integer_overflow must retain runtime category 1 in both profiles"
+        );
+    }
+}
+
+#[test]
+fn struct_values_preserve_copy_and_reconstruction_semantics_natively() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  defstruct Pair(a) do\n    first: a\n    second: i32\n  end\n  def main() -> i32 do\n    mut pair: Pair(i32) = %Pair{second: 1, first: 40}\n    copy = pair\n    pair.second := 2\n    copy.first + copy.second + pair.second - 1\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-struct"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "struct copies must remain unchanged after root reconstruction in {label}"
+        );
+    }
+}
+
+#[test]
+fn fixed_array_indexing_is_checked_in_development_and_release() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def get(values: [i32; 3], index: usize) -> i32 do\n    values[index]\n  end\n  def main() -> i32 do\n    get(#[1, 42, 3], 1)\n  end\nend\n";
+    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    values: [i32; 2] = #[1, 2]\n    values[2]\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-array-index"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "fixed-array indexing must select the requested element in {label}"
+        );
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-array-bounds"),
+                out_of_bounds,
+                profile,
+            )
+            .code(),
+            Some(105),
+            "index_out_of_bounds must retain runtime category 5 in {label}"
         );
     }
 }

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 /// Current private compiler/runtime ABI revision.
-pub const PRIVATE_ABI_VERSION: u32 = 1;
+pub const PRIVATE_ABI_VERSION: u32 = 2;
 
 /// Symbol called by generated code for source-mandated unrecoverable failures.
 pub const FAILURE_SYMBOL: &str = "__el_runtime_fail";
@@ -21,6 +21,8 @@ pub const ALLOCATE_SCANNED_SYMBOL: &str = "__el_runtime_alloc_scanned";
 pub const ALLOCATE_ATOMIC_SYMBOL: &str = "__el_runtime_alloc_atomic";
 /// Registers compiler-emitted scanned global storage with the collector.
 pub const REGISTER_GLOBALS_SYMBOL: &str = "__el_runtime_register_managed_globals";
+/// Returns the opaque process-local seed used by generated map hashers.
+pub const HASH_SEED_SYMBOL: &str = "__el_runtime_hash_seed";
 
 /// Static archives required when linking a managed EL executable.
 #[cfg(feature = "boehm")]
@@ -63,7 +65,9 @@ pub enum RuntimeCallEffect {
 #[must_use]
 pub fn runtime_call_effect(symbol: &str) -> Option<RuntimeCallEffect> {
     match symbol {
-        INITIALIZE_SYMBOL | REGISTER_GLOBALS_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
+        INITIALIZE_SYMBOL | REGISTER_GLOBALS_SYMBOL | HASH_SEED_SYMBOL => {
+            Some(RuntimeCallEffect::NonAllocating)
+        }
         ALLOCATE_SCANNED_SYMBOL | ALLOCATE_ATOMIC_SYMBOL => Some(RuntimeCallEffect::Allocating),
         FAILURE_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         _ => None,
@@ -111,8 +115,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_abi_starts_at_one() {
-        assert_eq!(PRIVATE_ABI_VERSION, 1);
+    fn private_abi_tracks_the_seeded_map_runtime_boundary() {
+        assert_eq!(PRIVATE_ABI_VERSION, 2);
     }
 
     #[test]
