@@ -221,6 +221,7 @@ pub enum Constant {
     Integer(i128),
     Boolean(bool),
     Unit,
+    String(String),
     Atom(String),
 }
 
@@ -576,6 +577,11 @@ impl<'a> Lowerer<'a> {
                 self.constant(Constant::Boolean(*value), expression.ty, expression.span)
             }
             TypedExprKind::Unit => self.constant(Constant::Unit, expression.ty, expression.span),
+            TypedExprKind::String(value) => self.constant(
+                Constant::String(value.clone()),
+                expression.ty,
+                expression.span,
+            ),
             TypedExprKind::Atom(name) => {
                 self.constant(Constant::Atom(name.clone()), expression.ty, expression.span)
             }
@@ -1520,6 +1526,7 @@ enum NormalizedType {
     I64,
     Bool,
     Unit,
+    String,
     Atom(String),
     List(Box<Self>),
     Array {
@@ -1838,6 +1845,7 @@ impl<'a> Monomorphizer<'a> {
             Type::I64 => NormalizedType::I64,
             Type::Bool => NormalizedType::Bool,
             Type::Unit => NormalizedType::Unit,
+            Type::String => NormalizedType::String,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
                 NormalizedType::List(Box::new(self.normalize(*item, substitution)?))
@@ -2032,6 +2040,7 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::I64 => return TypeId(1),
             NormalizedType::Bool => return TypeId(2),
             NormalizedType::Unit => return TypeId(3),
+            NormalizedType::String => Type::String,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
             NormalizedType::Array { item, length } => Type::Array {
@@ -2155,6 +2164,7 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::I64
         | NormalizedType::Bool
         | NormalizedType::Unit
+        | NormalizedType::String
         | NormalizedType::Atom(_) => {}
     }
 }
@@ -2906,7 +2916,8 @@ fn verify_operation(
             let valid = match (constant, types.get(ty.0 as usize)) {
                 (Constant::Integer(_), Some(Type::I32 | Type::I64))
                 | (Constant::Boolean(_), Some(Type::Bool))
-                | (Constant::Unit, Some(Type::Unit)) => true,
+                | (Constant::Unit, Some(Type::Unit))
+                | (Constant::String(_), Some(Type::String)) => true,
                 (Constant::Atom(name), Some(Type::Atom(expected))) => name == expected,
                 _ => false,
             };

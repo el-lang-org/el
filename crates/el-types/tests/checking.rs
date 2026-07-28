@@ -673,3 +673,14 @@ fn structural_pattern_rejections_point_at_the_offending_source() {
         assert_eq!(diagnostic.primary.start(), source.rfind(offending).unwrap());
     }
 }
+
+#[test]
+fn checks_string_literals_and_exhaustive_integer_string_unions() {
+    let source = "defmodule Main do\n  @type Scalar = i64 | string\n  def choose(text: bool) -> Scalar do\n    if text do\n      \"forty-two\"\n    else\n      42\n    end\n  end\n  def classify(value: Scalar) -> i32 do\n    match value do\n      number: i64 -> 40\n      text: string -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(choose(true))\n  end\nend\n";
+
+    let typed = checked(source).expect("string union is well typed and exhaustive");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string \"forty-two\": string"), "{debug}");
+    assert!(debug.contains("inject string"), "{debug}");
+    assert!(debug.contains("match exhaustive=true"), "{debug}");
+}

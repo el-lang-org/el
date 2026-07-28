@@ -17,6 +17,7 @@ pub enum Type {
     I64,
     Bool,
     Unit,
+    String,
     Atom(String),
     List(TypeId),
     Array {
@@ -211,6 +212,7 @@ pub enum TypedExprKind {
     Integer(i128),
     Boolean(bool),
     Unit,
+    String(String),
     Atom(String),
     List {
         elements: Vec<TypedExpr>,
@@ -581,6 +583,7 @@ impl<'a> Checker<'a> {
                 "i64" => Some(TypeId(1)),
                 "bool" => Some(TypeId(2)),
                 "unit" => Some(TypeId(3)),
+                "string" => Some(self.intern(Type::String)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
                         "E2100",
@@ -1215,6 +1218,7 @@ impl<'a> Checker<'a> {
                 ty: TypeId(3),
                 span: node.span,
             }),
+            "string" => self.check_string(node),
             "atom" => self.check_atom(node),
             "list_literal" => self.check_list(node, expected, owner, scopes),
             "array_literal" => self.check_array(node, expected, owner, scopes),
@@ -1277,6 +1281,11 @@ impl<'a> Checker<'a> {
                 .iter()
                 .copied()
                 .filter(|member| matches!(self.types[member.0 as usize], Type::Unit))
+                .collect(),
+            "string" => members
+                .iter()
+                .copied()
+                .filter(|member| matches!(self.types[member.0 as usize], Type::String))
                 .collect(),
             "list_literal" => members
                 .iter()
@@ -1987,6 +1996,17 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_string(&mut self, node: &Node) -> Option<TypedExpr> {
+        let Some(Value::String { decoded, .. }) = &node.value else {
+            return None;
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::String(decoded.clone()),
+            ty: self.intern(Type::String),
+            span: node.span,
+        })
+    }
+
     fn check_name(&mut self, node: &Node, scopes: &[BTreeMap<String, Local>]) -> Option<TypedExpr> {
         let name = unqualified_name(node)?;
         if let Some(local) = lookup(scopes, &name) {
@@ -2387,7 +2407,7 @@ impl<'a> Checker<'a> {
                     .iter()
                     .any(|(parameter, required)| *parameter == ty && required == protocol)
             }),
-            Type::I32 | Type::I64 | Type::Bool | Type::Unit | Type::Atom(_) => {
+            Type::I32 | Type::I64 | Type::Bool | Type::Unit | Type::String | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
             }
             Type::List(item) => match protocol {
@@ -2437,6 +2457,7 @@ impl<'a> Checker<'a> {
             Type::I64 => "i64".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
+            Type::String => "string".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.type_name(*item)),
@@ -2496,6 +2517,7 @@ impl<'a> Checker<'a> {
             Type::I64 => "00:i64".to_owned(),
             Type::Bool => "00:bool".to_owned(),
             Type::Unit => "00:unit".to_owned(),
+            Type::String => "00:string".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
             Type::Array { item, length } => format!("02a:[{};{length}]", self.type_key(*item)),
@@ -2565,6 +2587,7 @@ fn unify_types(
         return bind_type_variable(types, right, left, substitutions);
     }
     match (&types[left.0 as usize], &types[right.0 as usize]) {
+        (Type::String, Type::String) => true,
         (Type::Atom(left), Type::Atom(right)) => left == right,
         (Type::List(left), Type::List(right)) => unify_types(types, *left, *right, substitutions),
         (
@@ -3402,6 +3425,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         TypedExprKind::Integer(_)
         | TypedExprKind::Boolean(_)
         | TypedExprKind::Unit
+        | TypedExprKind::String(_)
         | TypedExprKind::Atom(_) => {}
     }
 }
@@ -3437,6 +3461,11 @@ fn verify_expr(
         }
         TypedExprKind::Unit if !matches!(types.get(expression.ty.0 as usize), Some(Type::Unit)) => {
             errors.push("unit expression has a non-unit type".to_owned());
+        }
+        TypedExprKind::String(_)
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::String)) =>
+        {
+            errors.push("string expression has a non-string type".to_owned());
         }
         TypedExprKind::Atom(name) if !matches!(types.get(expression.ty.0 as usize), Some(Type::Atom(expected)) if expected == name) =>
         {
@@ -3908,6 +3937,7 @@ impl TypedProgram {
             Type::I64 => "i64".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
+            Type::String => "string".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.display_type(*item)),
@@ -4034,6 +4064,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::Integer(value) => format!("integer {value}"),
         TypedExprKind::Boolean(value) => format!("boolean {value}"),
         TypedExprKind::Unit => "unit".to_owned(),
+        TypedExprKind::String(value) => format!("string {value:?}"),
         TypedExprKind::Atom(name) => format!("atom :{name}"),
         TypedExprKind::List { .. } => "list".to_owned(),
         TypedExprKind::Array(_) => "array".to_owned(),

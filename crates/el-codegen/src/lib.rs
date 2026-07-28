@@ -162,7 +162,8 @@ pub fn compute_primitive_layouts(module: &ConcreteModule, abi: PrimitiveAbi) -> 
             Type::I64 => Some(abi.i64),
             Type::Bool => Some(abi.boolean),
             Type::Unit => Some(abi.unit),
-            Type::Atom(_)
+            Type::String
+            | Type::Atom(_)
             | Type::List(_)
             | Type::Array { .. }
             | Type::Map { .. }

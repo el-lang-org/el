@@ -295,10 +295,10 @@ fn native_unrecoverable_failure_bypasses_pending_cleanup() {
 }
 
 #[test]
-fn native_tagged_union_match_preserves_discriminants_and_payloads() {
+fn native_string_backed_tagged_result_parser_preserves_discriminants_and_payloads() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);
-    let tagged = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  def parse(valid: bool) -> Parsed do\n    if valid do\n      {:ok, 40}\n    else\n      :error\n    end\n  end\n  def payload(value: {:ok, i32}) -> i32 do\n    match value do\n      {:ok, number} -> number\n    end\n  end\n  def atom_value(value: :error) -> i32 do\n    match value do\n      :error -> 2\n    end\n  end\n  def unwrap(value: Parsed) -> i32 do\n    match value do\n      ok: {:ok, i32} -> payload(ok)\n      _ -> atom_value(:error)\n    end\n  end\n  def main() -> i32 do\n    unwrap(parse(true)) + unwrap(parse(false))\n  end\nend\n";
+    let tagged = "defmodule Main do\n  @type Parsed = {:ok, string} | :error\n  def parse(input: string, valid: bool) -> Parsed do\n    if valid do\n      {:ok, input}\n    else\n      :error\n    end\n  end\n  def payload(value: {:ok, string}) -> i32 do\n    match value do\n      {:ok, text} -> 2\n    end\n  end\n  def atom_value(value: :error) -> i32 do\n    match value do\n      :error -> 40\n    end\n  end\n  def unwrap(value: Parsed) -> i32 do\n    match value do\n      ok: {:ok, string} -> payload(ok)\n      _ -> atom_value(:error)\n    end\n  end\n  def main() -> i32 do\n    unwrap(parse(\"forty-two\", true)) + unwrap(parse(\"ignored\", false))\n  end\nend\n";
 
     for (label, profile) in [
         ("debug", BuildProfile::Development),
@@ -308,13 +308,38 @@ fn native_tagged_union_match_preserves_discriminants_and_payloads() {
             build_and_run(
                 &temp.0,
                 &runtime,
-                &format!("{label}-tagged-union"),
+                &format!("{label}-tagged-parser"),
                 tagged,
                 profile,
             )
             .code(),
             Some(42),
-            "union tags and tagged-tuple payloads must survive calls and exhaustive matches"
+            "string-backed tagged parser results must survive calls and exhaustive matches"
+        );
+    }
+}
+
+#[test]
+fn native_exhaustive_i64_string_match_preserves_static_string_payloads() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  @type Scalar = i64 | string\n  def choose(text: bool) -> Scalar do\n    if text do\n      \"forty-two\"\n    else\n      42\n    end\n  end\n  def classify(value: Scalar) -> i32 do\n    match value do\n      number: i64 -> 40\n      text: string -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(choose(false)) + classify(choose(true))\n  end\nend\n";
+
+    for (label, profile) in [
+        ("debug", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-i64-string-union"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "both exhaustive union alternatives must preserve their payload ABI"
         );
     }
 }

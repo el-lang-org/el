@@ -8,13 +8,14 @@ use el_ir::{
     Type, TypeId, ValueId, verify_concrete,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
+use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock as LlvmBlock;
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
-use inkwell::module::Module;
+use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
@@ -421,6 +422,16 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             Some(Type::I64) => Ok(self.context.i64_type().into()),
             Some(Type::Bool) => Ok(self.context.bool_type().into()),
             Some(Type::Unit) => Ok(self.context.struct_type(&[], false).into()),
+            Some(Type::String) => Ok(self
+                .context
+                .struct_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.i64_type().into(),
+                    ],
+                    false,
+                )
+                .into()),
             Some(Type::Atom(_)) => Ok(self.context.i8_type().into()),
             Some(Type::Tuple(elements)) => {
                 let fields = elements
@@ -537,7 +548,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ty,
                 ..
             } => {
-                let value = self.constant(constant, *ty)?;
+                let value = self.constant(function, *result, constant, *ty)?;
                 values.insert(*result, value);
             }
             Operation::Tuple {
@@ -1026,6 +1037,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
 
     fn constant(
         &self,
+        function: FunctionId,
+        result: ValueId,
         constant: &Constant,
         ty: TypeId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
@@ -1054,6 +1067,28 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 .const_int(u64::from(*value), false)
                 .into()),
             (Constant::Unit, Some(Type::Unit)) => Ok(self.basic_type(ty)?.const_zero()),
+            (Constant::String(value), Some(Type::String)) => {
+                let bytes = self.context.const_string(value.as_bytes(), false);
+                let global = self.module.add_global(
+                    bytes.get_type(),
+                    None,
+                    &format!("el.s{}.{}", function.0, result.0),
+                );
+                global.set_initializer(&bytes);
+                global.set_constant(true);
+                global.set_linkage(Linkage::Private);
+                let string = self
+                    .basic_type(ty)?
+                    .into_struct_type()
+                    .const_named_struct(&[
+                        global.as_pointer_value().into(),
+                        self.context
+                            .i64_type()
+                            .const_int(value.len() as u64, false)
+                            .into(),
+                    ]);
+                Ok(string.into())
+            }
             (Constant::Atom(_), Some(Type::Atom(_))) => {
                 Ok(self.context.i8_type().const_zero().into())
             }
@@ -1222,6 +1257,99 @@ mod tests {
         assert!(text.contains("extractvalue"), "{text}");
         assert!(text.contains("switch"), "{text}");
         assert!(text.contains("{ i32, i8, { i8, i32 } }"), "{text}");
+    }
+
+    #[test]
+    fn lowers_static_strings_and_exhaustive_integer_string_unions() {
+        let core = concrete(
+            "defmodule Main do\n  @type Scalar = i64 | string\n  def choose(text: bool) -> Scalar do\n    if text do\n      \"forty-two\"\n    else\n      42\n    end\n  end\n  def classify(value: Scalar) -> i32 do\n    match value do\n      number: i64 -> 40\n      text: string -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(choose(true))\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("string union lowering verifies");
+        let text = llvm.as_str();
+        assert!(
+            text.contains("private constant [9 x i8] c\"forty-two\""),
+            "{text}"
+        );
+        assert!(text.contains("{ ptr, i64 }"), "{text}");
+        assert!(text.contains("switch i32"), "{text}");
+    }
+
+    #[test]
+    fn lowers_cleanup_blocks_with_saved_result_parameters() {
+        let core = concrete(
+            "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def compute(flag: bool) -> i32 do\n    defer cleanup(1)\n    if flag do\n      defer cleanup(2)\n      return 42\n    else\n      41\n    end\n  end\n  def main() -> i32 do\n    compute(true)\n  end\nend\n",
+        );
+        let compute = core
+            .functions
+            .iter()
+            .find(|function| function.name == "compute")
+            .expect("compute specialization remains reachable");
+        let cleanup = core
+            .functions
+            .iter()
+            .find(|function| function.name == "cleanup")
+            .expect("cleanup specialization remains reachable")
+            .id;
+        let cleanup_blocks = compute
+            .blocks
+            .iter()
+            .filter(|block| {
+                !block.parameters.is_empty()
+                    && block.operations.iter().any(
+                        |operation| matches!(operation, Operation::Call { function, .. } if *function == cleanup),
+                    )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cleanup_blocks.len(), 3, "all cleanup paths remain explicit");
+
+        let llvm = lower_to_llvm_ir(&core).expect("cleanup CFG lowers and verifies");
+        let text = llvm.as_str();
+        for block in cleanup_blocks {
+            let parameter = block.parameters[0].value;
+            assert!(
+                text.contains(&format!("b{}:", block.id.0))
+                    && text.contains(&format!("%v{} = phi i32", parameter.0)),
+                "cleanup block {:?} must receive its saved result through an LLVM phi:\n{text}",
+                block.id,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_cleanup_cfg_before_llvm_generation() {
+        let mut core = concrete(
+            "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    42\n  end\nend\n",
+        );
+        let main = core
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .expect("main specialization");
+        let cleanup = main
+            .blocks
+            .iter()
+            .find(|block| !block.parameters.is_empty())
+            .expect("cleanup block")
+            .id;
+        let Terminator::Branch { arguments, .. } = main
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                matches!(block.terminator, Terminator::Branch { target, .. } if target == cleanup)
+            })
+            .map(|block| &mut block.terminator)
+            .expect("incoming cleanup edge")
+        else {
+            panic!("incoming cleanup edge must be a branch")
+        };
+        arguments.clear();
+
+        assert!(matches!(
+            lower_to_llvm_ir(&core),
+            Err(BackendError::InvalidConcrete(errors))
+                if errors.iter().any(|error| error.contains("supplies 0 arguments, expected 1"))
+        ));
     }
 
     #[test]

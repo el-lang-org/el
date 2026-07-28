@@ -396,6 +396,97 @@ fn routes_nested_fallthrough_and_return_values_through_cleanup_blocks() {
 }
 
 #[test]
+fn cleanup_cfg_verifiers_reject_missing_and_mistyped_saved_results() {
+    let source = "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    42\n  end\nend\n";
+    let module = lowered(source);
+    let main = &module.functions[1];
+    let cleanup_block = main
+        .blocks
+        .iter()
+        .find(|block| {
+            !block.parameters.is_empty()
+                && block.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        Operation::Call {
+                            function: FunctionId(0),
+                            ..
+                        }
+                    )
+                })
+        })
+        .expect("cleanup block carries the saved result")
+        .id;
+
+    let mut missing = module.clone();
+    let Terminator::Branch { arguments, .. } = missing.functions[1]
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            matches!(block.terminator, Terminator::Branch { target, .. } if target == cleanup_block)
+        })
+        .map(|block| &mut block.terminator)
+        .expect("incoming cleanup edge")
+    else {
+        panic!("incoming cleanup edge must be a branch")
+    };
+    arguments.clear();
+    assert!(
+        verify(&missing)
+            .expect_err("missing saved cleanup result is rejected")
+            .iter()
+            .any(|error| error.contains("supplies 0 arguments, expected 1"))
+    );
+
+    let mut mistyped = module.clone();
+    mistyped.functions[1]
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == cleanup_block)
+        .expect("cleanup block")
+        .parameters[0]
+        .ty = TypeId(3);
+    assert!(
+        verify(&mistyped)
+            .expect_err("mistyped saved cleanup result is rejected")
+            .iter()
+            .any(|error| error.contains("incorrectly typed argument"))
+    );
+
+    let roots = executable_reachability_roots(&module).expect("valid executable entry");
+    let mut concrete = monomorphize(&module, &roots).expect("baseline cleanup graph specializes");
+    let main = concrete
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main specialization");
+    let cleanup_block = main
+        .blocks
+        .iter()
+        .find(|block| !block.parameters.is_empty())
+        .expect("concrete cleanup block")
+        .id;
+    let Terminator::Branch { arguments, .. } = main
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            matches!(block.terminator, Terminator::Branch { target, .. } if target == cleanup_block)
+        })
+        .map(|block| &mut block.terminator)
+        .expect("concrete incoming cleanup edge")
+    else {
+        panic!("concrete incoming cleanup edge must be a branch")
+    };
+    arguments.clear();
+    assert!(
+        verify_concrete(&concrete)
+            .expect_err("Concrete Core rejects a missing saved cleanup result")
+            .iter()
+            .any(|error| error.contains("supplies 0 arguments, expected 1"))
+    );
+}
+
+#[test]
 fn explicit_failure_terminators_bypass_cleanup_and_are_verified() {
     let module = lowered(
         "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def maximum() -> i32 do\n    2147483647\n  end\n  def one() -> i32 do\n    1\n  end\n  def main() -> i32 do\n    defer cleanup()\n    maximum() + one()\n  end\nend\n",

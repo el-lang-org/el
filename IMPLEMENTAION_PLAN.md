@@ -4,7 +4,7 @@ Status: implementation-ready planning document
 
 Language: **EL**
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
 > The filename `IMPLEMENTAION_PLAN.md` preserves the spelling requested when
 > this plan was created.
@@ -582,7 +582,7 @@ make cleanup explicit in Core IR.
 - [x] Cleanup CFGs that preserve block results and run actions once in LIFO order on
   fallthrough and every normal `return` path.
 - [x] Unrecoverable failure terminators that deliberately bypass cleanup.
-- [ ] LLVM lowering for block parameters, conditional branches, switches, aggregate
+- [x] LLVM lowering for block parameters, conditional branches, switches, aggregate
   values, and cleanup paths.
 
 **Tests**
@@ -592,10 +592,10 @@ make cleanup explicit in Core IR.
   order, typed union patterns, and unreachable arms.
 - [x] Deferred call timing versus block timing, capture snapshots, per-iteration
   cleanup, nested scopes, saved results, LIFO order, and failure skipping.
-- [ ] Core IR cleanup verifier tests and LLVM verification for every generated
+- [x] Core IR cleanup verifier tests and LLVM verification for every generated
   module.
 
-- [ ] **Exit gate:** compile and run iterative factorial, a tagged-result parser, and
+- [x] **Exit gate:** compile and run iterative factorial, a tagged-result parser, and
   an exhaustive `i64 | string` match.
 
 ### Milestone 5 — Boehm GC integration
@@ -1005,7 +1005,7 @@ unchecked and add `(in progress)` after the item when useful.
   process entry shim, target reproducibility metadata, and profile output directories
   are implemented, and debug/release native execution has parity; accepted D-008's
   basic LLVM debug-location requirement remains before closing the milestone.
-- [ ] **4 — Core control and matching (in progress):** primitive `i32`/`i64`
+- [x] **4 — Core control and matching:** primitive `i32`/`i64`
   comparisons, `bool` equality, expression-valued `if`, `while`, short-circuit
   `and`/`or`, and early `return` now pass Typed AST/Core IR verification and
   debug/release native factorial coverage. Tuples, atoms, normalized closed
@@ -1027,8 +1027,19 @@ unchecked and add `(in progress)` after the item when useful.
   verification and debug/release native tests. Checked arithmetic now exposes its
   ordered exceptional edges as category-tagged Core IR failure terminators; the
   verifier checks their plans and source origins, and debug/release execution
-  confirms failures bypass pending and remaining cleanup. The string-backed tagged
-  parser and remaining LLVM/Core verifier closure remain.
+  confirms failures bypass pending and remaining cleanup. Concrete Core block
+  parameters now lower to LLVM PHIs, branches and finite matches lower to verified
+  conditional branches and switches, tuples and closed unions use aggregate
+  insert/extract operations, and explicit cleanup paths retain saved results through
+  verified LLVM modules. Generic and Concrete Core verifier regressions reject
+  cleanup edges with missing or mistyped saved results, malformed cleanup Core is
+  rejected before LLVM generation, and every successfully lowered or emitted LLVM
+  module passes LLVM verification. The narrow text slice required by this milestone
+  represents UTF-8 literals as immutable static pointer/length values without
+  pulling forward Milestone 6 string APIs or allocation; string values survive
+  tuples, calls, and union payloads. Iterative factorial, a string-backed tagged
+  result parser, and an exhaustive `i64 | string` match now compile and run in both
+  development and release profiles, closing the Milestone 4 exit gate.
 - [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
 - [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
   rejection.
