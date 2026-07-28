@@ -2,7 +2,7 @@
 
 use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
-pub use el_types::{ArithmeticOperator, ComparisonOperator, Type, TypeId};
+pub use el_types::{ArithmeticOperator, BufferAppendKind, ComparisonOperator, Type, TypeId};
 use el_types::{
     LogicalOperator, TypedExpr, TypedExprKind, TypedItem, TypedPatternKind, TypedProgram,
 };
@@ -165,6 +165,70 @@ pub enum Operation {
     StringBytes {
         result: ValueId,
         string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringCodepoints {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringFromBytes {
+        result: ValueId,
+        bytes: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    Utf8ErrorOffset {
+        result: ValueId,
+        error: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    RuneToString {
+        result: ValueId,
+        rune: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BufferNew {
+        result: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BufferAppend {
+        result: ValueId,
+        buffer: ValueId,
+        value: ValueId,
+        kind: BufferAppendKind,
+        ty: TypeId,
+        origin: Span,
+    },
+    BufferToBytes {
+        result: ValueId,
+        buffer: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BytesToBits {
+        result: ValueId,
+        bytes: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BitsSlice {
+        result: ValueId,
+        bits: ValueId,
+        start: ValueId,
+        length: ValueId,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BitsToBytes {
+        result: ValueId,
+        bits: ValueId,
         ty: TypeId,
         origin: Span,
     },
@@ -331,6 +395,7 @@ pub enum Constant {
     Boolean(bool),
     Unit,
     String(String),
+    Rune(char),
     Atom(String),
 }
 
@@ -427,7 +492,13 @@ pub fn lower(program: &TypedProgram) -> GenericModule {
         .iter()
         .enumerate()
         .map(|(index, function)| {
-            Lowerer::new(function, FunctionId(index as u32), &functions_by_decl).lower()
+            Lowerer::new(
+                function,
+                FunctionId(index as u32),
+                &functions_by_decl,
+                &program.types,
+            )
+            .lower()
         })
         .collect();
     let module = GenericModule {
@@ -471,6 +542,7 @@ struct Lowerer<'a> {
     function: &'a el_types::TypedFunction,
     id: FunctionId,
     functions: &'a BTreeMap<DeclId, FunctionId>,
+    types: &'a [Type],
     next_value: u32,
     bindings: BTreeMap<SymbolId, Binding>,
     slots: Vec<Slot>,
@@ -487,11 +559,13 @@ impl<'a> Lowerer<'a> {
         function: &'a el_types::TypedFunction,
         id: FunctionId,
         functions: &'a BTreeMap<DeclId, FunctionId>,
+        types: &'a [Type],
     ) -> Self {
         Self {
             function,
             id,
             functions,
+            types,
             next_value: function.parameters.len() as u32,
             bindings: BTreeMap::new(),
             slots: Vec::new(),
@@ -745,6 +819,9 @@ impl<'a> Lowerer<'a> {
                 expression.ty,
                 expression.span,
             ),
+            TypedExprKind::Rune(value) => {
+                self.constant(Constant::Rune(*value), expression.ty, expression.span)
+            }
             TypedExprKind::Atom(name) => {
                 self.constant(Constant::Atom(name.clone()), expression.ty, expression.span)
             }
@@ -914,6 +991,152 @@ impl<'a> Lowerer<'a> {
                 self.operations.push(Operation::StringBytes {
                     result,
                     string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringCodepoints(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringCodepoints {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringFromBytes(value) => {
+                let bytes = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringFromBytes {
+                    result,
+                    bytes,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::Utf8ErrorOffset(value) => {
+                let error = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::Utf8ErrorOffset {
+                    result,
+                    error,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::RuneToString(value) => {
+                let rune = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::RuneToString {
+                    result,
+                    rune,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BufferNew => {
+                let result = self.value();
+                self.operations.push(Operation::BufferNew {
+                    result,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BufferAppend {
+                buffer,
+                value,
+                kind,
+            } => {
+                let buffer = self.lower_expr(buffer)?;
+                let value = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BufferAppend {
+                    result,
+                    buffer,
+                    value,
+                    kind: *kind,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BufferToBytes(value) => {
+                let buffer = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BufferToBytes {
+                    result,
+                    buffer,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BufferToString(value) => {
+                let buffer = self.lower_expr(value)?;
+                let bytes = self.value();
+                let bytes_ty =
+                    TypeId(self.types.iter().position(|ty| matches!(ty, Type::Bytes))? as u32);
+                self.operations.push(Operation::BufferToBytes {
+                    result: bytes,
+                    buffer,
+                    ty: bytes_ty,
+                    origin: expression.span,
+                });
+                let result = self.value();
+                self.operations.push(Operation::StringFromBytes {
+                    result,
+                    bytes,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BytesToBits(value) => {
+                let bytes = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BytesToBits {
+                    result,
+                    bytes,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BitsSlice {
+                value,
+                start,
+                length,
+            } => {
+                let bits = self.lower_expr(value)?;
+                let start = self.lower_expr(start)?;
+                let length = self.lower_expr(length)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::IndexOutOfBounds, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::BitsSlice {
+                    result,
+                    bits,
+                    start,
+                    length,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BitsToBytes(value) => {
+                let bits = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BitsToBytes {
+                    result,
+                    bits,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -2012,8 +2235,14 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
             operation,
             Operation::ListReverse { .. }
                 | Operation::MapToList { .. }
+                | Operation::StringCodepoints { .. }
+                | Operation::StringFromBytes { .. }
                 | Operation::BytesFromList { .. }
                 | Operation::BytesToList { .. }
+                | Operation::RuneToString { .. }
+                | Operation::BufferAppend { .. }
+                | Operation::BufferToBytes { .. }
+                | Operation::BitsToBytes { .. }
         )
         || matches!(
             operation,
@@ -2243,6 +2472,39 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::StringBytes { string, .. } => {
             live.values.insert(*string);
         }
+        Operation::StringCodepoints { string, .. } => {
+            live.values.insert(*string);
+        }
+        Operation::StringFromBytes { bytes, .. } => {
+            live.values.insert(*bytes);
+        }
+        Operation::Utf8ErrorOffset { error, .. } => {
+            live.values.insert(*error);
+        }
+        Operation::RuneToString { rune, .. } => {
+            live.values.insert(*rune);
+        }
+        Operation::BufferNew { .. } => {}
+        Operation::BufferAppend { buffer, value, .. } => {
+            live.values.extend([*buffer, *value]);
+        }
+        Operation::BufferToBytes { buffer, .. } => {
+            live.values.insert(*buffer);
+        }
+        Operation::BytesToBits { bytes, .. } => {
+            live.values.insert(*bytes);
+        }
+        Operation::BitsSlice {
+            bits,
+            start,
+            length,
+            ..
+        } => {
+            live.values.extend([*bits, *start, *length]);
+        }
+        Operation::BitsToBytes { bits, .. } => {
+            live.values.insert(*bits);
+        }
         Operation::BytesFromList { list, .. } => {
             live.values.insert(*list);
         }
@@ -2322,6 +2584,16 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::SliceSubslice { result, .. }
         | Operation::SliceCopy { result, .. }
         | Operation::StringBytes { result, .. }
+        | Operation::StringCodepoints { result, .. }
+        | Operation::StringFromBytes { result, .. }
+        | Operation::Utf8ErrorOffset { result, .. }
+        | Operation::RuneToString { result, .. }
+        | Operation::BufferNew { result, .. }
+        | Operation::BufferAppend { result, .. }
+        | Operation::BufferToBytes { result, .. }
+        | Operation::BytesToBits { result, .. }
+        | Operation::BitsSlice { result, .. }
+        | Operation::BitsToBytes { result, .. }
         | Operation::BytesFromList { result, .. }
         | Operation::BytesToList { result, .. }
         | Operation::BytesSlice { result, .. }
@@ -2367,13 +2639,17 @@ fn classify_managed_type(
         Type::I32
         | Type::I64
         | Type::Usize
+        | Type::Rune
+        | Type::Utf8Error
         | Type::U8
         | Type::Bool
         | Type::Unit
         | Type::Atom(_)
         | Type::Function { .. } => ManagedValueClass::Unmanaged,
         // String is a view-like pointer/length value and must retain its base.
-        Type::String | Type::Bytes | Type::Slice(_) => ManagedValueClass::ContainsBaseReferences,
+        Type::String | Type::Bytes | Type::Bits | Type::Buffer | Type::Slice(_) => {
+            ManagedValueClass::ContainsBaseReferences
+        }
         Type::List(_) | Type::Map { .. } => ManagedValueClass::BaseReference,
         Type::Array { item, .. } => aggregate_managed_class(module, [*item], visiting)?,
         Type::Tuple(elements) | Type::Union(elements) => {
@@ -2432,6 +2708,10 @@ enum NormalizedType {
     Unit,
     String,
     Bytes,
+    Bits,
+    Buffer,
+    Rune,
+    Utf8Error,
     U8,
     Atom(String),
     List(Box<Self>),
@@ -2755,6 +3035,10 @@ impl<'a> Monomorphizer<'a> {
             Type::Unit => NormalizedType::Unit,
             Type::String => NormalizedType::String,
             Type::Bytes => NormalizedType::Bytes,
+            Type::Bits => NormalizedType::Bits,
+            Type::Buffer => NormalizedType::Buffer,
+            Type::Rune => NormalizedType::Rune,
+            Type::Utf8Error => NormalizedType::Utf8Error,
             Type::U8 => NormalizedType::U8,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
@@ -2897,6 +3181,16 @@ impl<'a> Monomorphizer<'a> {
             | Operation::SliceSubslice { ty, .. }
             | Operation::SliceCopy { ty, .. }
             | Operation::StringBytes { ty, .. }
+            | Operation::StringCodepoints { ty, .. }
+            | Operation::StringFromBytes { ty, .. }
+            | Operation::Utf8ErrorOffset { ty, .. }
+            | Operation::RuneToString { ty, .. }
+            | Operation::BufferNew { ty, .. }
+            | Operation::BufferAppend { ty, .. }
+            | Operation::BufferToBytes { ty, .. }
+            | Operation::BytesToBits { ty, .. }
+            | Operation::BitsSlice { ty, .. }
+            | Operation::BitsToBytes { ty, .. }
             | Operation::BytesFromList { ty, .. }
             | Operation::BytesToList { ty, .. }
             | Operation::BytesSlice { ty, .. }
@@ -2977,6 +3271,10 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::Unit => return TypeId(3),
             NormalizedType::String => Type::String,
             NormalizedType::Bytes => Type::Bytes,
+            NormalizedType::Bits => Type::Bits,
+            NormalizedType::Buffer => Type::Buffer,
+            NormalizedType::Rune => Type::Rune,
+            NormalizedType::Utf8Error => Type::Utf8Error,
             NormalizedType::U8 => Type::U8,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
@@ -3107,6 +3405,10 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::Unit
         | NormalizedType::String
         | NormalizedType::Bytes
+        | NormalizedType::Bits
+        | NormalizedType::Buffer
+        | NormalizedType::Rune
+        | NormalizedType::Utf8Error
         | NormalizedType::U8
         | NormalizedType::Atom(_) => {}
     }
@@ -3123,6 +3425,16 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::SliceSubslice { ty, .. }
         | Operation::SliceCopy { ty, .. }
         | Operation::StringBytes { ty, .. }
+        | Operation::StringCodepoints { ty, .. }
+        | Operation::StringFromBytes { ty, .. }
+        | Operation::Utf8ErrorOffset { ty, .. }
+        | Operation::RuneToString { ty, .. }
+        | Operation::BufferNew { ty, .. }
+        | Operation::BufferAppend { ty, .. }
+        | Operation::BufferToBytes { ty, .. }
+        | Operation::BytesToBits { ty, .. }
+        | Operation::BitsSlice { ty, .. }
+        | Operation::BitsToBytes { ty, .. }
         | Operation::BytesFromList { ty, .. }
         | Operation::BytesToList { ty, .. }
         | Operation::BytesSlice { ty, .. }
@@ -3438,6 +3750,16 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::SliceSubslice { result, ty, .. }
                     | Operation::SliceCopy { result, ty, .. }
                     | Operation::StringBytes { result, ty, .. }
+                    | Operation::StringCodepoints { result, ty, .. }
+                    | Operation::StringFromBytes { result, ty, .. }
+                    | Operation::Utf8ErrorOffset { result, ty, .. }
+                    | Operation::RuneToString { result, ty, .. }
+                    | Operation::BufferNew { result, ty, .. }
+                    | Operation::BufferAppend { result, ty, .. }
+                    | Operation::BufferToBytes { result, ty, .. }
+                    | Operation::BytesToBits { result, ty, .. }
+                    | Operation::BitsSlice { result, ty, .. }
+                    | Operation::BitsToBytes { result, ty, .. }
                     | Operation::BytesFromList { result, ty, .. }
                     | Operation::BytesToList { result, ty, .. }
                     | Operation::BytesSlice { result, ty, .. }
@@ -3603,6 +3925,7 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                 }
                 if let Operation::ArrayIndex { failure, .. }
                 | Operation::SliceSubslice { failure, .. }
+                | Operation::BitsSlice { failure, .. }
                 | Operation::BytesSlice { failure, .. } = operation
                 {
                     predecessors.insert(*failure);
@@ -3709,6 +4032,9 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                     failure, origin, ..
                 }
                 | Operation::SliceSubslice {
+                    failure, origin, ..
+                }
+                | Operation::BitsSlice {
                     failure, origin, ..
                 }
                 | Operation::BytesSlice {
@@ -3936,6 +4262,7 @@ fn verify_operation(
                 | (Constant::Boolean(_), Some(Type::Bool))
                 | (Constant::Unit, Some(Type::Unit))
                 | (Constant::String(_), Some(Type::String)) => true,
+                (Constant::Rune(_), Some(Type::Rune)) => true,
                 (Constant::Atom(name), Some(Type::Atom(expected))) => name == expected,
                 _ => false,
             };
@@ -4120,6 +4447,7 @@ fn verify_operation(
                 ) => item == ty && source_length == length,
                 (Some(Type::Slice(item)), None) => item == ty,
                 (Some(Type::Bytes), None) => matches!(types.get(ty.0 as usize), Some(Type::U8)),
+                (Some(Type::Bits), None) => matches!(types.get(ty.0 as usize), Some(Type::Bool)),
                 _ => false,
             };
             if !valid {
@@ -4197,6 +4525,171 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::StringCodepoints {
+            result, string, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(string)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::String)
+            ) || !matches!(
+                types.get(ty.0 as usize),
+                Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::Rune))
+            ) {
+                errors.push(format!("string codepoints {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringFromBytes {
+            result, bytes, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(bytes)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Bytes)
+            ) || !is_utf8_result_type(types, *ty)
+            {
+                errors.push(format!("string from-bytes {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::Utf8ErrorOffset {
+            result, error, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(error)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Utf8Error)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push(format!("UTF-8 error offset {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::RuneToString {
+            result, rune, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(rune)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Rune)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::String))
+            {
+                errors.push(format!("rune to-string {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BufferNew { result, ty, .. } => {
+            if !matches!(types.get(ty.0 as usize), Some(Type::Buffer)) {
+                errors.push(format!("buffer construction {result:?} has invalid type"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BufferAppend {
+            result,
+            buffer,
+            value,
+            kind,
+            ty,
+            ..
+        } => {
+            let valid_value = match kind {
+                BufferAppendKind::Byte => matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::U8)
+                ),
+                BufferAppendKind::Bytes => matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::Bytes)
+                ),
+                BufferAppendKind::String => matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::String)
+                ),
+            };
+            if values.get(buffer) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Buffer))
+                || !valid_value
+            {
+                errors.push(format!("buffer append {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BufferToBytes {
+            result, buffer, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(buffer)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Buffer)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push(format!("buffer to-bytes {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BytesToBits {
+            result, bytes, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(bytes)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Bytes)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Bits))
+            {
+                errors.push(format!("bytes to-bits {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BitsSlice {
+            result,
+            bits,
+            start,
+            length,
+            ty,
+            ..
+        } => {
+            if values.get(bits) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Bits))
+                || !matches!(
+                    values.get(start).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+                || !matches!(
+                    values.get(length).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+            {
+                errors.push(format!("bits slice {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BitsToBytes {
+            result, bits, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(bits)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Bits)
+            ) || !is_option_bytes_type(types, *ty)
+            {
+                errors.push(format!("bits to-bytes {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::BytesFromList {
             result, list, ty, ..
         } => {
@@ -4258,9 +4751,17 @@ fn verify_operation(
             let source = values.get(value).and_then(|ty| types.get(ty.0 as usize));
             let valid_source = match (source, known_length) {
                 (Some(Type::Array { length, .. }), Some(known)) => length == known,
-                (Some(Type::String | Type::Bytes | Type::Slice(_) | Type::Map { .. }), None) => {
-                    true
-                }
+                (
+                    Some(
+                        Type::String
+                        | Type::Bytes
+                        | Type::Bits
+                        | Type::Buffer
+                        | Type::Slice(_)
+                        | Type::Map { .. },
+                    ),
+                    None,
+                ) => true,
                 _ => false,
             };
             if !valid_source || !matches!(types.get(ty.0 as usize), Some(Type::Usize)) {
@@ -4408,7 +4909,7 @@ fn verify_operation(
             );
             let supported = matches!(
                 types.get(operand_ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8) | Some(Type::Rune)
             ) || (!ordered && standard_eq_type(types, *operand_ty));
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
@@ -4512,9 +5013,13 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Unit
             | Type::String
             | Type::Bytes
+            | Type::Bits
+            | Type::Rune
+            | Type::Utf8Error
             | Type::U8
             | Type::Atom(_),
         ) => true,
+        Some(Type::Buffer) => false,
         Some(Type::List(item) | Type::Slice(item)) => standard_eq_type(types, *item),
         Some(Type::Array { item, .. }) => standard_eq_type(types, *item),
         Some(Type::Tuple(items)) => items.iter().all(|item| standard_eq_type(types, *item)),
@@ -4523,6 +5028,32 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_utf8_result_type(types: &[Type], ty: TypeId) -> bool {
+    matches!(types.get(ty.0 as usize), Some(Type::Union(members)) if {
+        let has = |tag: &str, payload: fn(&Type) -> bool| members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Tuple(fields)) if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(found)) if found == tag)
+                && types.get(fields[1].0 as usize).is_some_and(payload))
+        });
+        has("ok", |value| matches!(value, Type::String))
+            && has("error", |value| matches!(value, Type::Utf8Error))
+    })
+}
+
+fn is_option_bytes_type(types: &[Type], ty: TypeId) -> bool {
+    matches!(types.get(ty.0 as usize), Some(Type::Union(members)) if {
+        let has_none = members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Atom(found)) if found == "none")
+        });
+        let has_some = members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Tuple(fields)) if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(found)) if found == "some")
+                && matches!(types.get(fields[1].0 as usize), Some(Type::Bytes)))
+        });
+        has_none && has_some
+    })
 }
 
 fn standard_hash_type(types: &[Type], ty: TypeId) -> bool {
@@ -4783,6 +5314,53 @@ fn display_operation(operation: &Operation) -> String {
         Operation::StringBytes {
             result, string, ty, ..
         } => format!("v{} = string_bytes v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringCodepoints {
+            result, string, ty, ..
+        } => format!("v{} = string_codepoints v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringFromBytes {
+            result, bytes, ty, ..
+        } => format!("v{} = string_from_bytes v{}: t{}", result.0, bytes.0, ty.0),
+        Operation::Utf8ErrorOffset {
+            result, error, ty, ..
+        } => format!("v{} = utf8_error_offset v{}: t{}", result.0, error.0, ty.0),
+        Operation::RuneToString {
+            result, rune, ty, ..
+        } => format!("v{} = rune_to_string v{}: t{}", result.0, rune.0, ty.0),
+        Operation::BufferNew { result, ty, .. } => {
+            format!("v{} = buffer_new: t{}", result.0, ty.0)
+        }
+        Operation::BufferAppend {
+            result,
+            buffer,
+            value,
+            kind,
+            ty,
+            ..
+        } => format!(
+            "v{} = buffer_append_{kind:?} v{} v{}: t{}",
+            result.0, buffer.0, value.0, ty.0
+        ),
+        Operation::BufferToBytes {
+            result, buffer, ty, ..
+        } => format!("v{} = buffer_to_bytes v{}: t{}", result.0, buffer.0, ty.0),
+        Operation::BytesToBits {
+            result, bytes, ty, ..
+        } => format!("v{} = bytes_to_bits v{}: t{}", result.0, bytes.0, ty.0),
+        Operation::BitsSlice {
+            result,
+            bits,
+            start,
+            length,
+            failure,
+            ty,
+            ..
+        } => format!(
+            "v{} = bits_slice v{} v{} v{}: t{} [IndexOutOfBounds => b{}]",
+            result.0, bits.0, start.0, length.0, ty.0, failure.0
+        ),
+        Operation::BitsToBytes {
+            result, bits, ty, ..
+        } => format!("v{} = bits_to_bytes v{}: t{}", result.0, bits.0, ty.0),
         Operation::BytesFromList {
             result, list, ty, ..
         } => format!("v{} = bytes_from_list v{}: t{}", result.0, list.0, ty.0),

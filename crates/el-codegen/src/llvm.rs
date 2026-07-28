@@ -3,13 +3,14 @@
 use crate::integer_checks::FailureOrigin;
 use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
-    ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant,
-    CoreFailureCategory, CoreFunction, FunctionId, Operation, SlotId, SwitchValue, Terminator,
-    Type, TypeId, ValueId, collection_point_roots, verify_concrete,
+    ArithmeticOperator, Block, BlockId, BufferAppendKind, ComparisonOperator, ConcreteModule,
+    Constant, CoreFailureCategory, CoreFunction, FunctionId, Operation, SlotId, SwitchValue,
+    Terminator, Type, TypeId, ValueId, collection_point_roots, verify_concrete,
 };
 #[cfg(feature = "managed-runtime")]
 use el_runtime::{
     ALLOCATE_ATOMIC_SYMBOL, ALLOCATE_SCANNED_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL,
+    UTF8_VALIDATE_SYMBOL,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
 use inkwell::AddressSpace;
@@ -336,6 +337,8 @@ struct ModuleLowerer<'ctx, 'core> {
     allocate_atomic: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     hash_seed: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    utf8_validate: FunctionValue<'ctx>,
 }
 
 impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
@@ -444,6 +447,24 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 .fn_type(&[], false),
             None,
         );
+        #[cfg(feature = "managed-runtime")]
+        let utf8_validate = module.add_function(
+            UTF8_VALIDATE_SYMBOL,
+            context
+                .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                .expect("host usize type")
+                .fn_type(
+                    &[
+                        context.ptr_type(AddressSpace::default()).into(),
+                        context
+                            .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                            .expect("host usize type")
+                            .into(),
+                    ],
+                    false,
+                ),
+            None,
+        );
         Self {
             context,
             core,
@@ -460,6 +481,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             allocate_atomic,
             #[cfg(feature = "managed-runtime")]
             hash_seed,
+            #[cfg(feature = "managed-runtime")]
+            utf8_validate,
         }
     }
 
@@ -539,6 +562,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
     fn basic_type(&self, ty: TypeId) -> Result<BasicTypeEnum<'ctx>, BackendError> {
         match self.core.types.get(ty.0 as usize) {
             Some(Type::U8) => Ok(self.context.i8_type().into()),
+            Some(Type::Rune) => Ok(self.context.i32_type().into()),
+            Some(Type::Utf8Error) => Ok(self.usize_type()?.into()),
             Some(Type::I32) => Ok(self.context.i32_type().into()),
             Some(Type::I64) => Ok(self.context.i64_type().into()),
             Some(Type::Usize) => Ok(self.usize_type()?.into()),
@@ -554,12 +579,24 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     false,
                 )
                 .into()),
-            Some(Type::Bytes) => Ok(self
+            Some(Type::Bytes | Type::Buffer) => Ok(self
                 .context
                 .struct_type(
                     &[
                         self.context.ptr_type(AddressSpace::default()).into(),
                         self.context.ptr_type(AddressSpace::default()).into(),
+                        self.usize_type()?.into(),
+                    ],
+                    false,
+                )
+                .into()),
+            Some(Type::Bits) => Ok(self
+                .context
+                .struct_type(
+                    &[
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.context.ptr_type(AddressSpace::default()).into(),
+                        self.usize_type()?.into(),
                         self.usize_type()?.into(),
                     ],
                     false,
@@ -666,14 +703,21 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         name: &str,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match self.core.types.get(ty.0 as usize) {
-            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool | Type::Atom(_)) => {
-                built(builder.build_int_compare(
-                    IntPredicate::EQ,
-                    left.into_int_value(),
-                    right.into_int_value(),
-                    name,
-                ))
-            }
+            Some(
+                Type::I32
+                | Type::I64
+                | Type::Usize
+                | Type::Rune
+                | Type::Utf8Error
+                | Type::U8
+                | Type::Bool
+                | Type::Atom(_),
+            ) => built(builder.build_int_compare(
+                IntPredicate::EQ,
+                left.into_int_value(),
+                right.into_int_value(),
+                name,
+            )),
             Some(Type::Unit) => Ok(self.context.bool_type().const_all_ones()),
             Some(Type::Tuple(elements)) => {
                 let left = left.into_struct_value();
@@ -777,6 +821,23 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     name,
                 )
             }
+            Some(Type::Bits) => {
+                let left = left.into_struct_value();
+                let right = right.into_struct_value();
+                let field = |value: StructValue<'ctx>, index, suffix: &str| {
+                    built(builder.build_extract_value(value, index, &format!("{name}.{suffix}")))
+                };
+                self.bit_sequence_equal(
+                    builder,
+                    field(left, 1, "left_data")?.into_pointer_value(),
+                    field(left, 2, "left_offset")?.into_int_value(),
+                    field(left, 3, "left_length")?.into_int_value(),
+                    field(right, 1, "right_data")?.into_pointer_value(),
+                    field(right, 2, "right_offset")?.into_int_value(),
+                    field(right, 3, "right_length")?.into_int_value(),
+                    name,
+                )
+            }
             Some(Type::Slice(item)) => {
                 let left = left.into_struct_value();
                 let right = right.into_struct_value();
@@ -860,6 +921,156 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             &format!("{name}.contents_equal"),
         ))?;
         built(builder.build_and(length_equal, contents_equal, name))
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    fn bit_at(
+        &self,
+        builder: &Builder<'ctx>,
+        data: PointerValue<'ctx>,
+        offset: IntValue<'ctx>,
+        index: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let absolute = built(builder.build_int_add(offset, index, &format!("{name}.absolute")))?;
+        let byte_index = built(builder.build_right_shift(
+            absolute,
+            absolute.get_type().const_int(3, false),
+            false,
+            &format!("{name}.byte_index"),
+        ))?;
+        let pointer = self.element_pointer(
+            builder,
+            self.context.i8_type().into(),
+            data,
+            byte_index,
+            &format!("{name}.byte_ptr"),
+        )?;
+        let byte =
+            built(builder.build_load(self.context.i8_type(), pointer, &format!("{name}.byte")))?
+                .into_int_value();
+        let within = built(builder.build_and(
+            absolute,
+            absolute.get_type().const_int(7, false),
+            &format!("{name}.within"),
+        ))?;
+        let within = built(builder.build_int_truncate(
+            within,
+            self.context.i8_type(),
+            &format!("{name}.within_i8"),
+        ))?;
+        let shift = built(builder.build_int_sub(
+            self.context.i8_type().const_int(7, false),
+            within,
+            &format!("{name}.shift"),
+        ))?;
+        let shifted =
+            built(builder.build_right_shift(byte, shift, false, &format!("{name}.shifted")))?;
+        let bit = built(builder.build_and(
+            shifted,
+            self.context.i8_type().const_int(1, false),
+            &format!("{name}.bit"),
+        ))?;
+        built(builder.build_int_truncate(bit, self.context.bool_type(), name))
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn bit_sequence_equal(
+        &self,
+        builder: &Builder<'ctx>,
+        left_data: PointerValue<'ctx>,
+        left_offset: IntValue<'ctx>,
+        left_length: IntValue<'ctx>,
+        right_data: PointerValue<'ctx>,
+        right_offset: IntValue<'ctx>,
+        right_length: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let result_slot =
+            built(builder.build_alloca(self.context.bool_type(), &format!("{name}.result")))?;
+        built(builder.build_store(result_slot, self.context.bool_type().const_all_ones()))?;
+        let lengths_equal = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            left_length,
+            right_length,
+            &format!("{name}.lengths_equal"),
+        ))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let advance = self
+            .context
+            .append_basic_block(function, &format!("{name}.advance"));
+        let mismatch = self
+            .context
+            .append_basic_block(function, &format!("{name}.mismatch"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_conditional_branch(lengths_equal, loop_block, mismatch))?;
+        builder.position_at_end(loop_block);
+        let index = built(builder.build_phi(left_length.get_type(), &format!("{name}.index")))?;
+        index.add_incoming(&[(&left_length.get_type().const_zero(), preheader)]);
+        let exhausted = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            index.as_basic_value().into_int_value(),
+            left_length,
+            &format!("{name}.exhausted"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let index_value = index.as_basic_value().into_int_value();
+        let left_bit = self.bit_at(
+            builder,
+            left_data,
+            left_offset,
+            index_value,
+            &format!("{name}.left"),
+        )?;
+        let right_bit = self.bit_at(
+            builder,
+            right_data,
+            right_offset,
+            index_value,
+            &format!("{name}.right"),
+        )?;
+        let equal = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            left_bit,
+            right_bit,
+            &format!("{name}.bit_equal"),
+        ))?;
+        built(builder.build_conditional_branch(equal, advance, mismatch))?;
+        builder.position_at_end(advance);
+        let next = built(builder.build_int_add(
+            index_value,
+            left_length.get_type().const_int(1, false),
+            &format!("{name}.next"),
+        ))?;
+        let advance_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        index.add_incoming(&[(&next, advance_end)]);
+        builder.position_at_end(mismatch);
+        built(builder.build_store(result_slot, self.context.bool_type().const_zero()))?;
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(done);
+        Ok(
+            built(builder.build_load(self.context.bool_type(), result_slot, name))?
+                .into_int_value(),
+        )
     }
 
     #[cfg(feature = "managed-runtime")]
@@ -1422,7 +1633,16 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ))
             };
         match self.core.types.get(ty.0 as usize) {
-            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool | Type::Atom(_)) => {
+            Some(
+                Type::I32
+                | Type::I64
+                | Type::Usize
+                | Type::Rune
+                | Type::Utf8Error
+                | Type::U8
+                | Type::Bool
+                | Type::Atom(_),
+            ) => {
                 let integer = value.into_int_value();
                 let integer = if integer.get_type().get_bit_width() > usize_ty.get_bit_width() {
                     built(builder.build_int_truncate(
@@ -1484,6 +1704,18 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     built(builder.build_extract_value(value, 1, &format!("{name}.length")))?
                         .into_int_value();
                 self.byte_hash(builder, data, length, seed, name)
+            }
+            Some(Type::Bits) => {
+                let value = value.into_struct_value();
+                let data = built(builder.build_extract_value(value, 1, &format!("{name}.data")))?
+                    .into_pointer_value();
+                let offset =
+                    built(builder.build_extract_value(value, 2, &format!("{name}.offset")))?
+                        .into_int_value();
+                let length =
+                    built(builder.build_extract_value(value, 3, &format!("{name}.length")))?
+                        .into_int_value();
+                self.bit_hash(builder, data, offset, length, seed, name)
             }
             Some(Type::Bytes) => {
                 let value = value.into_struct_value();
@@ -1595,6 +1827,77 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             hash.as_basic_value().into_int_value(),
             byte,
             &format!("{name}.byte_hash"),
+        )?;
+        let next_index = built(builder.build_int_add(
+            index.as_basic_value().into_int_value(),
+            usize_ty.const_int(1, false),
+            &format!("{name}.next_index"),
+        ))?;
+        let body_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        index.add_incoming(&[(&next_index, body_end)]);
+        hash.add_incoming(&[(&next_hash, body_end)]);
+        builder.position_at_end(done);
+        Ok(hash.as_basic_value().into_int_value())
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn bit_hash(
+        &self,
+        builder: &Builder<'ctx>,
+        data: PointerValue<'ctx>,
+        offset: IntValue<'ctx>,
+        length: IntValue<'ctx>,
+        seed: IntValue<'ctx>,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        let usize_ty = self.usize_type()?;
+        let initial = self.hash_mix(builder, seed, length, &format!("{name}.length"))?;
+        let loop_block = self
+            .context
+            .append_basic_block(function, &format!("{name}.loop"));
+        let body = self
+            .context
+            .append_basic_block(function, &format!("{name}.body"));
+        let done = self
+            .context
+            .append_basic_block(function, &format!("{name}.done"));
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let index = built(builder.build_phi(usize_ty, &format!("{name}.index")))?;
+        let hash = built(builder.build_phi(usize_ty, &format!("{name}.hash")))?;
+        index.add_incoming(&[(&usize_ty.const_zero(), preheader)]);
+        hash.add_incoming(&[(&initial, preheader)]);
+        let exhausted = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            index.as_basic_value().into_int_value(),
+            length,
+            &format!("{name}.exhausted"),
+        ))?;
+        built(builder.build_conditional_branch(exhausted, done, body))?;
+        builder.position_at_end(body);
+        let bit = self.bit_at(
+            builder,
+            data,
+            offset,
+            index.as_basic_value().into_int_value(),
+            &format!("{name}.item"),
+        )?;
+        let next_hash = self.hash_mix(
+            builder,
+            hash.as_basic_value().into_int_value(),
+            bit,
+            &format!("{name}.bit_hash"),
         )?;
         let next_index = built(builder.build_int_add(
             index.as_basic_value().into_int_value(),
@@ -2185,6 +2488,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                             | Operation::MapRemove { .. }
                             | Operation::MapToList { .. }
                             | Operation::BytesToList { .. }
+                            | Operation::StringCodepoints { .. }
                     )
                 {
                     let pointer = built(builder.build_alloca(
@@ -3476,11 +3780,21 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             } => {
                 let index_value = integer_value(values, *index)?;
                 let source = struct_value(values, *array)?;
+                let source_ty = value_types
+                    .get(array)
+                    .copied()
+                    .ok_or(BackendError::MissingValue(*array))?;
+                let bits = matches!(self.core.types.get(source_ty.0 as usize), Some(Type::Bits));
                 let bound = if let Some(length) = length {
                     index_value.get_type().const_int(*length, false)
                 } else {
-                    built(builder.build_extract_value(source, 2, &format!("v{}.length", result.0)))?
-                        .into_int_value()
+                    let length_field = if bits { 3 } else { 2 };
+                    built(builder.build_extract_value(
+                        source,
+                        length_field,
+                        &format!("v{}.length", result.0),
+                    ))?
+                    .into_int_value()
                 };
                 let out_of_bounds = built(builder.build_int_compare(
                     IntPredicate::UGE,
@@ -3526,6 +3840,76 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         ))?;
                     }
                     values.insert(*result, selected);
+                } else if bits {
+                    let data = built(builder.build_extract_value(
+                        source,
+                        1,
+                        &format!("v{}.data", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let bit_offset = built(builder.build_extract_value(
+                        source,
+                        2,
+                        &format!("v{}.bit_offset", result.0),
+                    ))?
+                    .into_int_value();
+                    let absolute = built(builder.build_int_add(
+                        bit_offset,
+                        index_value,
+                        &format!("v{}.absolute_bit", result.0),
+                    ))?;
+                    let three = absolute.get_type().const_int(3, false);
+                    let byte_index = built(builder.build_right_shift(
+                        absolute,
+                        three,
+                        false,
+                        &format!("v{}.byte_index", result.0),
+                    ))?;
+                    let pointer = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        data,
+                        byte_index,
+                        &format!("v{}.byte_pointer", result.0),
+                    )?;
+                    let byte = built(builder.build_load(
+                        self.context.i8_type(),
+                        pointer,
+                        &format!("v{}.byte", result.0),
+                    ))?
+                    .into_int_value();
+                    let within = built(builder.build_and(
+                        absolute,
+                        absolute.get_type().const_int(7, false),
+                        &format!("v{}.bit_within_byte", result.0),
+                    ))?;
+                    let within = built(builder.build_int_truncate(
+                        within,
+                        self.context.i8_type(),
+                        &format!("v{}.bit_within_byte.i8", result.0),
+                    ))?;
+                    let shift = built(builder.build_int_sub(
+                        self.context.i8_type().const_int(7, false),
+                        within,
+                        &format!("v{}.bit_shift", result.0),
+                    ))?;
+                    let shifted = built(builder.build_right_shift(
+                        byte,
+                        shift,
+                        false,
+                        &format!("v{}.shifted_bit", result.0),
+                    ))?;
+                    let bit = built(builder.build_and(
+                        shifted,
+                        self.context.i8_type().const_int(1, false),
+                        &format!("v{}.bit", result.0),
+                    ))?;
+                    let bit = built(builder.build_int_truncate(
+                        bit,
+                        self.context.bool_type(),
+                        &format!("v{}", result.0),
+                    ))?;
+                    values.insert(*result, bit.into());
                 } else {
                     let data = built(builder.build_extract_value(
                         source,
@@ -3894,6 +4278,1618 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     ))?;
                 }
                 values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::StringCodepoints {
+                result,
+                string,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, string, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_codepoints",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder(
+                            "string codepoints has no partial-result root".to_owned(),
+                        )
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let null = pointer_ty.const_null();
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    let head_slot = built(builder.build_alloca(pointer_ty, "codepoints.head"))?;
+                    let tail_slot = built(builder.build_alloca(pointer_ty, "codepoints.tail"))?;
+                    built(builder.build_store(head_slot, null))?;
+                    built(builder.build_store(tail_slot, null))?;
+
+                    let source = struct_value(values, *string)?;
+                    let data = built(builder.build_extract_value(source, 0, "codepoints.data"))?
+                        .into_pointer_value();
+                    let length =
+                        built(builder.build_extract_value(source, 1, "codepoints.length"))?
+                            .into_int_value();
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_loop", result.0),
+                    );
+                    let decode_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_decode", result.0),
+                    );
+                    let ascii_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_ascii", result.0),
+                    );
+                    let non_ascii_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_non_ascii", result.0),
+                    );
+                    let two_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_two", result.0),
+                    );
+                    let three_or_four_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_three_or_four", result.0),
+                    );
+                    let three_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_three", result.0),
+                    );
+                    let four_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_four", result.0),
+                    );
+                    let decoded_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_decoded", result.0),
+                    );
+                    let install_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_install", result.0),
+                    );
+                    let link_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_link", result.0),
+                    );
+                    let continue_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_continue", result.0),
+                    );
+                    let done_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.codepoints_done", result.0),
+                    );
+                    built(builder.build_unconditional_branch(loop_block))?;
+
+                    builder.position_at_end(loop_block);
+                    let offset_phi =
+                        built(builder.build_phi(length.get_type(), "codepoints.offset"))?;
+                    offset_phi.add_incoming(&[(&length.get_type().const_zero(), preheader)]);
+                    let offset = offset_phi.as_basic_value().into_int_value();
+                    let done = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        offset,
+                        length,
+                        "codepoints.done",
+                    ))?;
+                    built(builder.build_conditional_branch(done, done_block, decode_block))?;
+
+                    let load_byte =
+                        |builder: &Builder<'ctx>, byte_offset: IntValue<'ctx>, name: &str| {
+                            let index = if byte_offset.get_type() == self.usize_type()? {
+                                byte_offset
+                            } else {
+                                built(builder.build_int_cast(
+                                    byte_offset,
+                                    self.usize_type()?,
+                                    &format!("{name}.index"),
+                                ))?
+                            };
+                            let pointer = self.element_pointer(
+                                builder,
+                                self.context.i8_type().into(),
+                                data,
+                                index,
+                                &format!("{name}.ptr"),
+                            )?;
+                            let byte =
+                                built(builder.build_load(self.context.i8_type(), pointer, name))?
+                                    .into_int_value();
+                            built(builder.build_int_z_extend(
+                                byte,
+                                self.context.i32_type(),
+                                &format!("{name}.i32"),
+                            ))
+                        };
+                    let offset_by = |builder: &Builder<'ctx>, amount: u64, name: &str| {
+                        built(builder.build_int_add(
+                            offset,
+                            offset.get_type().const_int(amount, false),
+                            name,
+                        ))
+                    };
+                    let continuation =
+                        |builder: &Builder<'ctx>, byte: IntValue<'ctx>, name: &str| {
+                            built(builder.build_and(
+                                byte,
+                                self.context.i32_type().const_int(0x3f, false),
+                                name,
+                            ))
+                        };
+
+                    builder.position_at_end(decode_block);
+                    let first = load_byte(builder, offset, "codepoints.first")?;
+                    let ascii = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        first,
+                        self.context.i32_type().const_int(0x7f, false),
+                        "codepoints.is_ascii",
+                    ))?;
+                    built(builder.build_conditional_branch(ascii, ascii_block, non_ascii_block))?;
+
+                    builder.position_at_end(ascii_block);
+                    let ascii_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(decoded_block))?;
+
+                    builder.position_at_end(non_ascii_block);
+                    let is_two = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        first,
+                        self.context.i32_type().const_int(0xdf, false),
+                        "codepoints.is_two",
+                    ))?;
+                    built(builder.build_conditional_branch(
+                        is_two,
+                        two_block,
+                        three_or_four_block,
+                    ))?;
+
+                    builder.position_at_end(two_block);
+                    let second = load_byte(
+                        builder,
+                        offset_by(builder, 1, "codepoints.second_offset")?,
+                        "codepoints.second",
+                    )?;
+                    let lead = built(builder.build_and(
+                        first,
+                        self.context.i32_type().const_int(0x1f, false),
+                        "codepoints.two_lead",
+                    ))?;
+                    let lead = built(builder.build_left_shift(
+                        lead,
+                        self.context.i32_type().const_int(6, false),
+                        "codepoints.two_shift",
+                    ))?;
+                    let codepoint_two = built(builder.build_or(
+                        lead,
+                        continuation(builder, second, "codepoints.two_tail")?,
+                        "codepoints.two_value",
+                    ))?;
+                    let two_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(decoded_block))?;
+
+                    builder.position_at_end(three_or_four_block);
+                    let is_three = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        first,
+                        self.context.i32_type().const_int(0xef, false),
+                        "codepoints.is_three",
+                    ))?;
+                    built(builder.build_conditional_branch(is_three, three_block, four_block))?;
+
+                    builder.position_at_end(three_block);
+                    let second_three = load_byte(
+                        builder,
+                        offset_by(builder, 1, "codepoints.three_second_offset")?,
+                        "codepoints.three_second",
+                    )?;
+                    let third_three = load_byte(
+                        builder,
+                        offset_by(builder, 2, "codepoints.three_third_offset")?,
+                        "codepoints.three_third",
+                    )?;
+                    let lead_three = built(builder.build_and(
+                        first,
+                        self.context.i32_type().const_int(0x0f, false),
+                        "codepoints.three_lead",
+                    ))?;
+                    let lead_three = built(builder.build_left_shift(
+                        lead_three,
+                        self.context.i32_type().const_int(12, false),
+                        "codepoints.three_lead_shift",
+                    ))?;
+                    let middle_three = built(builder.build_left_shift(
+                        continuation(builder, second_three, "codepoints.three_middle")?,
+                        self.context.i32_type().const_int(6, false),
+                        "codepoints.three_middle_shift",
+                    ))?;
+                    let codepoint_three = built(builder.build_or(
+                        built(builder.build_or(
+                            lead_three,
+                            middle_three,
+                            "codepoints.three_prefix",
+                        ))?,
+                        continuation(builder, third_three, "codepoints.three_tail")?,
+                        "codepoints.three_value",
+                    ))?;
+                    let three_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(decoded_block))?;
+
+                    builder.position_at_end(four_block);
+                    let second_four = load_byte(
+                        builder,
+                        offset_by(builder, 1, "codepoints.four_second_offset")?,
+                        "codepoints.four_second",
+                    )?;
+                    let third_four = load_byte(
+                        builder,
+                        offset_by(builder, 2, "codepoints.four_third_offset")?,
+                        "codepoints.four_third",
+                    )?;
+                    let fourth_four = load_byte(
+                        builder,
+                        offset_by(builder, 3, "codepoints.four_fourth_offset")?,
+                        "codepoints.four_fourth",
+                    )?;
+                    let lead_four = built(builder.build_and(
+                        first,
+                        self.context.i32_type().const_int(0x07, false),
+                        "codepoints.four_lead",
+                    ))?;
+                    let lead_four = built(builder.build_left_shift(
+                        lead_four,
+                        self.context.i32_type().const_int(18, false),
+                        "codepoints.four_lead_shift",
+                    ))?;
+                    let second_four = built(builder.build_left_shift(
+                        continuation(builder, second_four, "codepoints.four_second_tail")?,
+                        self.context.i32_type().const_int(12, false),
+                        "codepoints.four_second_shift",
+                    ))?;
+                    let third_four = built(builder.build_left_shift(
+                        continuation(builder, third_four, "codepoints.four_third_tail")?,
+                        self.context.i32_type().const_int(6, false),
+                        "codepoints.four_third_shift",
+                    ))?;
+                    let prefix_four =
+                        built(builder.build_or(lead_four, second_four, "codepoints.four_prefix"))?;
+                    let prefix_four = built(builder.build_or(
+                        prefix_four,
+                        third_four,
+                        "codepoints.four_prefix2",
+                    ))?;
+                    let codepoint_four = built(builder.build_or(
+                        prefix_four,
+                        continuation(builder, fourth_four, "codepoints.four_tail")?,
+                        "codepoints.four_value",
+                    ))?;
+                    let four_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(decoded_block))?;
+
+                    builder.position_at_end(decoded_block);
+                    let codepoint_phi =
+                        built(builder.build_phi(self.context.i32_type(), "codepoints.value"))?;
+                    codepoint_phi.add_incoming(&[
+                        (&first, ascii_end),
+                        (&codepoint_two, two_end),
+                        (&codepoint_three, three_end),
+                        (&codepoint_four, four_end),
+                    ]);
+                    let width_phi =
+                        built(builder.build_phi(length.get_type(), "codepoints.width"))?;
+                    width_phi.add_incoming(&[
+                        (&length.get_type().const_int(1, false), ascii_end),
+                        (&length.get_type().const_int(2, false), two_end),
+                        (&length.get_type().const_int(3, false), three_end),
+                        (&length.get_type().const_int(4, false), four_end),
+                    ]);
+                    let list_node = self.list_node_type(*ty)?;
+                    let native_size = list_node
+                        .size_of()
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let size = if native_size.get_type() == self.context.i64_type() {
+                        native_size
+                    } else {
+                        built(builder.build_int_cast(
+                            native_size,
+                            self.context.i64_type(),
+                            "codepoints.node_size",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_scanned,
+                            &[
+                                size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.codepoint_node", result.0),
+                        ),
+                    )?;
+                    let node = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    let item_ptr =
+                        built(builder.build_struct_gep(list_node, node, 0, "codepoints.item_ptr"))?;
+                    let next_ptr =
+                        built(builder.build_struct_gep(list_node, node, 1, "codepoints.next_ptr"))?;
+                    built(
+                        builder
+                            .build_store(item_ptr, codepoint_phi.as_basic_value().into_int_value()),
+                    )?;
+                    built(builder.build_store(next_ptr, null))?;
+                    let head = built(builder.build_load(pointer_ty, head_slot, "codepoints.head"))?
+                        .into_pointer_value();
+                    let empty = built(builder.build_is_null(head, "codepoints.output_empty"))?;
+                    built(builder.build_conditional_branch(empty, install_block, link_block))?;
+
+                    builder.position_at_end(install_block);
+                    built(builder.build_store(head_slot, node))?;
+                    built(builder.build_store(tail_slot, node))?;
+                    set_volatile(built(builder.build_store(partial, node))?)?;
+                    built(builder.build_unconditional_branch(continue_block))?;
+
+                    builder.position_at_end(link_block);
+                    let tail = built(builder.build_load(pointer_ty, tail_slot, "codepoints.tail"))?
+                        .into_pointer_value();
+                    let tail_next = built(builder.build_struct_gep(
+                        list_node,
+                        tail,
+                        1,
+                        "codepoints.tail_next",
+                    ))?;
+                    built(builder.build_store(tail_next, node))?;
+                    built(builder.build_store(tail_slot, node))?;
+                    built(builder.build_unconditional_branch(continue_block))?;
+
+                    builder.position_at_end(continue_block);
+                    let next_offset = built(builder.build_int_add(
+                        offset,
+                        width_phi.as_basic_value().into_int_value(),
+                        "codepoints.next_offset",
+                    ))?;
+                    let continue_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    offset_phi.add_incoming(&[(&next_offset, continue_end)]);
+
+                    builder.position_at_end(done_block);
+                    let output = built(builder.build_load(
+                        pointer_ty,
+                        head_slot,
+                        &format!("v{}", result.0),
+                    ))?
+                    .into_pointer_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    set_volatile(built(builder.build_store(partial, null))?)?;
+                    values.insert(*result, output.into());
+                }
+            }
+            Operation::StringFromBytes {
+                result,
+                bytes,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, bytes, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_from_bytes",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *bytes)?;
+                    let data = built(builder.build_extract_value(source, 1, "utf8.data"))?
+                        .into_pointer_value();
+                    let length = built(builder.build_extract_value(source, 2, "utf8.length"))?
+                        .into_int_value();
+                    let validated = built(builder.build_call(
+                        self.utf8_validate,
+                        &[data.into(), length.into()],
+                        "utf8.validated",
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::MissingValue(*result))?
+                    .into_int_value();
+                    let valid = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        validated,
+                        length,
+                        "utf8.valid",
+                    ))?;
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let valid_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.utf8_valid", result.0));
+                    let invalid_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.utf8_invalid", result.0));
+                    let done_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.utf8_done", result.0));
+                    built(builder.build_conditional_branch(valid, valid_block, invalid_block))?;
+
+                    let Some(Type::Union(members)) = self.core.types.get(ty.0 as usize) else {
+                        return Err(BackendError::UnsupportedType(*ty));
+                    };
+                    let tagged_member = |tag: &str| {
+                        members.iter().copied().find(|member| {
+                            matches!(self.core.types.get(member.0 as usize), Some(Type::Tuple(fields)) if
+                                matches!(fields.first().and_then(|field| self.core.types.get(field.0 as usize)), Some(Type::Atom(found)) if found == tag))
+                        })
+                    };
+                    let ok_ty = tagged_member("ok").ok_or(BackendError::UnsupportedType(*ty))?;
+                    let error_ty =
+                        tagged_member("error").ok_or(BackendError::UnsupportedType(*ty))?;
+
+                    builder.position_at_end(valid_block);
+                    let one = length.get_type().const_int(1, false);
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        "utf8.empty",
+                    ))?;
+                    let allocation_size =
+                        built(builder.build_select(empty, one, length, "utf8.allocation_size"))?
+                            .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "utf8.allocation_size.i64",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.utf8_copy", result.0),
+                        ),
+                    )?;
+                    let copied = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    built(builder.build_memcpy(copied, 1, data, 1, length))?;
+                    let string_ty = match self.core.types.get(ok_ty.0 as usize) {
+                        Some(Type::Tuple(fields)) => {
+                            *fields.get(1).ok_or(BackendError::UnsupportedType(ok_ty))?
+                        }
+                        _ => return Err(BackendError::UnsupportedType(ok_ty)),
+                    };
+                    let string_length = if length.get_type() == self.context.i64_type() {
+                        length
+                    } else {
+                        built(builder.build_int_cast(
+                            length,
+                            self.context.i64_type(),
+                            "utf8.string_length",
+                        ))?
+                    };
+                    let mut string = AggregateValueEnum::StructValue(
+                        self.basic_type(string_ty)?.into_struct_type().get_undef(),
+                    );
+                    string =
+                        built(builder.build_insert_value(string, copied, 0, "utf8.string_data"))?;
+                    string = built(builder.build_insert_value(
+                        string,
+                        string_length,
+                        1,
+                        "utf8.string_length_field",
+                    ))?;
+                    let mut ok = AggregateValueEnum::StructValue(
+                        self.basic_type(ok_ty)?.into_struct_type().get_undef(),
+                    );
+                    ok = built(builder.build_insert_value(
+                        ok,
+                        self.context.i8_type().const_zero(),
+                        0,
+                        "utf8.ok_tag",
+                    ))?;
+                    ok = built(builder.build_insert_value(
+                        ok,
+                        string.into_struct_value(),
+                        1,
+                        "utf8.ok_string",
+                    ))?;
+                    let mut ok_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let ok_tag = self.union_tag(*ty, ok_ty)?;
+                    ok_union = built(builder.build_insert_value(
+                        ok_union,
+                        self.context.i32_type().const_int(u64::from(ok_tag), false),
+                        0,
+                        "utf8.ok_union_tag",
+                    ))?;
+                    ok_union = built(builder.build_insert_value(
+                        ok_union,
+                        ok.into_struct_value(),
+                        ok_tag + 1,
+                        "utf8.ok_payload",
+                    ))?;
+                    let valid_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done_block))?;
+
+                    builder.position_at_end(invalid_block);
+                    let mut error = AggregateValueEnum::StructValue(
+                        self.basic_type(error_ty)?.into_struct_type().get_undef(),
+                    );
+                    error = built(builder.build_insert_value(
+                        error,
+                        self.context.i8_type().const_zero(),
+                        0,
+                        "utf8.error_tag",
+                    ))?;
+                    error = built(builder.build_insert_value(
+                        error,
+                        validated,
+                        1,
+                        "utf8.error_offset",
+                    ))?;
+                    let mut error_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let error_tag = self.union_tag(*ty, error_ty)?;
+                    error_union = built(
+                        builder.build_insert_value(
+                            error_union,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(error_tag), false),
+                            0,
+                            "utf8.error_union_tag",
+                        ),
+                    )?;
+                    error_union = built(builder.build_insert_value(
+                        error_union,
+                        error.into_struct_value(),
+                        error_tag + 1,
+                        "utf8.error_payload",
+                    ))?;
+                    let invalid_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done_block))?;
+
+                    builder.position_at_end(done_block);
+                    let output =
+                        built(builder.build_phi(self.basic_type(*ty)?, &format!("v{}", result.0)))?;
+                    let ok_value = ok_union.into_struct_value();
+                    let error_value = error_union.into_struct_value();
+                    output.add_incoming(&[(&ok_value, valid_end), (&error_value, invalid_end)]);
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    values.insert(*result, output.as_basic_value());
+                }
+            }
+            Operation::Utf8ErrorOffset { result, error, .. } => {
+                values.insert(*result, integer_value(values, *error)?.into());
+            }
+            Operation::RuneToString {
+                result,
+                rune,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, rune, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "rune_to_string",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let rune = integer_value(values, *rune)?;
+                    let rune_ty = rune.get_type();
+                    let one_byte = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        rune,
+                        rune_ty.const_int(0x7f, false),
+                        "rune.utf8.one_byte",
+                    ))?;
+                    let two_bytes = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        rune,
+                        rune_ty.const_int(0x7ff, false),
+                        "rune.utf8.two_bytes",
+                    ))?;
+                    let three_bytes = built(builder.build_int_compare(
+                        IntPredicate::ULE,
+                        rune,
+                        rune_ty.const_int(0xffff, false),
+                        "rune.utf8.three_bytes",
+                    ))?;
+                    let i64_ty = self.context.i64_type();
+                    let long_length = built(builder.build_select(
+                        three_bytes,
+                        i64_ty.const_int(3, false),
+                        i64_ty.const_int(4, false),
+                        "rune.utf8.long_length",
+                    ))?
+                    .into_int_value();
+                    let non_ascii_length = built(builder.build_select(
+                        two_bytes,
+                        i64_ty.const_int(2, false),
+                        long_length,
+                        "rune.utf8.non_ascii_length",
+                    ))?
+                    .into_int_value();
+                    let length = built(builder.build_select(
+                        one_byte,
+                        i64_ty.const_int(1, false),
+                        non_ascii_length,
+                        "rune.utf8.length",
+                    ))?
+                    .into_int_value();
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                i64_ty.const_int(4, false).into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                i64_ty.const_int(source_origin.start, false).into(),
+                                i64_ty.const_int(source_origin.end, false).into(),
+                            ],
+                            &format!("v{}.utf8", result.0),
+                        ),
+                    )?;
+                    let data = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+
+                    let shift = |amount: u64, name: &str| {
+                        built(builder.build_right_shift(
+                            rune,
+                            rune_ty.const_int(amount, false),
+                            false,
+                            name,
+                        ))
+                    };
+                    let mask = rune_ty.const_int(0x3f, false);
+                    let continuation = |value: IntValue<'ctx>, name: &str| {
+                        let low = built(builder.build_and(value, mask, &format!("{name}.low")))?;
+                        built(builder.build_or(low, rune_ty.const_int(0x80, false), name))
+                    };
+                    let first_two = built(builder.build_or(
+                        shift(6, "rune.utf8.shift6")?,
+                        rune_ty.const_int(0xc0, false),
+                        "rune.utf8.first_two",
+                    ))?;
+                    let first_three = built(builder.build_or(
+                        shift(12, "rune.utf8.shift12")?,
+                        rune_ty.const_int(0xe0, false),
+                        "rune.utf8.first_three",
+                    ))?;
+                    let first_four = built(builder.build_or(
+                        shift(18, "rune.utf8.shift18")?,
+                        rune_ty.const_int(0xf0, false),
+                        "rune.utf8.first_four",
+                    ))?;
+                    let first_long = built(builder.build_select(
+                        three_bytes,
+                        first_three,
+                        first_four,
+                        "rune.utf8.first_long",
+                    ))?
+                    .into_int_value();
+                    let first_non_ascii = built(builder.build_select(
+                        two_bytes,
+                        first_two,
+                        first_long,
+                        "rune.utf8.first_non_ascii",
+                    ))?
+                    .into_int_value();
+                    let first = built(builder.build_select(
+                        one_byte,
+                        rune,
+                        first_non_ascii,
+                        "rune.utf8.first",
+                    ))?
+                    .into_int_value();
+                    let second_long = built(builder.build_select(
+                        three_bytes,
+                        continuation(
+                            shift(6, "rune.utf8.second_shift6")?,
+                            "rune.utf8.second_three",
+                        )?,
+                        continuation(
+                            shift(12, "rune.utf8.second_shift12")?,
+                            "rune.utf8.second_four",
+                        )?,
+                        "rune.utf8.second_long",
+                    ))?
+                    .into_int_value();
+                    let second = built(builder.build_select(
+                        two_bytes,
+                        continuation(rune, "rune.utf8.second_two")?,
+                        second_long,
+                        "rune.utf8.second",
+                    ))?
+                    .into_int_value();
+                    let third = built(builder.build_select(
+                        three_bytes,
+                        continuation(rune, "rune.utf8.third_three")?,
+                        continuation(shift(6, "rune.utf8.third_shift6")?, "rune.utf8.third_four")?,
+                        "rune.utf8.third",
+                    ))?
+                    .into_int_value();
+                    let fourth = continuation(rune, "rune.utf8.fourth")?;
+                    let usize_ty = self.usize_type()?;
+                    for (index, byte) in [first, second, third, fourth].into_iter().enumerate() {
+                        let destination = self.element_pointer(
+                            builder,
+                            self.context.i8_type().into(),
+                            data,
+                            usize_ty.const_int(index as u64, false),
+                            "rune.utf8.byte_ptr",
+                        )?;
+                        let byte = built(builder.build_int_truncate(
+                            byte,
+                            self.context.i8_type(),
+                            "rune.utf8.byte",
+                        ))?;
+                        built(builder.build_store(destination, byte))?;
+                    }
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(output, data, 0, "string.data"))?;
+                    output = built(builder.build_insert_value(output, length, 1, "string.length"))?;
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::BufferNew { result, ty, .. } => {
+                values.insert(*result, self.basic_type(*ty)?.const_zero());
+            }
+            Operation::BufferAppend {
+                result,
+                buffer,
+                value: appended,
+                kind,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, buffer, appended, kind, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "buffer_append",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *buffer)?;
+                    let source_data =
+                        built(builder.build_extract_value(source, 1, "buffer.source_data"))?
+                            .into_pointer_value();
+                    let source_length =
+                        built(builder.build_extract_value(source, 2, "buffer.source_length"))?
+                            .into_int_value();
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let (appended_data, appended_length) = match kind {
+                        BufferAppendKind::Byte => (
+                            pointer_ty.const_null(),
+                            source_length.get_type().const_int(1, false),
+                        ),
+                        BufferAppendKind::Bytes => {
+                            let appended = struct_value(values, *appended)?;
+                            (
+                                built(builder.build_extract_value(
+                                    appended,
+                                    1,
+                                    "buffer.appended_data",
+                                ))?
+                                .into_pointer_value(),
+                                built(builder.build_extract_value(
+                                    appended,
+                                    2,
+                                    "buffer.appended_length",
+                                ))?
+                                .into_int_value(),
+                            )
+                        }
+                        BufferAppendKind::String => {
+                            let appended = struct_value(values, *appended)?;
+                            let length = built(builder.build_extract_value(
+                                appended,
+                                1,
+                                "buffer.appended_length",
+                            ))?
+                            .into_int_value();
+                            let length = if length.get_type() == source_length.get_type() {
+                                length
+                            } else {
+                                built(builder.build_int_cast(
+                                    length,
+                                    source_length.get_type(),
+                                    "buffer.appended_length.usize",
+                                ))?
+                            };
+                            (
+                                built(builder.build_extract_value(
+                                    appended,
+                                    0,
+                                    "buffer.appended_data",
+                                ))?
+                                .into_pointer_value(),
+                                length,
+                            )
+                        }
+                    };
+                    let length = built(builder.build_int_add(
+                        source_length,
+                        appended_length,
+                        "buffer.length",
+                    ))?;
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        "buffer.empty",
+                    ))?;
+                    let allocation_size = built(builder.build_select(
+                        empty,
+                        length.get_type().const_int(1, false),
+                        length,
+                        "buffer.allocation_size.nonzero",
+                    ))?
+                    .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "buffer.allocation_size",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.buffer", result.0),
+                        ),
+                    )?;
+                    let base = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    built(builder.build_memcpy(base, 1, source_data, 1, source_length))?;
+                    let destination = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        base,
+                        source_length,
+                        "buffer.append_destination",
+                    )?;
+                    match kind {
+                        BufferAppendKind::Byte => {
+                            built(
+                                builder.build_store(destination, integer_value(values, *appended)?),
+                            )?;
+                        }
+                        BufferAppendKind::Bytes | BufferAppendKind::String => {
+                            built(builder.build_memcpy(
+                                destination,
+                                1,
+                                appended_data,
+                                1,
+                                appended_length,
+                            ))?;
+                        }
+                    }
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    for (field, field_value) in [
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(length),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        output = built(builder.build_insert_value(
+                            output,
+                            field_value,
+                            field as u32,
+                            "buffer.field",
+                        ))?;
+                    }
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::BufferToBytes {
+                result,
+                buffer,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, buffer, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "buffer_to_bytes",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *buffer)?;
+                    let data = built(builder.build_extract_value(source, 1, "buffer.data"))?
+                        .into_pointer_value();
+                    let length = built(builder.build_extract_value(source, 2, "buffer.length"))?
+                        .into_int_value();
+                    let one = length.get_type().const_int(1, false);
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        "buffer.empty",
+                    ))?;
+                    let allocation_size =
+                        built(builder.build_select(empty, one, length, "buffer.snapshot_size"))?
+                            .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "buffer.snapshot_size.i64",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.buffer_snapshot", result.0),
+                        ),
+                    )?;
+                    let base = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    built(builder.build_memcpy(base, 1, data, 1, length))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    for (field, field_value) in [
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(length),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        output = built(builder.build_insert_value(
+                            output,
+                            field_value,
+                            field as u32,
+                            "bytes.field",
+                        ))?;
+                    }
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::BytesToBits {
+                result, bytes, ty, ..
+            } => {
+                let source = struct_value(values, *bytes)?;
+                let base = built(builder.build_extract_value(source, 0, "bits.base"))?;
+                let data = built(builder.build_extract_value(source, 1, "bits.data"))?;
+                let byte_length =
+                    built(builder.build_extract_value(source, 2, "bits.bytes"))?.into_int_value();
+                let bit_length = built(builder.build_left_shift(
+                    byte_length,
+                    byte_length.get_type().const_int(3, false),
+                    "bits.length",
+                ))?;
+                let mut output = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                for (field, field_value) in [
+                    base,
+                    data,
+                    self.usize_type()?.const_zero().into(),
+                    bit_length.into(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    output = built(builder.build_insert_value(
+                        output,
+                        field_value,
+                        field as u32,
+                        "bits.field",
+                    ))?;
+                }
+                values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::BitsSlice {
+                result,
+                bits,
+                start,
+                length,
+                failure,
+                ty,
+                ..
+            } => {
+                let source = struct_value(values, *bits)?;
+                let source_length = built(builder.build_extract_value(
+                    source,
+                    3,
+                    &format!("v{}.source_length", result.0),
+                ))?
+                .into_int_value();
+                let start = integer_value(values, *start)?;
+                let length = integer_value(values, *length)?;
+                let start_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    start,
+                    source_length,
+                    &format!("v{}.start_invalid", result.0),
+                ))?;
+                let remaining = built(builder.build_int_sub(
+                    source_length,
+                    start,
+                    &format!("v{}.remaining", result.0),
+                ))?;
+                let length_invalid = built(builder.build_int_compare(
+                    IntPredicate::UGT,
+                    length,
+                    remaining,
+                    &format!("v{}.length_invalid", result.0),
+                ))?;
+                let invalid = built(builder.build_or(
+                    start_invalid,
+                    length_invalid,
+                    &format!("v{}.out_of_bounds", result.0),
+                ))?;
+                let continuation = self.context.append_basic_block(
+                    builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?,
+                    &format!("v{}.bits_slice_ok", result.0),
+                );
+                built(builder.build_conditional_branch(
+                    invalid,
+                    self.block(blocks, *failure)?,
+                    continuation,
+                ))?;
+                builder.position_at_end(continuation);
+                let base = built(builder.build_extract_value(source, 0, "bits.base"))?;
+                let data = built(builder.build_extract_value(source, 1, "bits.data"))?;
+                let source_offset =
+                    built(builder.build_extract_value(source, 2, "bits.source_offset"))?
+                        .into_int_value();
+                let offset =
+                    built(builder.build_int_add(source_offset, start, "bits.slice_offset"))?;
+                let mut output = AggregateValueEnum::StructValue(
+                    self.basic_type(*ty)?.into_struct_type().get_undef(),
+                );
+                for (field, field_value) in [base, data, offset.into(), length.into()]
+                    .into_iter()
+                    .enumerate()
+                {
+                    output = built(builder.build_insert_value(
+                        output,
+                        field_value,
+                        field as u32,
+                        "bits.field",
+                    ))?;
+                }
+                values.insert(*result, output.into_struct_value().into());
+            }
+            Operation::BitsToBytes {
+                result,
+                bits,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, bits, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "bits_to_bytes",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *bits)?;
+                    let data = built(builder.build_extract_value(source, 1, "bits.data"))?
+                        .into_pointer_value();
+                    let offset = built(builder.build_extract_value(source, 2, "bits.offset"))?
+                        .into_int_value();
+                    let length = built(builder.build_extract_value(source, 3, "bits.length"))?
+                        .into_int_value();
+                    let remainder = built(builder.build_and(
+                        length,
+                        length.get_type().const_int(7, false),
+                        "bits.alignment_remainder",
+                    ))?;
+                    let aligned = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        remainder,
+                        length.get_type().const_zero(),
+                        "bits.byte_aligned",
+                    ))?;
+                    let llvm_function = builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| {
+                            BackendError::Builder("builder has no function".to_owned())
+                        })?;
+                    let some_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.bits_some", result.0));
+                    let none_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.bits_none", result.0));
+                    let done_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.bits_done", result.0));
+                    built(builder.build_conditional_branch(aligned, some_block, none_block))?;
+
+                    let Some(Type::Union(members)) = self.core.types.get(ty.0 as usize) else {
+                        return Err(BackendError::UnsupportedType(*ty));
+                    };
+                    let none_ty = members
+                        .iter()
+                        .copied()
+                        .find(|member| {
+                            matches!(self.core.types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none")
+                        })
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+                    let some_ty = members
+                        .iter()
+                        .copied()
+                        .find(|member| {
+                            matches!(self.core.types.get(member.0 as usize), Some(Type::Tuple(fields)) if
+                                matches!(fields.first().and_then(|field| self.core.types.get(field.0 as usize)), Some(Type::Atom(name)) if name == "some"))
+                        })
+                        .ok_or(BackendError::UnsupportedType(*ty))?;
+
+                    builder.position_at_end(none_block);
+                    let mut none_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let none_tag = self.union_tag(*ty, none_ty)?;
+                    none_union = built(
+                        builder.build_insert_value(
+                            none_union,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(none_tag), false),
+                            0,
+                            "bits.none_tag",
+                        ),
+                    )?;
+                    let none_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done_block))?;
+
+                    builder.position_at_end(some_block);
+                    let byte_length = built(builder.build_right_shift(
+                        length,
+                        length.get_type().const_int(3, false),
+                        false,
+                        "bits.byte_length",
+                    ))?;
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        byte_length,
+                        byte_length.get_type().const_zero(),
+                        "bits.empty",
+                    ))?;
+                    let allocation_size = built(builder.build_select(
+                        empty,
+                        byte_length.get_type().const_int(1, false),
+                        byte_length,
+                        "bits.allocation_size",
+                    ))?
+                    .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            "bits.allocation_size.i64",
+                        ))?
+                    };
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}.bits_bytes", result.0),
+                        ),
+                    )?;
+                    let base = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    let preheader = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    let loop_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.bits_pack", result.0));
+                    let body_block = self.context.append_basic_block(
+                        llvm_function,
+                        &format!("v{}.bits_pack_body", result.0),
+                    );
+                    let packed_block = self
+                        .context
+                        .append_basic_block(llvm_function, &format!("v{}.bits_packed", result.0));
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    builder.position_at_end(loop_block);
+                    let index_phi = built(builder.build_phi(offset.get_type(), "bits.pack_index"))?;
+                    index_phi.add_incoming(&[(&offset.get_type().const_zero(), preheader)]);
+                    let index = index_phi.as_basic_value().into_int_value();
+                    let finished = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        index,
+                        byte_length,
+                        "bits.pack_finished",
+                    ))?;
+                    built(builder.build_conditional_branch(finished, packed_block, body_block))?;
+                    builder.position_at_end(body_block);
+                    let absolute = built(builder.build_int_add(
+                        offset,
+                        built(builder.build_left_shift(
+                            index,
+                            index.get_type().const_int(3, false),
+                            "bits.pack_index_bits",
+                        ))?,
+                        "bits.pack_absolute",
+                    ))?;
+                    let source_index = built(builder.build_right_shift(
+                        absolute,
+                        absolute.get_type().const_int(3, false),
+                        false,
+                        "bits.pack_source_index",
+                    ))?;
+                    let first_ptr = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        data,
+                        source_index,
+                        "bits.pack_first_ptr",
+                    )?;
+                    let first = built(builder.build_load(
+                        self.context.i8_type(),
+                        first_ptr,
+                        "bits.pack_first",
+                    ))?
+                    .into_int_value();
+                    let shift = built(builder.build_and(
+                        absolute,
+                        absolute.get_type().const_int(7, false),
+                        "bits.pack_shift",
+                    ))?;
+                    let shift_i8 = built(builder.build_int_truncate(
+                        shift,
+                        self.context.i8_type(),
+                        "bits.pack_shift_i8",
+                    ))?;
+                    let shift_zero = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        shift,
+                        shift.get_type().const_zero(),
+                        "bits.pack_aligned",
+                    ))?;
+                    let next_index = built(builder.build_int_add(
+                        source_index,
+                        source_index.get_type().const_int(1, false),
+                        "bits.pack_next_index",
+                    ))?;
+                    let next_index = built(builder.build_select(
+                        shift_zero,
+                        source_index,
+                        next_index,
+                        "bits.pack_safe_next_index",
+                    ))?
+                    .into_int_value();
+                    let next_ptr = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        data,
+                        next_index,
+                        "bits.pack_next_ptr",
+                    )?;
+                    let next = built(builder.build_load(
+                        self.context.i8_type(),
+                        next_ptr,
+                        "bits.pack_next",
+                    ))?
+                    .into_int_value();
+                    let high = built(builder.build_left_shift(first, shift_i8, "bits.pack_high"))?;
+                    let inverse = built(builder.build_int_sub(
+                        self.context.i8_type().const_int(8, false),
+                        shift_i8,
+                        "bits.pack_inverse_shift",
+                    ))?;
+                    let low =
+                        built(builder.build_right_shift(next, inverse, false, "bits.pack_low"))?;
+                    let combined = built(builder.build_or(high, low, "bits.pack_combined"))?;
+                    let packed =
+                        built(builder.build_select(shift_zero, first, combined, "bits.pack_byte"))?;
+                    let destination = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        base,
+                        index,
+                        "bits.pack_destination",
+                    )?;
+                    built(builder.build_store(destination, packed))?;
+                    let next_index = built(builder.build_int_add(
+                        index,
+                        index.get_type().const_int(1, false),
+                        "bits.pack_next",
+                    ))?;
+                    let body_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(loop_block))?;
+                    index_phi.add_incoming(&[(&next_index, body_end)]);
+
+                    builder.position_at_end(packed_block);
+                    let bytes_ty = match self.core.types.get(some_ty.0 as usize) {
+                        Some(Type::Tuple(fields)) => *fields
+                            .get(1)
+                            .ok_or(BackendError::UnsupportedType(some_ty))?,
+                        _ => return Err(BackendError::UnsupportedType(some_ty)),
+                    };
+                    let mut bytes_value = AggregateValueEnum::StructValue(
+                        self.basic_type(bytes_ty)?.into_struct_type().get_undef(),
+                    );
+                    for (field, field_value) in [
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(base),
+                        BasicValueEnum::from(byte_length),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        bytes_value = built(builder.build_insert_value(
+                            bytes_value,
+                            field_value,
+                            field as u32,
+                            "bits.bytes_field",
+                        ))?;
+                    }
+                    let mut some = AggregateValueEnum::StructValue(
+                        self.basic_type(some_ty)?.into_struct_type().get_undef(),
+                    );
+                    some = built(builder.build_insert_value(
+                        some,
+                        self.context.i8_type().const_zero(),
+                        0,
+                        "bits.some_atom",
+                    ))?;
+                    some = built(builder.build_insert_value(
+                        some,
+                        bytes_value.into_struct_value(),
+                        1,
+                        "bits.some_bytes",
+                    ))?;
+                    let mut some_union = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    let some_tag = self.union_tag(*ty, some_ty)?;
+                    some_union = built(
+                        builder.build_insert_value(
+                            some_union,
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(some_tag), false),
+                            0,
+                            "bits.some_tag",
+                        ),
+                    )?;
+                    some_union = built(builder.build_insert_value(
+                        some_union,
+                        some.into_struct_value(),
+                        some_tag + 1,
+                        "bits.some_payload",
+                    ))?;
+                    let some_end = builder
+                        .get_insert_block()
+                        .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+                    built(builder.build_unconditional_branch(done_block))?;
+
+                    builder.position_at_end(done_block);
+                    let output =
+                        built(builder.build_phi(self.basic_type(*ty)?, &format!("v{}", result.0)))?;
+                    let none_value = none_union.into_struct_value();
+                    let some_value = some_union.into_struct_value();
+                    output.add_incoming(&[(&none_value, none_end), (&some_value, some_end)]);
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    values.insert(*result, output.as_basic_value());
+                }
             }
             Operation::BytesFromList {
                 result,
@@ -4440,6 +6436,13 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         &format!("v{}", result.0),
                     ))?
                     .into_int_value()
+                } else if matches!(self.core.types.get(source_ty.0 as usize), Some(Type::Bits)) {
+                    built(builder.build_extract_value(
+                        struct_value(values, *value)?,
+                        3,
+                        &format!("v{}", result.0),
+                    ))?
+                    .into_int_value()
                 } else {
                     built(builder.build_extract_value(
                         struct_value(values, *value)?,
@@ -4517,7 +6520,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     ComparisonOperator::Equal | ComparisonOperator::NotEqual
                 ) && !matches!(
                     self.core.types.get(operand_ty.0 as usize),
-                    Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Bool)
+                    Some(
+                        Type::I32
+                            | Type::I64
+                            | Type::Usize
+                            | Type::Rune
+                            | Type::Utf8Error
+                            | Type::U8
+                            | Type::Bool
+                    )
                 ) {
                     #[cfg(not(feature = "managed-runtime"))]
                     return Err(BackendError::UnsupportedOperation {
@@ -4545,7 +6556,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 }
                 let unsigned = matches!(
                     self.core.types.get(operand_ty.0 as usize),
-                    Some(Type::U8 | Type::Usize)
+                    Some(Type::Rune | Type::U8 | Type::Usize)
                 );
                 let predicate = match operator {
                     ComparisonOperator::Equal => IntPredicate::EQ,
@@ -5113,6 +7124,11 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     ]);
                 Ok(string.into())
             }
+            (Constant::Rune(value), Some(Type::Rune)) => Ok(self
+                .context
+                .i32_type()
+                .const_int(u64::from(u32::from(*value)), false)
+                .into()),
             (Constant::Atom(_), Some(Type::Atom(_))) => {
                 Ok(self.context.i8_type().const_zero().into())
             }
@@ -5152,6 +7168,16 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::SliceSubslice { result, ty, .. }
                     | Operation::SliceCopy { result, ty, .. }
                     | Operation::StringBytes { result, ty, .. }
+                    | Operation::StringCodepoints { result, ty, .. }
+                    | Operation::StringFromBytes { result, ty, .. }
+                    | Operation::Utf8ErrorOffset { result, ty, .. }
+                    | Operation::RuneToString { result, ty, .. }
+                    | Operation::BufferNew { result, ty, .. }
+                    | Operation::BufferAppend { result, ty, .. }
+                    | Operation::BufferToBytes { result, ty, .. }
+                    | Operation::BytesToBits { result, ty, .. }
+                    | Operation::BitsSlice { result, ty, .. }
+                    | Operation::BitsToBytes { result, ty, .. }
                     | Operation::BytesFromList { result, ty, .. }
                     | Operation::BytesToList { result, ty, .. }
                     | Operation::BytesSlice { result, ty, .. }
@@ -5588,6 +7614,104 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("gc.partial"), "{text}");
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_rune_to_utf8_with_atomic_storage() {
+        let core = concrete(
+            "defmodule Main do\n  def render(value: rune) -> string do\n    Rune.to_string(value)\n  end\n  def main() -> i32 do\n    if String.byte_size(render('🙂')) == 4 do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("rune UTF-8 lowering verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("rune.utf8.length"), "{text}");
+        assert!(text.contains("rune.utf8.first"), "{text}");
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_atomic(i64 4"),
+            "{text}"
+        );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_eager_utf8_codepoint_decoding_with_rooted_list_construction() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    if String.codepoints(\"Aé🙂\") == ['A', 'e', '́', '🙂'] do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("codepoint decoding lowers and verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("codepoints_loop"), "{text}");
+        assert!(text.contains("codepoints_two"), "{text}");
+        assert!(text.contains("codepoints_three"), "{text}");
+        assert!(text.contains("codepoints_four"), "{text}");
+        assert!(text.contains("codepoints.value = phi i32"), "{text}");
+        assert!(text.contains("gc.partial"), "{text}");
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_utf8_validation_to_tagged_results_and_copy_on_success() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    match String.from_bytes(String.bytes(\"é\")) do\n      value: {:ok, string} -> 42\n      _ -> 0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("UTF-8 validation lowers and verifies");
+        let text = llvm.as_str();
+        assert!(
+            text.contains("call i64 @__el_runtime_utf8_validate"),
+            "{text}"
+        );
+        assert!(text.contains("utf8_valid"), "{text}");
+        assert!(text.contains("utf8_invalid"), "{text}");
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_atomic"),
+            "{text}"
+        );
+        assert!(text.contains("llvm.memcpy"), "{text}");
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_buffer_appends_snapshots_and_shared_utf8_validation() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    first = Buffer.append_string(Buffer.new(), \"hello\")\n    second = Buffer.append_byte(first, 32)\n    complete = Buffer.append_bytes(second, String.bytes(\"world\"))\n    snapshot = Buffer.to_bytes(complete)\n    match Buffer.to_string(complete) do\n      value: {:ok, string} -> if Bytes.byte_size(snapshot) == 11 do\n        42\n      else\n        0\n      end\n      _ -> 0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("Buffer lowering verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("buffer.append_destination"), "{text}");
+        assert!(text.contains("buffer_snapshot"), "{text}");
+        assert!(
+            text.contains("call i64 @__el_runtime_utf8_validate"),
+            "{text}"
+        );
+        assert!(
+            text.matches("call ptr @__el_runtime_alloc_atomic").count() >= 5,
+            "{text}"
+        );
+        assert!(text.contains("llvm.memcpy"), "{text}");
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_arbitrary_bit_views_indexing_and_packed_byte_conversion() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(String.bytes(\"abc\"))\n    view = Bits.slice(bits, 3, 16)\n    Bits.to_bytes(view)\n    if Bits.bit_size(view) == 16 and view[0] and view == Bits.slice(bits, 3, 16) do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("bits lowering verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("bits_slice_ok"), "{text}");
+        assert!(text.contains("shifted_bit"), "{text}");
+        assert!(text.contains("bits_pack"), "{text}");
+        assert!(text.contains("bits.pack_combined"), "{text}");
+        assert!(text.contains("equal.loop"), "{text}");
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_atomic"),
+            "{text}"
+        );
     }
 
     #[test]

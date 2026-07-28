@@ -20,6 +20,10 @@ pub enum Type {
     Unit,
     String,
     Bytes,
+    Bits,
+    Buffer,
+    Rune,
+    Utf8Error,
     U8,
     Atom(String),
     List(TypeId),
@@ -225,6 +229,7 @@ pub enum TypedExprKind {
     Boolean(bool),
     Unit,
     String(String),
+    Rune(char),
     Atom(String),
     List {
         elements: Vec<TypedExpr>,
@@ -274,6 +279,25 @@ pub enum TypedExprKind {
     },
     SliceCopy(Box<TypedExpr>),
     StringBytes(Box<TypedExpr>),
+    StringCodepoints(Box<TypedExpr>),
+    StringFromBytes(Box<TypedExpr>),
+    Utf8ErrorOffset(Box<TypedExpr>),
+    RuneToString(Box<TypedExpr>),
+    BufferNew,
+    BufferAppend {
+        buffer: Box<TypedExpr>,
+        value: Box<TypedExpr>,
+        kind: BufferAppendKind,
+    },
+    BufferToBytes(Box<TypedExpr>),
+    BufferToString(Box<TypedExpr>),
+    BytesToBits(Box<TypedExpr>),
+    BitsToBytes(Box<TypedExpr>),
+    BitsSlice {
+        value: Box<TypedExpr>,
+        start: Box<TypedExpr>,
+        length: Box<TypedExpr>,
+    },
     BytesFromList(Box<TypedExpr>),
     BytesToList(Box<TypedExpr>),
     BytesSlice {
@@ -321,6 +345,13 @@ pub enum TypedExprKind {
         member: TypeId,
         value: Box<TypedExpr>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferAppendKind {
+    Byte,
+    Bytes,
+    String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,6 +681,10 @@ impl<'a> Checker<'a> {
                 "unit" => Some(TypeId(3)),
                 "string" => Some(self.intern(Type::String)),
                 "bytes" => Some(self.intern(Type::Bytes)),
+                "bits" => Some(self.intern(Type::Bits)),
+                "Buffer" => Some(self.intern(Type::Buffer)),
+                "rune" => Some(self.intern(Type::Rune)),
+                "String.Utf8Error" => Some(self.intern(Type::Utf8Error)),
                 "u8" => Some(self.intern(Type::U8)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
@@ -1187,6 +1222,12 @@ impl<'a> Checker<'a> {
                         span: node.span,
                     });
                 }
+                if written == "String.Utf8Error" && node.children.len() == 1 {
+                    return Some(TypeSyntax::Primitive {
+                        name: written,
+                        span: node.span,
+                    });
+                }
                 let declaration = self
                     .aliases
                     .values()
@@ -1369,6 +1410,7 @@ impl<'a> Checker<'a> {
                 span: node.span,
             }),
             "string" => self.check_string(node),
+            "rune" => self.check_rune(node),
             "atom" => self.check_atom(node),
             "list_literal" => self.check_list(node, expected, owner, scopes),
             "array_literal" => self.check_array(node, expected, owner, scopes),
@@ -1437,6 +1479,11 @@ impl<'a> Checker<'a> {
                 .iter()
                 .copied()
                 .filter(|member| matches!(self.types[member.0 as usize], Type::String))
+                .collect(),
+            "rune" => members
+                .iter()
+                .copied()
+                .filter(|member| matches!(self.types[member.0 as usize], Type::Rune))
                 .collect(),
             "list_literal" => members
                 .iter()
@@ -2170,6 +2217,17 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_rune(&mut self, node: &Node) -> Option<TypedExpr> {
+        let Some(Value::Rune { decoded, .. }) = &node.value else {
+            return None;
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Rune(*decoded),
+            ty: self.intern(Type::Rune),
+            span: node.span,
+        })
+    }
+
     fn check_name(&mut self, node: &Node, scopes: &[BTreeMap<String, Local>]) -> Option<TypedExpr> {
         let name = unqualified_name(node)?;
         if let Some(local) = lookup(scopes, &name) {
@@ -2246,14 +2304,14 @@ impl<'a> Checker<'a> {
         );
         let supported = matches!(
             self.types[left.ty.0 as usize],
-            Type::I32 | Type::I64 | Type::Usize | Type::U8
+            Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Rune
         ) || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
         if !supported {
             self.diagnostics.push(Diagnostic::error(
                 "E2139",
                 node.span,
                 if ordered {
-                    "ordered comparison requires matching integer operands"
+                    "ordered comparison requires matching integer or rune operands"
                 } else {
                     "equality requires matching operands that implement `Eq`"
                 },
@@ -2350,6 +2408,7 @@ impl<'a> Checker<'a> {
                     Type::Array { item, length } => (item, Some(length)),
                     Type::Slice(item) => (item, None),
                     Type::Bytes => (self.intern(Type::U8), None),
+                    Type::Bits => (self.intern(Type::Bool), None),
                     Type::String => {
                         self.diagnostics.push(Diagnostic::error(
                             "E2150",
@@ -2633,10 +2692,25 @@ impl<'a> Checker<'a> {
                     | "Slice.length"
                     | "String.byte_size"
                     | "String.bytes"
+                    | "String.codepoints"
+                    | "String.from_bytes"
+                    | "String.utf8_error_offset"
+                    | "Rune.to_string"
+                    | "Buffer.new"
+                    | "Buffer.byte_size"
+                    | "Buffer.append_byte"
+                    | "Buffer.append_bytes"
+                    | "Buffer.append_string"
+                    | "Buffer.to_bytes"
+                    | "Buffer.to_string"
+                    | "Bits.bit_size"
+                    | "Bits.slice"
+                    | "Bits.to_bytes"
                     | "Bytes.byte_size"
                     | "Bytes.slice"
                     | "Bytes.from_list"
                     | "Bytes.to_list"
+                    | "Bytes.to_bits"
             )
         }) {
             let arguments_node = node
@@ -2834,9 +2908,32 @@ impl<'a> Checker<'a> {
                 span,
             });
         }
+        if name == "Buffer.new" {
+            if !arguments.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2111",
+                    span,
+                    format!(
+                        "function `{name}` expects 0 arguments but received {}",
+                        arguments.len()
+                    ),
+                ));
+                return None;
+            }
+            let ty = self.intern(Type::Buffer);
+            return Some(TypedExpr {
+                kind: TypedExprKind::BufferNew,
+                ty,
+                span,
+            });
+        }
         let required = match name {
-            "Slice.subslice" | "Bytes.slice" | "Map.put" => 3,
-            "Map.remove" | "Map.fetch" => 2,
+            "Slice.subslice" | "Bytes.slice" | "Bits.slice" | "Map.put" => 3,
+            "Map.remove"
+            | "Map.fetch"
+            | "Buffer.append_byte"
+            | "Buffer.append_bytes"
+            | "Buffer.append_string" => 2,
             _ => 1,
         };
         if arguments.len() != required {
@@ -2934,6 +3031,116 @@ impl<'a> Checker<'a> {
                 let ty = self.intern(Type::Bytes);
                 (TypedExprKind::StringBytes(Box::new(first)), ty)
             }
+            ("String.codepoints", Type::String) => {
+                let rune_ty = self.intern(Type::Rune);
+                let ty = self.intern(Type::List(rune_ty));
+                (TypedExprKind::StringCodepoints(Box::new(first)), ty)
+            }
+            ("String.from_bytes", Type::Bytes) => {
+                let ok_atom = self.intern(Type::Atom("ok".to_owned()));
+                let error_atom = self.intern(Type::Atom("error".to_owned()));
+                let string_ty = self.intern(Type::String);
+                let error_ty = self.intern(Type::Utf8Error);
+                let ok = self.intern(Type::Tuple(vec![ok_atom, string_ty]));
+                let error = self.intern(Type::Tuple(vec![error_atom, error_ty]));
+                let ty = self.normalize_union(vec![ok, error], span)?;
+                (TypedExprKind::StringFromBytes(Box::new(first)), ty)
+            }
+            ("String.utf8_error_offset", Type::Utf8Error) => {
+                (TypedExprKind::Utf8ErrorOffset(Box::new(first)), usize_ty)
+            }
+            ("Rune.to_string", Type::Rune) => {
+                let ty = self.intern(Type::String);
+                (TypedExprKind::RuneToString(Box::new(first)), ty)
+            }
+            ("Buffer.byte_size", Type::Buffer) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("Buffer.append_byte", Type::Buffer) => {
+                let expected = self.intern(Type::U8);
+                let value = self.check_expr(arguments[1], Some(expected), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::BufferAppend {
+                        buffer: Box::new(first),
+                        value: Box::new(value),
+                        kind: BufferAppendKind::Byte,
+                    },
+                    ty,
+                )
+            }
+            ("Buffer.append_bytes", Type::Buffer) => {
+                let expected = self.intern(Type::Bytes);
+                let value = self.check_expr(arguments[1], Some(expected), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::BufferAppend {
+                        buffer: Box::new(first),
+                        value: Box::new(value),
+                        kind: BufferAppendKind::Bytes,
+                    },
+                    ty,
+                )
+            }
+            ("Buffer.append_string", Type::Buffer) => {
+                let expected = self.intern(Type::String);
+                let value = self.check_expr(arguments[1], Some(expected), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::BufferAppend {
+                        buffer: Box::new(first),
+                        value: Box::new(value),
+                        kind: BufferAppendKind::String,
+                    },
+                    ty,
+                )
+            }
+            ("Buffer.to_bytes", Type::Buffer) => {
+                let ty = self.intern(Type::Bytes);
+                (TypedExprKind::BufferToBytes(Box::new(first)), ty)
+            }
+            ("Buffer.to_string", Type::Buffer) => {
+                let ok_atom = self.intern(Type::Atom("ok".to_owned()));
+                let error_atom = self.intern(Type::Atom("error".to_owned()));
+                let string_ty = self.intern(Type::String);
+                let error_ty = self.intern(Type::Utf8Error);
+                let ok = self.intern(Type::Tuple(vec![ok_atom, string_ty]));
+                let error = self.intern(Type::Tuple(vec![error_atom, error_ty]));
+                let ty = self.normalize_union(vec![ok, error], span)?;
+                (TypedExprKind::BufferToString(Box::new(first)), ty)
+            }
+            ("Bits.bit_size", Type::Bits) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("Bits.slice", Type::Bits) => {
+                let start = self.check_expr(arguments[1], Some(usize_ty), owner, scopes)?;
+                let length = self.check_expr(arguments[2], Some(usize_ty), owner, scopes)?;
+                let ty = first.ty;
+                (
+                    TypedExprKind::BitsSlice {
+                        value: Box::new(first),
+                        start: Box::new(start),
+                        length: Box::new(length),
+                    },
+                    ty,
+                )
+            }
+            ("Bits.to_bytes", Type::Bits) => {
+                let some_atom = self.intern(Type::Atom("some".to_owned()));
+                let none_atom = self.intern(Type::Atom("none".to_owned()));
+                let bytes_ty = self.intern(Type::Bytes);
+                let some = self.intern(Type::Tuple(vec![some_atom, bytes_ty]));
+                let ty = self.normalize_union(vec![some, none_atom], span)?;
+                (TypedExprKind::BitsToBytes(Box::new(first)), ty)
+            }
             ("Bytes.byte_size", Type::Bytes) => (
                 TypedExprKind::CollectionLength {
                     value: Box::new(first),
@@ -2951,6 +3158,10 @@ impl<'a> Checker<'a> {
                 let u8_ty = self.intern(Type::U8);
                 let ty = self.intern(Type::List(u8_ty));
                 (TypedExprKind::BytesToList(Box::new(first)), ty)
+            }
+            ("Bytes.to_bits", Type::Bytes) => {
+                let ty = self.intern(Type::Bits);
+                (TypedExprKind::BytesToBits(Box::new(first)), ty)
             }
             ("Bytes.slice", Type::Bytes) => {
                 let start = self.check_expr(arguments[1], Some(usize_ty), owner, scopes)?;
@@ -3192,10 +3403,14 @@ impl<'a> Checker<'a> {
             | Type::Unit
             | Type::String
             | Type::Bytes
+            | Type::Bits
+            | Type::Rune
             | Type::U8
             | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
             }
+            Type::Buffer => false,
+            Type::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
             Type::List(item) => match protocol {
                 "Iterable" | "Concat" => true,
                 "Eq" | "Ord" | "Show" | "Hash" => self.type_satisfies(*item, protocol, owner),
@@ -3251,6 +3466,10 @@ impl<'a> Checker<'a> {
             Type::Unit => "unit".to_owned(),
             Type::String => "string".to_owned(),
             Type::Bytes => "bytes".to_owned(),
+            Type::Bits => "bits".to_owned(),
+            Type::Buffer => "Buffer".to_owned(),
+            Type::Rune => "rune".to_owned(),
+            Type::Utf8Error => "String.Utf8Error".to_owned(),
             Type::U8 => "u8".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
@@ -3315,6 +3534,10 @@ impl<'a> Checker<'a> {
             Type::Unit => "00:unit".to_owned(),
             Type::String => "00:string".to_owned(),
             Type::Bytes => "00:bytes".to_owned(),
+            Type::Bits => "00:bits".to_owned(),
+            Type::Buffer => "00:Buffer".to_owned(),
+            Type::Rune => "00:rune".to_owned(),
+            Type::Utf8Error => "00:String.Utf8Error".to_owned(),
             Type::U8 => "00:u8".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
@@ -3388,6 +3611,10 @@ fn unify_types(
     match (&types[left.0 as usize], &types[right.0 as usize]) {
         (Type::String, Type::String) => true,
         (Type::Bytes, Type::Bytes) => true,
+        (Type::Bits, Type::Bits) => true,
+        (Type::Buffer, Type::Buffer) => true,
+        (Type::Rune, Type::Rune) => true,
+        (Type::Utf8Error, Type::Utf8Error) => true,
         (Type::U8, Type::U8) => true,
         (Type::Atom(left), Type::Atom(right)) => left == right,
         (Type::List(left), Type::List(right)) => unify_types(types, *left, *right, substitutions),
@@ -4258,6 +4485,14 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         TypedExprKind::SliceFromArray { value, .. }
         | TypedExprKind::SliceCopy(value)
         | TypedExprKind::StringBytes(value)
+        | TypedExprKind::StringCodepoints(value)
+        | TypedExprKind::StringFromBytes(value)
+        | TypedExprKind::Utf8ErrorOffset(value)
+        | TypedExprKind::RuneToString(value)
+        | TypedExprKind::BufferToBytes(value)
+        | TypedExprKind::BufferToString(value)
+        | TypedExprKind::BytesToBits(value)
+        | TypedExprKind::BitsToBytes(value)
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::CollectionLength { value, .. } => collect_expr_locals(value, output),
@@ -4269,6 +4504,19 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
             collect_expr_locals(value, output);
             collect_expr_locals(start, output);
             collect_expr_locals(length, output);
+        }
+        TypedExprKind::BitsSlice {
+            value,
+            start,
+            length,
+        } => {
+            collect_expr_locals(value, output);
+            collect_expr_locals(start, output);
+            collect_expr_locals(length, output);
+        }
+        TypedExprKind::BufferAppend { buffer, value, .. } => {
+            collect_expr_locals(buffer, output);
+            collect_expr_locals(value, output);
         }
         TypedExprKind::SliceSubslice {
             value,
@@ -4314,6 +4562,8 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::Boolean(_)
         | TypedExprKind::Unit
         | TypedExprKind::String(_)
+        | TypedExprKind::Rune(_)
+        | TypedExprKind::BufferNew
         | TypedExprKind::Atom(_) => {}
     }
 }
@@ -4354,6 +4604,11 @@ fn verify_expr(
             if !matches!(types.get(expression.ty.0 as usize), Some(Type::String)) =>
         {
             errors.push("string expression has a non-string type".to_owned());
+        }
+        TypedExprKind::Rune(_)
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::Rune)) =>
+        {
+            errors.push("rune expression has a non-rune type".to_owned());
         }
         TypedExprKind::Atom(name) if !matches!(types.get(expression.ty.0 as usize), Some(Type::Atom(expected)) if expected == name) =>
         {
@@ -4526,6 +4781,8 @@ fn verify_expr(
                 (Some(Type::Slice(item)), None) if *item == expression.ty => {}
                 (Some(Type::Bytes), None)
                     if matches!(types.get(expression.ty.0 as usize), Some(Type::U8)) => {}
+                (Some(Type::Bits), None)
+                    if matches!(types.get(expression.ty.0 as usize), Some(Type::Bool)) => {}
                 _ => {
                     errors.push("index expression has an invalid source or result type".to_owned())
                 }
@@ -4604,6 +4861,212 @@ fn verify_expr(
                 errors.push("string bytes conversion has incorrect types".to_owned());
             }
         }
+        TypedExprKind::StringCodepoints(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::String))
+                || !matches!(
+                    types.get(expression.ty.0 as usize),
+                    Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::Rune))
+                )
+            {
+                errors.push("string codepoints conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::StringFromBytes(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let valid_result = matches!(types.get(expression.ty.0 as usize), Some(Type::Union(members)) if {
+                let has = |tag: &str, payload: fn(&Type) -> bool| members.iter().any(|member| {
+                    matches!(types.get(member.0 as usize), Some(Type::Tuple(fields)) if fields.len() == 2
+                        && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(found)) if found == tag)
+                        && types.get(fields[1].0 as usize).is_some_and(payload))
+                });
+                has("ok", |ty| matches!(ty, Type::String))
+                    && has("error", |ty| matches!(ty, Type::Utf8Error))
+            });
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Bytes)) || !valid_result {
+                errors.push("string from-bytes conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::Utf8ErrorOffset(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Utf8Error))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push("UTF-8 error offset access has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::RuneToString(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Rune))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::String))
+            {
+                errors.push("rune to-string conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BufferNew => {
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::Buffer)) {
+                errors.push("buffer construction has an incorrect type".to_owned());
+            }
+        }
+        TypedExprKind::BufferAppend {
+            buffer,
+            value,
+            kind,
+        } => {
+            verify_expr(
+                buffer,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let valid_value = match kind {
+                BufferAppendKind::Byte => matches!(types.get(value.ty.0 as usize), Some(Type::U8)),
+                BufferAppendKind::Bytes => {
+                    matches!(types.get(value.ty.0 as usize), Some(Type::Bytes))
+                }
+                BufferAppendKind::String => {
+                    matches!(types.get(value.ty.0 as usize), Some(Type::String))
+                }
+            };
+            if buffer.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Buffer))
+                || !valid_value
+            {
+                errors.push("buffer append has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BufferToBytes(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Buffer))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push("buffer to-bytes conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BufferToString(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Buffer))
+                || !is_utf8_result_type(types, expression.ty)
+            {
+                errors.push("buffer to-string conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BytesToBits(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Bytes))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bits))
+            {
+                errors.push("bytes to-bits conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BitsToBytes(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Bits))
+                || !is_option_bytes_type(types, expression.ty)
+            {
+                errors.push("bits to-bytes conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::BitsSlice {
+            value,
+            start,
+            length,
+        } => {
+            for child in [value.as_ref(), start.as_ref(), length.as_ref()] {
+                verify_expr(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            if value.ty != expression.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Bits))
+                || !matches!(types.get(start.ty.0 as usize), Some(Type::Usize))
+                || !matches!(types.get(length.ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push("bits slice has incorrect types".to_owned());
+            }
+        }
         TypedExprKind::BytesFromList(value) => {
             verify_expr(
                 value,
@@ -4680,9 +5143,17 @@ fn verify_expr(
             );
             let valid_source = match (types.get(value.ty.0 as usize), known_length) {
                 (Some(Type::Array { length, .. }), Some(known)) => length == known,
-                (Some(Type::String | Type::Bytes | Type::Slice(_) | Type::Map { .. }), None) => {
-                    true
-                }
+                (
+                    Some(
+                        Type::String
+                        | Type::Bytes
+                        | Type::Bits
+                        | Type::Buffer
+                        | Type::Slice(_)
+                        | Type::Map { .. },
+                    ),
+                    None,
+                ) => true,
                 _ => false,
             };
             if !matches!(types.get(expression.ty.0 as usize), Some(Type::Usize)) || !valid_source {
@@ -5006,7 +5477,7 @@ fn verify_expr(
             );
             let supported = matches!(
                 types.get(left.ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Rune)
             ) || (!ordered && standard_eq_type(types, left.ty));
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
@@ -5087,9 +5558,13 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Unit
             | Type::String
             | Type::Bytes
+            | Type::Bits
+            | Type::Rune
+            | Type::Utf8Error
             | Type::U8
             | Type::Atom(_),
         ) => true,
+        Some(Type::Buffer) => false,
         Some(Type::List(item) | Type::Slice(item)) => standard_eq_type(types, *item),
         Some(Type::Array { item, .. }) => standard_eq_type(types, *item),
         Some(Type::Tuple(items)) => items.iter().all(|item| standard_eq_type(types, *item)),
@@ -5098,6 +5573,32 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_utf8_result_type(types: &[Type], ty: TypeId) -> bool {
+    matches!(types.get(ty.0 as usize), Some(Type::Union(members)) if {
+        let has = |tag: &str, payload: fn(&Type) -> bool| members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Tuple(fields)) if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(found)) if found == tag)
+                && types.get(fields[1].0 as usize).is_some_and(payload))
+        });
+        has("ok", |member| matches!(member, Type::String))
+            && has("error", |member| matches!(member, Type::Utf8Error))
+    })
+}
+
+fn is_option_bytes_type(types: &[Type], ty: TypeId) -> bool {
+    matches!(types.get(ty.0 as usize), Some(Type::Union(members)) if {
+        let has_none = members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Atom(found)) if found == "none")
+        });
+        let has_some = members.iter().any(|member| {
+            matches!(types.get(member.0 as usize), Some(Type::Tuple(fields)) if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(found)) if found == "some")
+                && matches!(types.get(fields[1].0 as usize), Some(Type::Bytes)))
+        });
+        has_none && has_some
+    })
 }
 
 fn standard_hash_type(types: &[Type], ty: TypeId) -> bool {
@@ -5224,6 +5725,10 @@ impl TypedProgram {
             Type::Unit => "unit".to_owned(),
             Type::String => "string".to_owned(),
             Type::Bytes => "bytes".to_owned(),
+            Type::Bits => "bits".to_owned(),
+            Type::Buffer => "Buffer".to_owned(),
+            Type::Rune => "rune".to_owned(),
+            Type::Utf8Error => "String.Utf8Error".to_owned(),
             Type::U8 => "u8".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
@@ -5362,6 +5867,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::Boolean(value) => format!("boolean {value}"),
         TypedExprKind::Unit => "unit".to_owned(),
         TypedExprKind::String(value) => format!("string {value:?}"),
+        TypedExprKind::Rune(value) => format!("rune {value:?}"),
         TypedExprKind::Atom(name) => format!("atom :{name}"),
         TypedExprKind::List { .. } => "list".to_owned(),
         TypedExprKind::ListReverse(_) => "list reverse".to_owned(),
@@ -5381,6 +5887,17 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::SliceSubslice { .. } => "subslice".to_owned(),
         TypedExprKind::SliceCopy(_) => "slice copy".to_owned(),
         TypedExprKind::StringBytes(_) => "string bytes".to_owned(),
+        TypedExprKind::StringCodepoints(_) => "string codepoints".to_owned(),
+        TypedExprKind::StringFromBytes(_) => "string from bytes".to_owned(),
+        TypedExprKind::Utf8ErrorOffset(_) => "UTF-8 error offset".to_owned(),
+        TypedExprKind::RuneToString(_) => "rune to string".to_owned(),
+        TypedExprKind::BufferNew => "buffer new".to_owned(),
+        TypedExprKind::BufferAppend { kind, .. } => format!("buffer append {kind:?}"),
+        TypedExprKind::BufferToBytes(_) => "buffer to bytes".to_owned(),
+        TypedExprKind::BufferToString(_) => "buffer to string".to_owned(),
+        TypedExprKind::BytesToBits(_) => "bytes to bits".to_owned(),
+        TypedExprKind::BitsToBytes(_) => "bits to bytes".to_owned(),
+        TypedExprKind::BitsSlice { .. } => "bits slice".to_owned(),
         TypedExprKind::BytesFromList(_) => "bytes from list".to_owned(),
         TypedExprKind::BytesToList(_) => "bytes to list".to_owned(),
         TypedExprKind::BytesSlice { .. } => "bytes slice".to_owned(),
@@ -5455,9 +5972,21 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::SliceFromArray { value, .. }
         | TypedExprKind::SliceCopy(value)
         | TypedExprKind::StringBytes(value)
+        | TypedExprKind::StringCodepoints(value)
+        | TypedExprKind::StringFromBytes(value)
+        | TypedExprKind::Utf8ErrorOffset(value)
+        | TypedExprKind::RuneToString(value)
+        | TypedExprKind::BufferToBytes(value)
+        | TypedExprKind::BufferToString(value)
+        | TypedExprKind::BytesToBits(value)
+        | TypedExprKind::BitsToBytes(value)
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::CollectionLength { value, .. } => {
+            write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::BufferAppend { buffer, value, .. } => {
+            write_expr(program, output, buffer, depth + 1);
             write_expr(program, output, value, depth + 1);
         }
         TypedExprKind::SliceSubslice {
@@ -5470,6 +5999,15 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
             write_expr(program, output, length, depth + 1);
         }
         TypedExprKind::BytesSlice {
+            value,
+            start,
+            length,
+        } => {
+            write_expr(program, output, value, depth + 1);
+            write_expr(program, output, start, depth + 1);
+            write_expr(program, output, length, depth + 1);
+        }
+        TypedExprKind::BitsSlice {
             value,
             start,
             length,

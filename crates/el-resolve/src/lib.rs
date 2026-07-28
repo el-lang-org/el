@@ -1027,6 +1027,20 @@ fn parse_type(
                     span: node.span,
                 });
             }
+            if matches!(written.as_str(), "Buffer" | "String.Utf8Error") {
+                if node.children.len() != 1 {
+                    diagnostics.push(Diagnostic::error(
+                        "E2007",
+                        node.span,
+                        "type `String.Utf8Error` expects 0 arguments",
+                    ));
+                    return None;
+                }
+                return Some(TypeSyntax::Primitive {
+                    name: written,
+                    span: node.span,
+                });
+            }
             let local_name = written
                 .strip_prefix(&format!("{module_name}."))
                 .unwrap_or(&written);

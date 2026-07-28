@@ -293,6 +293,147 @@ fn bytes_list_conversions_are_fresh_and_survive_gc_stress() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn rune_to_string_encodes_every_utf8_width_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.byte_size(Rune.to_string('🙂'))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    ascii = Rune.to_string('A')\n    two = Rune.to_string('é')\n    three = Rune.to_string('€')\n    four = Rune.to_string('🙂')\n    rune_keys: Map(rune, i32) = %{'A' => 1, 'A' => 2}\n    pressure(256)\n    ascii_bytes = String.bytes(ascii)\n    two_bytes = String.bytes(two)\n    three_bytes = String.bytes(three)\n    four_bytes = String.bytes(four)\n    if String.byte_size(ascii) == 1 and ascii_bytes[0] == 65 and String.byte_size(two) == 2 and two_bytes[0] == 195 and two_bytes[1] == 169 and String.byte_size(three) == 3 and three_bytes[0] == 226 and three_bytes[1] == 130 and three_bytes[2] == 172 and String.byte_size(four) == 4 and four_bytes[0] == 240 and four_bytes[1] == 159 and four_bytes[2] == 153 and four_bytes[3] == 130 and Map.size(rune_keys) == 1 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-rune-to-string-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "Rune.to_string must encode exact UTF-8 and retain storage in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn string_codepoints_decode_eagerly_in_order_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary = String.codepoints(\"Aé€🙂\")\n      temporary == ['A', 'e', '́', '€', '🙂']\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    codepoints = String.codepoints(\"Aé€🙂\")\n    empty = String.codepoints(\"\")\n    pressure(256)\n    if codepoints == ['A', 'e', '́', '€', '🙂'] and empty == [] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-string-codepoints-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "String.codepoints must preserve scalar order and roots in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn string_from_bytes_validates_utf8_and_reports_first_invalid_offsets() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def valid_payload(value: {:ok, string}) -> string do\n    match value do\n      {:ok, text} -> text\n    end\n  end\n  def error_payload(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def decode(data: bytes) -> string do\n    match String.from_bytes(data) do\n      value: {:ok, string} -> valid_payload(value)\n      _ -> \"\"\n    end\n  end\n  def error_offset(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.from_bytes(Bytes.from_list([65, 195, 169]))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    source = Bytes.from_list([101, 204, 129, 240, 159, 153, 130])\n    text = decode(source)\n    pressure(256)\n    if String.byte_size(text) == 7 and String.bytes(text)[0] == 101 and error_offset(Bytes.from_list([97, 128])) == 1 and error_offset(Bytes.from_list([97, 194])) == 1 and error_offset(Bytes.from_list([224, 128, 128])) == 0 and error_offset(Bytes.from_list([237, 160, 128])) == 0 and error_offset(Bytes.from_list([244, 144, 128, 128])) == 0 and error_offset(Bytes.from_list([240, 159, 65, 130])) == 0 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-utf8-validation-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "String.from_bytes must validate and report stable offsets in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn buffers_preserve_value_snapshots_and_match_string_utf8_validation() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def valid_payload(value: {:ok, string}) -> string do\n    match value do\n      {:ok, text} -> text\n    end\n  end\n  def error_payload(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def buffer_text(buffer: Buffer) -> string do\n    match Buffer.to_string(buffer) do\n      value: {:ok, string} -> valid_payload(value)\n      _ -> \"\"\n    end\n  end\n  def buffer_error(buffer: Buffer) -> usize do\n    match Buffer.to_string(buffer) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def bytes_error(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      Buffer.to_bytes(Buffer.append_string(Buffer.new(), \"temporary🙂\"))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    empty = Buffer.new()\n    original = Buffer.append_string(empty, \"hello\")\n    spaced = Buffer.append_byte(original, 32)\n    complete = Buffer.append_bytes(spaced, String.bytes(\"world\"))\n    snapshot = Buffer.to_bytes(complete)\n    later = Buffer.append_byte(complete, 33)\n    invalid_bytes = Bytes.from_list([97, 128])\n    invalid = Buffer.append_bytes(Buffer.new(), invalid_bytes)\n    text = buffer_text(complete)\n    pressure(256)\n    if Buffer.byte_size(empty) == 0 and Bytes.byte_size(Buffer.to_bytes(empty)) == 0 and String.byte_size(buffer_text(empty)) == 0 and Buffer.byte_size(original) == 5 and Buffer.byte_size(complete) == 11 and Buffer.byte_size(later) == 12 and Bytes.byte_size(snapshot) == 11 and snapshot[0] == 104 and snapshot[10] == 100 and String.byte_size(text) == 11 and String.bytes(text)[5] == 32 and buffer_error(invalid) == 1 and buffer_error(invalid) == bytes_error(invalid_bytes) do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-buffer-snapshot-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "Buffer snapshots and UTF-8 validation must remain stable in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn arbitrary_bit_views_pack_msb_first_and_preserve_backing() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def some_payload(value: {:some, bytes}) -> bytes do\n    match value do\n      {:some, data} -> data\n    end\n  end\n  def aligned(value: bits) -> bytes do\n    match Bits.to_bytes(value) do\n      result: {:some, bytes} -> some_payload(result)\n      none: :none -> Bytes.from_list([])\n    end\n  end\n  def is_none(value: {:some, bytes} | :none) -> bool do\n    match value do\n      none: :none -> true\n      _ -> false\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      Bits.to_bytes(Bits.slice(Bytes.to_bits(Bytes.from_list([178, 108, 240])), 3, 16))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    source = Bytes.from_list([178, 108, 240])\n    bits = Bytes.to_bits(source)\n    view = Bits.slice(bits, 3, 16)\n    packed = aligned(view)\n    original = aligned(bits)\n    empty = aligned(Bytes.to_bits(Bytes.from_list([])))\n    pressure(256)\n    if Bits.bit_size(bits) == 24 and Bits.bit_size(view) == 16 and bits[0] and bits[1] == false and view[0] and view[1] == false and Bytes.byte_size(packed) == 2 and packed[0] == 147 and packed[1] == 103 and original[0] == 178 and original[2] == 240 and Bytes.byte_size(empty) == 0 and is_none(Bits.to_bytes(Bits.slice(bits, 1, 15))) do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let source = source
+        .replace(
+            "none: :none -> Bytes.from_list([])",
+            "_ -> Bytes.from_list([])",
+        )
+        .replace(
+            "none: :none -> true\n      _ -> false",
+            "some: {:some, bytes} -> false\n      _ -> true",
+        );
+    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(Bytes.from_list([128]))\n    bits[8]\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-arbitrary-bits-stress"),
+                &source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "bit views must index and repack MSB-first in {label}"
+        );
+        assert_ne!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-bits-out-of-bounds"),
+                out_of_bounds,
+                profile,
+            )
+            .code(),
+            Some(0),
+            "bit indexing must fail out of bounds in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn managed_slices_retain_nested_backing_and_copy_in_both_profiles() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def head(values: [i32]) -> i32 do\n    match values do\n      [value | _] -> value\n      [] -> 0\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4]\n      head(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    array: [[i32]; 2] = #[[1], [42]]\n    whole = Slice.from_array(array)\n    part = Slice.subslice(whole, 1, 1)\n    copy = Slice.copy(part)\n    pressure(256)\n    head(copy[0])\n  end\nend\n";

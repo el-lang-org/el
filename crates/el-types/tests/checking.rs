@@ -821,6 +821,139 @@ fn checks_utf8_string_byte_size_and_rejects_non_string_inputs() {
 }
 
 #[test]
+fn checks_rune_literals_ordering_and_string_conversion() {
+    let source = "defmodule Main do\n  def render(value: rune) -> string do\n    Rune.to_string(value)\n  end\n  def main() -> i32 do\n    values: Map(rune, string) = %{'a' => render('a'), '🙂' => render('🙂')}\n    if 'a' < '🙂' and Map.size(values) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("runes are scalar values with conversion and ordering");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("rune 'a': rune"), "{debug}");
+    assert!(debug.contains("rune to string: string"), "{debug}");
+    verify(&typed).expect("rune Typed AST verifies");
+
+    let invalid = source.replace("Rune.to_string(value)", "Rune.to_string(1)");
+    assert!(
+        checked(&invalid)
+            .expect_err("Rune.to_string rejects non-rune inputs")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_eager_string_codepoints() {
+    let source = "defmodule Main do\n  def decode(text: string) -> [rune] do\n    String.codepoints(text)\n  end\n  def main() -> i32 do\n    if decode(\"Aé🙂\") == ['A', 'e', '́', '🙂'] do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("String.codepoints returns eager rune values");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string codepoints: [rune]"), "{debug}");
+    verify(&typed).expect("string codepoints Typed AST verifies");
+
+    let invalid = source.replace("String.codepoints(text)", "String.codepoints(1)");
+    assert!(
+        checked(&invalid)
+            .expect_err("String.codepoints rejects non-string inputs")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_utf8_validation_results_and_error_offsets() {
+    let source = "defmodule Main do\n  def valid(value: {:ok, string}) -> usize do\n    match value do\n      {:ok, text} -> String.byte_size(text)\n    end\n  end\n  def invalid(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def inspect(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:ok, string} -> valid(value)\n      value: {:error, String.Utf8Error} -> invalid(value)\n    end\n  end\n  def main() -> i32 do\n    if inspect(String.bytes(\"é\")) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("UTF-8 validation result is inspectable");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string from bytes:"), "{debug}");
+    assert!(debug.contains("UTF-8 error offset: usize"), "{debug}");
+    verify(&typed).expect("UTF-8 validation Typed AST verifies");
+
+    for invalid in [
+        source.replace("String.from_bytes(data)", "String.from_bytes(1)"),
+        source.replace(
+            "String.utf8_error_offset(reason)",
+            "String.utf8_error_offset(1)",
+        ),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("invalid UTF-8 API input is rejected")
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E2151")
+        );
+    }
+}
+
+#[test]
+fn checks_value_style_buffer_operations_and_utf8_results() {
+    let source = "defmodule Main do\n  def build() -> Buffer do\n    first = Buffer.append_string(Buffer.new(), \"hello\")\n    second = Buffer.append_byte(first, 32)\n    Buffer.append_bytes(second, String.bytes(\"world\"))\n  end\n  def inspect(buffer: Buffer) -> {:ok, string} | {:error, String.Utf8Error} do\n    Buffer.to_string(buffer)\n  end\n  def main() -> i32 do\n    if Buffer.byte_size(build()) == Bytes.byte_size(Buffer.to_bytes(build())) do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("Buffer's minimal API type checks");
+    let debug = typed.debug_tree();
+    for operation in [
+        "buffer new: Buffer",
+        "buffer append String: Buffer",
+        "buffer append Byte: Buffer",
+        "buffer append Bytes: Buffer",
+        "buffer to bytes: bytes",
+        "buffer to string:",
+    ] {
+        assert!(
+            debug.contains(operation),
+            "missing {operation:?} in {debug}"
+        );
+    }
+    verify(&typed).expect("Buffer Typed AST verifies");
+
+    for invalid in [
+        source.replace(
+            "Buffer.append_byte(first, 32)",
+            "Buffer.append_byte(first, true)",
+        ),
+        source.replace(
+            "Buffer.append_bytes(second, String.bytes(\"world\"))",
+            "Buffer.append_bytes(second, \"world\")",
+        ),
+        source.replace("Buffer.to_string(buffer)", "Buffer.to_string(1)"),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("invalid Buffer API input is rejected")
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code.as_str(), "E2113" | "E2151"))
+        );
+    }
+}
+
+#[test]
+fn checks_arbitrary_bit_views_indexing_and_alignment_conversion() {
+    let source = "defmodule Main do\n  def convert(data: bytes) -> {:some, bytes} | :none do\n    bits = Bytes.to_bits(data)\n    Bits.bit_size(bits)\n    view = Bits.slice(bits, 1, 7)\n    view[0]\n    Bits.to_bytes(view)\n  end\nend\n";
+    let typed = checked(source).expect("bits APIs and direct indexing type check");
+    let debug = typed.debug_tree();
+    for operation in [
+        "bytes to bits: bits",
+        "bits slice: bits",
+        "collection length: usize",
+        "index: bool",
+        "bits to bytes:",
+    ] {
+        assert!(
+            debug.contains(operation),
+            "missing {operation:?} in {debug}"
+        );
+    }
+    verify(&typed).expect("bits Typed AST verifies");
+
+    for invalid in [
+        source.replace("Bytes.to_bits(data)", "Bytes.to_bits(1)"),
+        source.replace("Bits.slice(bits, 1, 7)", "Bits.slice(bits, true, 1)"),
+        source.replace("Bits.to_bytes(view)", "Bits.to_bytes(data)"),
+    ] {
+        assert!(
+            checked(&invalid)
+                .expect_err("invalid bits API input is rejected")
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code.as_str(), "E2113" | "E2151"))
+        );
+    }
+}
+
+#[test]
 fn checks_string_bytes_and_bounds_checked_byte_views() {
     let source = "defmodule Main do\n  def view(text: string) -> bytes do\n    Bytes.slice(String.bytes(text), 1, 2)\n  end\n  def main() -> i32 do\n    if Bytes.byte_size(view(\"é🙂\")) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("string bytes and byte slicing type check");

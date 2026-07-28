@@ -39,6 +39,54 @@ uintptr_t __el_runtime_hash_seed(void) {
   return el_hash_seed;
 }
 
+static int el_utf8_continuation(uint8_t byte) {
+  return byte >= 0x80u && byte <= 0xbfu;
+}
+
+size_t __el_runtime_utf8_validate(const uint8_t *data, size_t size) {
+  size_t offset = 0;
+  while (offset < size) {
+    const uint8_t first = data[offset];
+    if (first <= 0x7fu) {
+      offset += 1;
+    } else if (first >= 0xc2u && first <= 0xdfu) {
+      if (size - offset < 2 || !el_utf8_continuation(data[offset + 1])) return offset;
+      offset += 2;
+    } else if (first == 0xe0u) {
+      if (size - offset < 3 || data[offset + 1] < 0xa0u ||
+          data[offset + 1] > 0xbfu || !el_utf8_continuation(data[offset + 2])) return offset;
+      offset += 3;
+    } else if ((first >= 0xe1u && first <= 0xecu) ||
+               (first >= 0xeeu && first <= 0xefu)) {
+      if (size - offset < 3 || !el_utf8_continuation(data[offset + 1]) ||
+          !el_utf8_continuation(data[offset + 2])) return offset;
+      offset += 3;
+    } else if (first == 0xedu) {
+      if (size - offset < 3 || data[offset + 1] < 0x80u ||
+          data[offset + 1] > 0x9fu || !el_utf8_continuation(data[offset + 2])) return offset;
+      offset += 3;
+    } else if (first == 0xf0u) {
+      if (size - offset < 4 || data[offset + 1] < 0x90u ||
+          data[offset + 1] > 0xbfu || !el_utf8_continuation(data[offset + 2]) ||
+          !el_utf8_continuation(data[offset + 3])) return offset;
+      offset += 4;
+    } else if (first >= 0xf1u && first <= 0xf3u) {
+      if (size - offset < 4 || !el_utf8_continuation(data[offset + 1]) ||
+          !el_utf8_continuation(data[offset + 2]) ||
+          !el_utf8_continuation(data[offset + 3])) return offset;
+      offset += 4;
+    } else if (first == 0xf4u) {
+      if (size - offset < 4 || data[offset + 1] < 0x80u ||
+          data[offset + 1] > 0x8fu || !el_utf8_continuation(data[offset + 2]) ||
+          !el_utf8_continuation(data[offset + 3])) return offset;
+      offset += 4;
+    } else {
+      return offset;
+    }
+  }
+  return size;
+}
+
 static void *el_allocate(uint64_t size, int atomic, uint32_t file, uint64_t start,
                          uint64_t end) {
   void *result;

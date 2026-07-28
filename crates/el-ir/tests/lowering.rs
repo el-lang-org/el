@@ -1153,6 +1153,83 @@ fn lowers_utf8_string_byte_size_as_verified_o1_length() {
 }
 
 #[test]
+fn lowers_rune_values_and_allocating_utf8_conversion() {
+    let module = lowered(
+        "defmodule Main do\n  def render(value: rune) -> string do\n    Rune.to_string(value)\n  end\n  def main() -> i32 do\n    if String.byte_size(render('🙂')) == 4 and 'a' < '🙂' do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("Rune('🙂')"), "{debug}");
+    assert!(debug.contains("rune_to_string"), "{debug}");
+    let conversion = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::RuneToString { .. }))
+        .expect("rune conversion operation");
+    assert_eq!(
+        operation_collection_effect(conversion),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("rune conversion Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("rune conversion specializes");
+    verify_concrete(&concrete).expect("concrete rune conversion Core verifies");
+}
+
+#[test]
+fn lowers_eager_string_codepoint_decoding_as_an_allocating_operation() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    if String.codepoints(\"Aé🙂\") == ['A', 'e', '́', '🙂'] do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("string_codepoints"), "{debug}");
+    let operation = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::StringCodepoints { .. }))
+        .expect("string codepoints operation");
+    assert_eq!(
+        operation_collection_effect(operation),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("string codepoints Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("string codepoints specialize");
+    verify_concrete(&concrete).expect("concrete string codepoints Core verifies");
+}
+
+#[test]
+fn lowers_utf8_validation_and_inspectable_error_offsets() {
+    let module = lowered(
+        "defmodule Main do\n  def valid(value: {:ok, string}) -> usize do\n    match value do\n      {:ok, text} -> String.byte_size(text)\n    end\n  end\n  def invalid(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def inspect(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:ok, string} -> valid(value)\n      value: {:error, String.Utf8Error} -> invalid(value)\n    end\n  end\n  def main() -> i32 do\n    if inspect(String.bytes(\"é\")) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("string_from_bytes"), "{debug}");
+    assert!(debug.contains("utf8_error_offset"), "{debug}");
+    let conversion = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::StringFromBytes { .. }))
+        .expect("UTF-8 validation operation");
+    assert_eq!(
+        operation_collection_effect(conversion),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("UTF-8 validation Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("UTF-8 validation specializes");
+    verify_concrete(&concrete).expect("concrete UTF-8 validation Core verifies");
+}
+
+#[test]
 fn lowers_string_bytes_and_byte_slices_as_retained_views() {
     let module = lowered(
         "defmodule Main do\n  def main() -> i32 do\n    data = String.bytes(\"é🙂\")\n    view = Bytes.slice(data, 1, 2)\n    if Bytes.byte_size(view) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n",
@@ -1174,6 +1251,90 @@ fn lowers_string_bytes_and_byte_slices_as_retained_views() {
         .expect("concrete bytes type");
     assert_eq!(
         managed_value_class(&concrete, bytes),
+        Some(ManagedValueClass::ContainsBaseReferences)
+    );
+}
+
+#[test]
+fn lowers_value_style_buffers_and_reuses_strict_utf8_validation() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    original = Buffer.append_string(Buffer.new(), \"hello\")\n    extended = Buffer.append_byte(original, 32)\n    complete = Buffer.append_bytes(extended, String.bytes(\"world\"))\n    snapshot = Buffer.to_bytes(complete)\n    Buffer.to_string(complete)\n    if Buffer.byte_size(original) == 5 and Bytes.byte_size(snapshot) == 11 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("buffer_new"), "{debug}");
+    assert!(debug.contains("buffer_append_String"), "{debug}");
+    assert!(debug.contains("buffer_append_Byte"), "{debug}");
+    assert!(debug.contains("buffer_append_Bytes"), "{debug}");
+    assert!(debug.contains("buffer_to_bytes"), "{debug}");
+    assert!(debug.contains("string_from_bytes"), "{debug}");
+    for operation in module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter().flat_map(|block| &block.operations))
+    {
+        if matches!(
+            operation,
+            Operation::BufferAppend { .. }
+                | Operation::BufferToBytes { .. }
+                | Operation::StringFromBytes { .. }
+        ) {
+            assert_eq!(
+                operation_collection_effect(operation),
+                CollectionEffect::MayCollect
+            );
+        }
+    }
+    verify(&module).expect("Buffer Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("Buffer operations specialize");
+    verify_concrete(&concrete).expect("concrete Buffer Core verifies");
+    let buffer = concrete
+        .types
+        .iter()
+        .position(|ty| matches!(ty, Type::Buffer))
+        .map(|index| TypeId(index as u32))
+        .expect("concrete Buffer type");
+    assert_eq!(
+        managed_value_class(&concrete, buffer),
+        Some(ManagedValueClass::ContainsBaseReferences)
+    );
+}
+
+#[test]
+fn lowers_arbitrary_bit_views_indexing_and_alignment_conversion() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(String.bytes(\"abc\"))\n    view = Bits.slice(bits, 3, 16)\n    Bits.to_bytes(view)\n    if Bits.bit_size(view) == 16 and view[0] do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("bytes_to_bits"), "{debug}");
+    assert!(debug.contains("bits_slice"), "{debug}");
+    assert!(debug.contains("bits_to_bytes"), "{debug}");
+    assert!(debug.contains("IndexOutOfBounds"), "{debug}");
+    let conversion = module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::BitsToBytes { .. }))
+        .expect("bits conversion operation");
+    assert_eq!(
+        operation_collection_effect(conversion),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("bits Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("bits operations specialize");
+    verify_concrete(&concrete).expect("concrete bits Core verifies");
+    let bits = concrete
+        .types
+        .iter()
+        .position(|ty| matches!(ty, Type::Bits))
+        .map(|index| TypeId(index as u32))
+        .expect("concrete bits type");
+    assert_eq!(
+        managed_value_class(&concrete, bits),
         Some(ManagedValueClass::ContainsBaseReferences)
     );
 }

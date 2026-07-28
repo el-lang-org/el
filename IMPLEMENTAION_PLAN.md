@@ -655,7 +655,7 @@ verified managed runtime.
    revision 47 grapheme segmentation independent of host locale.
 6. [ ] **Views:** eager codepoint/grapheme collections and lazy views that retain
    source backing storage.
-7. [ ] **Buffer:** explicit value-style byte/string append operations and immutable
+7. [x] **Buffer:** explicit value-style byte/string append operations and immutable
    conversion snapshots.
 8. [ ] **Function values:** exact monomorphic direct code targets, indirect calls,
    visibility behavior, and generic specialization from expected types.
@@ -672,7 +672,7 @@ verified managed runtime.
 - [x] Fixed-array length inference and rejection of symbolic/derived lengths.
 - [x] Map insertion order across seeds and all update/remove/reinsert cases.
 - [ ] Bounds and numeric failure categories in debug and release.
-- [ ] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
+- [x] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
 - [ ] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
   length APIs.
 - [ ] GC stress for nested composite graphs, views, base retention, immutable
@@ -754,7 +754,7 @@ verified managed runtime.
   cover literal duplicate replacement, stable replacement position, removal and
   reinsertion at the tail, three forced hash seeds, every standard composite-key
   category available in this milestone, and unequal values. The private runtime ABI
-  is now revision 2 for the seeded-hasher entry point and map-node layout.
+  advanced to revision 2 for the seeded-hasher entry point and map-node layout.
 - [x] Added the first Milestone 6 text API slice with O(1) `String.byte_size`.
   The type checker recognizes only a `string` input and a `usize` result, Typed AST
   and Core verifiers enforce that contract, and LLVM reads the byte length already
@@ -791,6 +791,71 @@ verified managed runtime.
   allocation, and development/release collection-at-every-allocation native tests
   cover empty-capable loops, boundary byte values, order, source immutability, and
   retained byte storage under subsequent allocation pressure.
+- [x] Added the scalar `rune` value category and `Rune.to_string` end to end.
+  Rune literals retain their parser-validated Unicode scalar identity, use a
+  target-independent 32-bit Core/LLVM value, support scalar ordering and structural
+  `Eq`/`Hash`, and encode to immutable valid UTF-8 through a verified allocating
+  operation. The backend uses pointer-free backing storage and preserves exact
+  one-, two-, three-, and four-byte encodings. Frontend/Core tests cover the exact
+  types and allocation effect; development/release collection-at-every-allocation
+  native tests cover every UTF-8 width, retained strings under allocation pressure,
+  and duplicate rune map keys. Rune/integer conversions, rune patterns, and eager
+  or lazy string codepoint APIs remained open before the slice below.
+- [x] Added eager `String.codepoints(text) -> [rune]` with direct, locale-independent
+  decoding of the string representation's guaranteed-valid UTF-8. The type checker,
+  Typed AST verifier, Generic/Concrete Core verifiers, and monomorphizer enforce the
+  exact string-to-rune-list contract and classify the operation as allocating.
+  LLVM selects the one-, two-, three-, or four-byte decode path without reading past
+  a scalar, appends freshly allocated scanned nodes in source order, and roots both
+  the source and partial list at every collection point. Development/release
+  collection-at-every-allocation tests cover empty text, ASCII, combining marks,
+  three-byte scalars, supplementary scalars, deterministic order, and retention
+  under subsequent allocation pressure. The lazy codepoint view and rune patterns
+  remain open alongside grapheme APIs.
+- [x] Added strict `String.from_bytes` validation and inspectable
+  `String.Utf8Error` offsets, completing the first valid/rejected UTF-8 exit-gate
+  path. The opaque error is nameable only through its specified standard type and
+  exposes only `String.utf8_error_offset`; successful conversion returns
+  `{:ok, string}`, while malformed or incomplete input returns
+  `{:error, String.Utf8Error}` with the invalid sequence's starting byte offset.
+  A non-allocating private runtime validator rejects stray continuations, invalid
+  leads, overlong encodings, surrogate encodings, values above U+10FFFF, malformed
+  continuations, and incomplete suffixes. LLVM copies successful visible byte views
+  into independent pointer-free string backing, roots the input across allocation,
+  and constructs verified tagged-union results for both arms. Development/release
+  collection-at-every-allocation tests cover valid mixed-width text, prefixed
+  failures, incomplete suffixes, each restricted UTF-8 boundary, stable offsets,
+  and retained successful snapshots. The private runtime ABI is revision 3 for the
+  validator entry point.
+- [x] Completed the minimal value-style `Buffer` API end to end: `Buffer.new`,
+  `byte_size`, distinct byte/bytes/string append operations, immutable `to_bytes`
+  snapshots, and strict `to_string` results. `Buffer` is a distinct standard type
+  that implements none of `Eq`, `Ord`, or `Hash`; Generic/Concrete Core classify
+  its backing as managed and mark every copying operation as a collection point.
+  LLVM currently realizes the permitted simple implementation by copying into
+  fresh pointer-free backing for each append and conversion, preserving old buffer
+  values and returned snapshots without exposing mutation. `Buffer.to_string`
+  lowers through `Buffer.to_bytes` and the same runtime validator used by
+  `String.from_bytes`, so the first-invalid and incomplete-suffix offsets are
+  identical by construction. Type, Core, LLVM, and development/release native
+  GC-stress tests cover all append forms, empty values, retained snapshots after
+  later appends, valid text, and invalid-offset parity. The Buffer deliverable and
+  UTF-8 parity test are closed; runtime `bits` and source bitstrings remained at
+  this point.
+- [x] Added the minimal arbitrary-length `bits` runtime surface: lossless
+  `Bytes.to_bits`, O(1) bounds-checked `Bits.slice`, O(1) `Bits.bit_size`, direct
+  MSB-first boolean indexing, and alignment-sensitive `Bits.to_bytes`. Bits retain
+  the immutable byte base plus an arbitrary bit offset and length, allowing nested
+  non-byte-aligned views without copying. Aligned-length conversion returns
+  `{:some, bytes}` and packs even non-byte-aligned views into fresh pointer-free
+  storage; other lengths return `:none`. Structural equality and hashing traverse
+  visible bits rather than backing identity or padding. Typed AST and both Core
+  verifiers enforce exact source/result shapes and explicit bounds failures, while
+  LLVM preserves bases across the allocating packing path. Development/release
+  collection-at-every-allocation tests cover empty, aligned, and non-aligned views,
+  MSB-first indexing, exact repacking, retained source storage, and index failures.
+  Byte-aligned `<<...>>` construction/pattern lowering and `Concat` remain before
+  the text/binary deliverable closes.
 
 ### Milestone 7 — Protocols and iteration
 
