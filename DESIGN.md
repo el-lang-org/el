@@ -2,7 +2,7 @@
 
 Status: living design document  
 Language name: **EL**
-Last updated: 2026-07-26
+Last updated: 2026-07-28
 
 This document is the source of truth for EL's vision, observable runtime
 semantics, compiler architecture, roadmap, open questions, and design decisions.
@@ -34,6 +34,12 @@ EL should feel small, readable, and predictable. Version 1 deliberately favors
 a coherent language that we can finish over a wide language with unfinished
 features.
 
+EL also values developer experience and developer happiness. Common work should
+feel direct and pleasant: syntax should be readable, tools and diagnostics
+should be helpful, and routine tasks should require little ceremony. This does
+not override correctness, predictability, or simplicity; it guides choices
+between designs that satisfy those constraints.
+
 ### 1.1 Design philosophy: simplicity
 
 EL's primary design philosophy is **simplicity**: language features should be
@@ -58,6 +64,8 @@ and fewer feature interactions. The decision log must explain exceptions.
 
 - Produce a standalone native executable for the host platform.
 - Detect type errors at compile time with useful source locations.
+- Make common development workflows pleasant through clear diagnostics,
+  readable code, and low ceremony.
 - Provide value semantics and immutable bindings by default.
 - Support explicit mutable local bindings.
 - Support functions, lexical blocks, conditionals, loops, and recursion.
@@ -3747,6 +3755,21 @@ These require explicit decisions before the affected implementation begins:
 - Reason: A small typed CFG makes evaluation order, joins, early return, pattern
   decisions, cleanup, and backend verification explicit without forcing mutable
   source bindings into SSA before the compiler is ready to promote them.
+
+### D-065 — Developer experience is a design value
+
+- Date: 2026-07-28
+- Status: accepted
+- Decision: EL values developer experience and developer happiness. Among
+  designs that preserve correctness, predictability, and simplicity, prefer the
+  design that makes common work more readable, helpful, direct, and pleasant.
+- Consequence: Syntax and tooling should minimize incidental ceremony, and
+  diagnostics should help developers understand and correct problems. This
+  principle does not justify adding features with unclear interactions or
+  weakening explicit language guarantees.
+- Reason: A language can remain small and rigorous while respecting the people
+  who use it. Making routine development satisfying is part of EL's quality,
+  not merely a post-v1 tooling concern.
 
 ## 21. Next design checkpoint
 
