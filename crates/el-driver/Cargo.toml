@@ -16,6 +16,9 @@ el-types = { path = "../el-types", version = "=0.1.0" }
 [features]
 default = []
 llvm = ["el-codegen/llvm"]
+managed-runtime = ["llvm", "el-codegen/managed-runtime"]
+gc-stress-test = ["managed-runtime", "el-codegen/gc-stress-test"]
+allocation-failure-test = ["managed-runtime", "el-codegen/allocation-failure-test"]
 
 [[example]]
 name = "compile_source"

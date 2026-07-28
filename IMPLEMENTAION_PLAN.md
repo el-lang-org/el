@@ -605,31 +605,31 @@ collection before adding the bulk of heap-backed types.
 
 **Deliverables**
 
-- [ ] Define and version a small private runtime ABI.
-- [ ] Vendor, build, and statically link the pinned Boehm GC release.
-- [ ] Initialize the collector before any managed runtime state.
-- [ ] Provide separate scanned and pointer-free allocation wrappers whose scan class
+- [x] Define and version a small private runtime ABI.
+- [x] Vendor, build, and statically link the pinned Boehm GC release.
+- [x] Initialize the collector before any managed runtime state.
+- [x] Provide separate scanned and pointer-free allocation wrappers whose scan class
   never changes.
-- [ ] Classify private runtime calls as allocating or non-allocating while treating
+- [x] Classify private runtime calls as allocating or non-allocating while treating
   every EL call as a possible collection point.
-- [ ] Preserve live, aligned, unmodified base pointers across every collection point
+- [x] Preserve live, aligned, unmodified base pointers across every collection point
   in locals, arguments, returns, globals, aggregate payloads, and hidden cleanup
   state.
-- [ ] Add managed-global registration and allocation-exhaustion termination.
-- [ ] Add a test-only stress mode that attempts collection at every managed
+- [x] Add managed-global registration and allocation-exhaustion termination.
+- [x] Add a test-only stress mode that attempts collection at every managed
   allocation.
-- [ ] Keep all Boehm types and controls out of compiler stage APIs and EL source.
+- [x] Keep all Boehm types and controls out of compiler stage APIs and EL source.
 
 **Tests**
 
-- [ ] Graph retention and reclamation pressure in debug and optimized builds.
-- [ ] Base-pointer survival in registers, stack slots, calls, recursion, unions,
+- [x] Graph retention and reclamation pressure in debug and optimized builds.
+- [x] Base-pointer survival in registers, stack slots, calls, recursion, unions,
   saved block results, and deferred captures.
-- [ ] Scanned object graphs and pointer-free buffers.
-- [ ] Allocation exhaustion category, source location, nonzero exit, and no cleanup
+- [x] Scanned object graphs and pointer-free buffers.
+- [x] Allocation exhaustion category, source location, nonzero exit, and no cleanup
   unwinding.
 
-- [ ] **Exit gate:** an optimized native EL program retains a reachable heap graph and
+- [x] **Exit gate:** an optimized native EL program retains a reachable heap graph and
   survives collection-at-every-allocation stress while temporary allocations are
   reclaimable.
 
@@ -1040,7 +1040,35 @@ unchecked and add `(in progress)` after the item when useful.
   tuples, calls, and union payloads. Iterative factorial, a string-backed tagged
   result parser, and an exhaustive `i64 | string` match now compile and run in both
   development and release profiles, closing the Milestone 4 exit gate.
-- [ ] **5 — Boehm GC:** optimized graph retention under GC stress.
+- [x] **5 — Boehm GC:** the versioned private ABI, static vendored
+  collector build, startup initialization, immutable scanned/atomic allocation
+  classes, managed-global registration, allocation-exhaustion termination, and
+  collection-at-every-allocation build mode are implemented behind `el-runtime`.
+  A native development/O3 conformance fixture retains a scanned 4,096-node graph
+  through allocation pressure, exercises pointer-free buffers, and verifies a
+  registered global root under stress. The managed LLVM entry shim now initializes
+  the collector before `Main.main`, and the host linker consumes the exact private
+  runtime and collector archives through a tested feature boundary. Concrete Core
+  now classifies direct managed bases separately from aggregates/views containing
+  bases across nested arrays, tuples, unions, structs, lists, maps, and strings;
+  its verifier rejects types without a classification, and every EL call is marked
+  as possibly collecting. A deterministic backwards dataflow pass now computes the
+  managed SSA values and addressable slots live at every collection point, including
+  CFG block arguments, loops, call operands, mutable locals, saved cleanup results,
+  and deferred state. LLVM lowering preserves those bases in aligned volatile stack
+  storage across calls, touches live managed slots so optimization cannot promote
+  away their only visible representation, and clears temporary root spills after
+  each call. The first managed list backend slice allocates immutable nodes in
+  scanned storage, roots partially constructed spines across each allocation, and
+  lowers empty/cons tests plus head/tail projections. A native EL fixture exercises
+  live graphs in SSA values, mutable slots, arguments, returns, recursive calls,
+  union payloads, saved block results, and deferred captures while collection runs
+  at every allocation in development and O3 builds. Runtime tests bound heap growth
+  under repeated temporary-allocation pressure, verify scanned graphs, atomic
+  buffers, and registered globals, and run in debug and optimized profiles. A
+  deterministic allocation-failure build proves category 6, the list literal's
+  exact source span, nonzero termination, and skipped deferred cleanup. The
+  optimized native EL graph-retention exit gate is closed.
 - [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
   rejection.
 - [ ] **7 — Protocols and iteration:** derive, constrained generics, iteration,

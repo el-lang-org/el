@@ -4,7 +4,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+build = "build.rs"
+
+[features]
+default = []
+# Builds the vendored collector and the native runtime archive. Keeping this
+# explicit lets frontend-only contributors work without a C toolchain.
+boehm = []
+gc-stress-test = ["boehm"]
+allocation-failure-test = ["boehm"]
 
 [lints]
 workspace = true
-

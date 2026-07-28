@@ -17,6 +17,7 @@
   `README.QUICK`.
 
 The archive is retained rather than an extracted working tree so that its
-upstream checksum remains directly verifiable. Runtime build support will
-extract it into an ignored directory. The collector is not compiled or linked
-by Milestone 0, and no collector API is exposed to EL source programs.
+upstream checksum remains directly verifiable. `el-runtime` extracts it into
+Cargo's build output, configures a static-only build, and links it only when the
+`boehm` feature is selected. No collector API is exposed to compiler stages or
+EL source programs.

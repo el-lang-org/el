@@ -23,6 +23,40 @@ pub fn link_host_objects(objects: &[&Path], executable: &Path) -> Result<(), Lin
     invoke_linker(&driver, objects, executable)
 }
 
+/// Links generated code with the matching private runtime and vendored
+/// collector. Runtime archives follow generated objects so static symbol
+/// resolution is deterministic.
+#[cfg(feature = "managed-runtime")]
+pub fn link_host_managed_executable(
+    objects: &[&Path],
+    executable: &Path,
+) -> Result<(), LinkerError> {
+    let archives = el_runtime::native_runtime_archives();
+    let driver = env::var_os("CC").unwrap_or_else(|| OsString::from(DEFAULT_HOST_COMPILER));
+    let output = Command::new(&driver)
+        .args(objects)
+        .arg(archives.wrapper())
+        .arg(archives.collector())
+        .arg("-lpthread")
+        .arg("-o")
+        .arg(executable)
+        .output()
+        .map_err(|source| LinkerError::Launch {
+            driver: driver.clone(),
+            source: IoError::from(source),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(LinkerError::Failed {
+            driver,
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 fn invoke_linker(driver: &OsStr, objects: &[&Path], executable: &Path) -> Result<(), LinkerError> {
     let output = Command::new(driver)
         .args(objects)
@@ -193,6 +227,36 @@ mod tests {
                 .to_string()
                 .contains("could not start host compiler driver")
         );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn links_the_matching_private_runtime_archives() {
+        let temp = TempDir::new();
+        let source = temp.0.join("main.c");
+        let object = temp.0.join("main.o");
+        let executable = temp.0.join("main");
+        fs::write(
+            &source,
+            "void __el_runtime_init(void);\nint main(void) { __el_runtime_init(); return 42; }\n",
+        )
+        .expect("write managed linker fixture");
+        let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from(DEFAULT_HOST_COMPILER));
+        let compilation = Command::new(compiler)
+            .arg("-c")
+            .arg(source)
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .expect("compile managed linker fixture");
+        assert!(compilation.status.success());
+
+        link_host_managed_executable(&[object.as_path()], &executable)
+            .expect("link with private runtime archives");
+        let status = Command::new(executable)
+            .status()
+            .expect("run managed linker fixture");
+        assert_eq!(status.code(), Some(42));
     }
 
     #[cfg(unix)]

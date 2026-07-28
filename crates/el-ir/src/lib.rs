@@ -1506,6 +1506,350 @@ pub struct ConcreteStruct {
     pub origin: Span,
 }
 
+/// Collector-relevant physical category carried by a Concrete Core type.
+///
+/// This is deliberately independent of Boehm. Backends use it to decide which
+/// live values require an unmodified base pointer at collection points.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedValueClass {
+    Unmanaged,
+    BaseReference,
+    ContainsBaseReferences,
+}
+
+impl ManagedValueClass {
+    #[must_use]
+    pub const fn requires_root(self) -> bool {
+        !matches!(self, Self::Unmanaged)
+    }
+}
+
+/// Collection behavior of a Concrete Core operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionEffect {
+    CannotCollect,
+    MayCollect,
+}
+
+/// Every EL call is a possible collection point. A non-empty list construction
+/// allocates one or more scanned nodes. Private runtime operations carry their
+/// explicit effects when they enter the representation.
+#[must_use]
+pub const fn operation_collection_effect(operation: &Operation) -> CollectionEffect {
+    if matches!(operation, Operation::Call { .. })
+        || matches!(operation, Operation::List { elements, .. } if !elements.is_empty())
+    {
+        CollectionEffect::MayCollect
+    } else {
+        CollectionEffect::CannotCollect
+    }
+}
+
+/// Managed Core values and addressable slots live when an operation may collect.
+///
+/// Results are ordered by block and operation index, and each root list is
+/// sorted by its stable function-local ID. Values include call operands because
+/// a callee may collect while consuming them. Slots are live when their current
+/// contents can be loaded after the collection point before being overwritten.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionPointRoots {
+    pub block: BlockId,
+    pub operation_index: usize,
+    pub values: Vec<ValueId>,
+    pub slots: Vec<SlotId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LiveState {
+    values: BTreeSet<ValueId>,
+    slots: BTreeSet<SlotId>,
+}
+
+/// Computes the exact managed roots required at each possible collection point
+/// in one verified Concrete Core function.
+#[must_use]
+pub fn collection_point_roots(
+    module: &ConcreteModule,
+    function: &CoreFunction,
+) -> Vec<CollectionPointRoots> {
+    let value_types = function_value_types(function);
+    let slot_types = function
+        .slots
+        .iter()
+        .map(|slot| (slot.id, slot.ty))
+        .collect::<BTreeMap<_, _>>();
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect::<BTreeMap<_, _>>();
+    let mut live_in = blocks
+        .keys()
+        .map(|block| (*block, LiveState::default()))
+        .collect::<BTreeMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+        for block in function.blocks.iter().rev() {
+            let mut live = terminator_live_out(&block.terminator, &blocks, &live_in);
+            add_terminator_uses(&block.terminator, &mut live.values);
+            for operation in block.operations.iter().rev() {
+                transfer_operation(operation, &mut live);
+            }
+            for parameter in &block.parameters {
+                live.values.remove(&parameter.value);
+            }
+            if live_in.get(&block.id) != Some(&live) {
+                live_in.insert(block.id, live);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut points = Vec::new();
+    for block in &function.blocks {
+        let mut live = terminator_live_out(&block.terminator, &blocks, &live_in);
+        add_terminator_uses(&block.terminator, &mut live.values);
+        let mut reversed = Vec::new();
+        for (operation_index, operation) in block.operations.iter().enumerate().rev() {
+            transfer_operation(operation, &mut live);
+            if operation_collection_effect(operation) == CollectionEffect::MayCollect {
+                let values = live
+                    .values
+                    .iter()
+                    .copied()
+                    .filter(|value| {
+                        value_types.get(value).is_some_and(|ty| {
+                            managed_value_class(module, *ty)
+                                .is_some_and(ManagedValueClass::requires_root)
+                        })
+                    })
+                    .collect();
+                let slots = live
+                    .slots
+                    .iter()
+                    .copied()
+                    .filter(|slot| {
+                        slot_types.get(slot).is_some_and(|ty| {
+                            managed_value_class(module, *ty)
+                                .is_some_and(ManagedValueClass::requires_root)
+                        })
+                    })
+                    .collect();
+                reversed.push(CollectionPointRoots {
+                    block: block.id,
+                    operation_index,
+                    values,
+                    slots,
+                });
+            }
+        }
+        reversed.reverse();
+        points.extend(reversed);
+    }
+    points.sort_by_key(|point| (point.block, point.operation_index));
+    points
+}
+
+fn terminator_live_out(
+    terminator: &Terminator,
+    blocks: &BTreeMap<BlockId, &Block>,
+    live_in: &BTreeMap<BlockId, LiveState>,
+) -> LiveState {
+    let mut output = LiveState::default();
+    match terminator {
+        Terminator::Branch {
+            target, arguments, ..
+        } => add_edge_live(*target, arguments, blocks, live_in, &mut output),
+        Terminator::CondBranch {
+            then_target,
+            else_target,
+            ..
+        } => {
+            add_edge_live(*then_target, &[], blocks, live_in, &mut output);
+            add_edge_live(*else_target, &[], blocks, live_in, &mut output);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            for (_, target) in cases {
+                add_edge_live(*target, &[], blocks, live_in, &mut output);
+            }
+            if let Some(target) = default {
+                add_edge_live(*target, &[], blocks, live_in, &mut output);
+            }
+        }
+        Terminator::Return { .. } | Terminator::Failure { .. } | Terminator::Unreachable { .. } => {
+        }
+    }
+    output
+}
+
+fn add_edge_live(
+    target: BlockId,
+    arguments: &[ValueId],
+    blocks: &BTreeMap<BlockId, &Block>,
+    live_in: &BTreeMap<BlockId, LiveState>,
+    output: &mut LiveState,
+) {
+    let Some(target_live) = live_in.get(&target) else {
+        return;
+    };
+    output.slots.extend(&target_live.slots);
+    output.values.extend(&target_live.values);
+    if let Some(target_block) = blocks.get(&target) {
+        for (index, parameter) in target_block.parameters.iter().enumerate() {
+            if output.values.remove(&parameter.value)
+                && let Some(argument) = arguments.get(index)
+            {
+                output.values.insert(*argument);
+            }
+        }
+    }
+}
+
+fn add_terminator_uses(terminator: &Terminator, live: &mut BTreeSet<ValueId>) {
+    match terminator {
+        Terminator::Branch { .. } => {}
+        Terminator::CondBranch { condition, .. } => {
+            live.insert(*condition);
+        }
+        Terminator::Switch { subject, .. } => {
+            live.insert(*subject);
+        }
+        Terminator::Return { value, .. } => {
+            live.insert(*value);
+        }
+        Terminator::Failure { .. } | Terminator::Unreachable { .. } => {}
+    }
+}
+
+fn transfer_operation(operation: &Operation, live: &mut LiveState) {
+    if let Some(result) = operation_result(operation) {
+        live.values.remove(&result);
+    }
+    match operation {
+        Operation::Constant { .. } => {}
+        Operation::List { elements, tail, .. } => {
+            live.values.extend(elements);
+            live.values.extend(tail);
+        }
+        Operation::Array { elements, .. } | Operation::Tuple { elements, .. } => {
+            live.values.extend(elements);
+        }
+        Operation::Map { entries, .. } => {
+            live.values
+                .extend(entries.iter().flat_map(|(key, value)| [*key, *value]));
+        }
+        Operation::TupleProject { tuple, .. } => {
+            live.values.insert(*tuple);
+        }
+        Operation::StructProject { structure, .. } => {
+            live.values.insert(*structure);
+        }
+        Operation::ListHead { list, .. } | Operation::ListTail { list, .. } => {
+            live.values.insert(*list);
+        }
+        Operation::CheckedArithmetic { left, right, .. }
+        | Operation::Compare { left, right, .. } => {
+            live.values.insert(*left);
+            live.values.insert(*right);
+        }
+        Operation::Call { arguments, .. } => {
+            live.values.extend(arguments);
+        }
+        Operation::UnionInject { value, .. } | Operation::UnionProject { value, .. } => {
+            live.values.insert(*value);
+        }
+        Operation::Load { slot, .. } => {
+            live.slots.insert(*slot);
+        }
+        Operation::Store { slot, value, .. } => {
+            live.slots.remove(slot);
+            live.values.insert(*value);
+        }
+    }
+}
+
+fn operation_result(operation: &Operation) -> Option<ValueId> {
+    match operation {
+        Operation::Constant { result, .. }
+        | Operation::List { result, .. }
+        | Operation::Array { result, .. }
+        | Operation::Map { result, .. }
+        | Operation::Tuple { result, .. }
+        | Operation::TupleProject { result, .. }
+        | Operation::StructProject { result, .. }
+        | Operation::ListHead { result, .. }
+        | Operation::ListTail { result, .. }
+        | Operation::CheckedArithmetic { result, .. }
+        | Operation::Compare { result, .. }
+        | Operation::Call { result, .. }
+        | Operation::UnionInject { result, .. }
+        | Operation::UnionProject { result, .. }
+        | Operation::Load { result, .. } => Some(*result),
+        Operation::Store { .. } => None,
+    }
+}
+
+/// Classifies a fully concrete type without exposing collector implementation
+/// details across the IR boundary.
+#[must_use]
+pub fn managed_value_class(module: &ConcreteModule, ty: TypeId) -> Option<ManagedValueClass> {
+    classify_managed_type(module, ty, &mut BTreeSet::new())
+}
+
+fn classify_managed_type(
+    module: &ConcreteModule,
+    ty: TypeId,
+    visiting: &mut BTreeSet<TypeId>,
+) -> Option<ManagedValueClass> {
+    let value = module.types.get(ty.0 as usize)?;
+    if !visiting.insert(ty) {
+        return Some(ManagedValueClass::ContainsBaseReferences);
+    }
+    let class = match value {
+        Type::I32 | Type::I64 | Type::Bool | Type::Unit | Type::Atom(_) | Type::Function { .. } => {
+            ManagedValueClass::Unmanaged
+        }
+        // String is a view-like pointer/length value and must retain its base.
+        Type::String => ManagedValueClass::ContainsBaseReferences,
+        Type::List(_) | Type::Map { .. } => ManagedValueClass::BaseReference,
+        Type::Array { item, .. } => aggregate_managed_class(module, [*item], visiting)?,
+        Type::Tuple(elements) | Type::Union(elements) => {
+            aggregate_managed_class(module, elements.iter().copied(), visiting)?
+        }
+        Type::Struct { declaration, .. } => {
+            let structure = module
+                .structs
+                .iter()
+                .find(|structure| structure.declaration == *declaration)?;
+            aggregate_managed_class(
+                module,
+                structure.fields.iter().map(|(_, field)| *field),
+                visiting,
+            )?
+        }
+        Type::Parameter { .. } => return None,
+    };
+    visiting.remove(&ty);
+    Some(class)
+}
+
+fn aggregate_managed_class(
+    module: &ConcreteModule,
+    children: impl IntoIterator<Item = TypeId>,
+    visiting: &mut BTreeSet<TypeId>,
+) -> Option<ManagedValueClass> {
+    for child in children {
+        if classify_managed_type(module, child, visiting)?.requires_root() {
+            return Some(ManagedValueClass::ContainsBaseReferences);
+        }
+    }
+    Some(ManagedValueClass::Unmanaged)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MonomorphizationError {
     UnknownRoot(FunctionId),
@@ -2211,6 +2555,11 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
         if matches!(ty, Type::Parameter { .. }) {
             errors.push(format!(
                 "Concrete Core type t{index} contains a residual type parameter"
+            ));
+        }
+        if managed_value_class(module, TypeId(index as u32)).is_none() {
+            errors.push(format!(
+                "Concrete Core type t{index} has no managed-value classification"
             ));
         }
     }

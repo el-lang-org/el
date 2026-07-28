@@ -5,8 +5,10 @@ use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
     ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant,
     CoreFailureCategory, CoreFunction, FunctionId, Operation, SlotId, SwitchValue, Terminator,
-    Type, TypeId, ValueId, verify_concrete,
+    Type, TypeId, ValueId, collection_point_roots, verify_concrete,
 };
+#[cfg(feature = "managed-runtime")]
+use el_runtime::{ALLOCATE_SCANNED_SYMBOL, INITIALIZE_SYMBOL};
 use el_runtime::{FAILURE_SYMBOL, FailureCategory};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -20,12 +22,12 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
 use inkwell::values::{
-    AggregateValueEnum, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PhiValue,
-    PointerValue, StructValue,
+    AggregateValueEnum, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
+    InstructionValue, IntValue, PhiValue, PointerValue, StructValue,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -321,6 +323,10 @@ struct ModuleLowerer<'ctx, 'core> {
     module: Module<'ctx>,
     functions: BTreeMap<FunctionId, FunctionValue<'ctx>>,
     failure: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    initialize_runtime: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    allocate_scanned: FunctionValue<'ctx>,
 }
 
 impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
@@ -336,12 +342,36 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             false,
         );
         let failure = module.add_function(FAILURE_SYMBOL, failure_type, None);
+        #[cfg(feature = "managed-runtime")]
+        let initialize_runtime = module.add_function(
+            INITIALIZE_SYMBOL,
+            context.void_type().fn_type(&[], false),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let allocate_scanned = module.add_function(
+            ALLOCATE_SCANNED_SYMBOL,
+            context.ptr_type(AddressSpace::default()).fn_type(
+                &[
+                    context.i64_type().into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
         Self {
             context,
             core,
             module,
             functions: BTreeMap::new(),
             failure,
+            #[cfg(feature = "managed-runtime")]
+            initialize_runtime,
+            #[cfg(feature = "managed-runtime")]
+            allocate_scanned,
         }
     }
 
@@ -407,6 +437,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         let block = self.context.append_basic_block(shim, "entry");
         let builder = self.context.create_builder();
         builder.position_at_end(block);
+        #[cfg(feature = "managed-runtime")]
+        built(builder.build_call(self.initialize_runtime, &[], ""))?;
         let call = built(builder.build_call(target, &[], "el.exit_status"))?;
         let status = call
             .try_as_basic_value()
@@ -432,6 +464,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     false,
                 )
                 .into()),
+            Some(Type::List(_)) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             Some(Type::Atom(_)) => Ok(self.context.i8_type().into()),
             Some(Type::Tuple(elements)) => {
                 let fields = elements
@@ -461,6 +494,19 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             .position(|candidate| *candidate == member)
             .and_then(|index| u32::try_from(index).ok())
             .ok_or(BackendError::InvalidUnionMember { union, member })
+    }
+
+    fn list_node_type(&self, list: TypeId) -> Result<StructType<'ctx>, BackendError> {
+        let Some(Type::List(item)) = self.core.types.get(list.0 as usize) else {
+            return Err(BackendError::UnsupportedType(list));
+        };
+        Ok(self.context.struct_type(
+            &[
+                self.basic_type(*item)?,
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        ))
     }
 
     fn lower_function(&self, function: &CoreFunction) -> Result<(), BackendError> {
@@ -512,9 +558,53 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             slots.insert(slot.id, pointer);
         }
 
+        let collection_points = collection_point_roots(self.core, function)
+            .into_iter()
+            .map(|point| ((point.block, point.operation_index), point))
+            .collect::<BTreeMap<_, _>>();
+        let value_types = core_value_types(function);
+        let slot_types = function
+            .slots
+            .iter()
+            .map(|slot| (slot.id, slot.ty))
+            .collect::<BTreeMap<_, _>>();
+        let rooted_values = collection_points
+            .values()
+            .flat_map(|point| point.values.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut root_slots = BTreeMap::new();
+        for value in rooted_values {
+            let ty = value_types
+                .get(&value)
+                .copied()
+                .ok_or(BackendError::MissingValue(value))?;
+            let llvm_ty = self.basic_type(ty)?;
+            let pointer = built(builder.build_alloca(llvm_ty, &format!("gc.root.v{}", value.0)))?;
+            set_volatile(built(builder.build_store(pointer, llvm_ty.const_zero()))?)?;
+            root_slots.insert(value, pointer);
+        }
+        let mut partial_list_roots = BTreeMap::new();
+        for block in &function.blocks {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
+                if collection_points.contains_key(&(block.id, operation_index))
+                    && matches!(operation, Operation::List { .. })
+                {
+                    let pointer = built(builder.build_alloca(
+                        self.context.ptr_type(AddressSpace::default()),
+                        &format!("gc.partial.b{}.o{}", block.id.0, operation_index),
+                    ))?;
+                    set_volatile(built(builder.build_store(
+                        pointer,
+                        self.context.ptr_type(AddressSpace::default()).const_null(),
+                    ))?)?;
+                    partial_list_roots.insert((block.id, operation_index), pointer);
+                }
+            }
+        }
+
         for block in ordered_blocks {
             builder.position_at_end(self.block(&blocks, block.id)?);
-            for operation in &block.operations {
+            for (operation_index, operation) in block.operations.iter().enumerate() {
                 self.lower_operation(
                     function.id,
                     block.id,
@@ -523,6 +613,13 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &blocks,
                     &mut values,
                     &slots,
+                    collection_points.get(&(block.id, operation_index)),
+                    &root_slots,
+                    &value_types,
+                    &slot_types,
+                    partial_list_roots
+                        .get(&(block.id, operation_index))
+                        .copied(),
                 )?;
             }
             self.lower_terminator(function, block, &builder, &blocks, &values, &phis)?;
@@ -540,6 +637,11 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
         values: &mut BTreeMap<ValueId, BasicValueEnum<'ctx>>,
         slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
+        roots: Option<&el_ir::CollectionPointRoots>,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        value_types: &BTreeMap<ValueId, TypeId>,
+        slot_types: &BTreeMap<SlotId, TypeId>,
+        _partial_list_root: Option<PointerValue<'ctx>>,
     ) -> Result<(), BackendError> {
         match operation {
             Operation::Constant {
@@ -550,6 +652,107 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             } => {
                 let value = self.constant(function, *result, constant, *ty)?;
                 values.insert(*result, value);
+            }
+            Operation::List {
+                result,
+                elements,
+                tail,
+                ty,
+                origin,
+            } => {
+                let null = self.context.ptr_type(AddressSpace::default()).const_null();
+                let initial = tail
+                    .map(|tail| pointer_value(values, tail))
+                    .transpose()?
+                    .unwrap_or(null);
+                if elements.is_empty() {
+                    values.insert(*result, initial.into());
+                } else {
+                    #[cfg(not(feature = "managed-runtime"))]
+                    {
+                        let _ = (ty, origin);
+                        return Err(BackendError::UnsupportedOperation {
+                            function,
+                            block,
+                            operation: "list",
+                        });
+                    }
+                    #[cfg(feature = "managed-runtime")]
+                    {
+                        let roots = roots.ok_or_else(|| {
+                            BackendError::InvalidConcrete(vec![format!(
+                                "missing live-root set for collection point {function:?} {block:?}"
+                            )])
+                        })?;
+                        let partial = _partial_list_root.ok_or_else(|| {
+                            BackendError::Builder(
+                                "allocating list has no partial-list root".to_owned(),
+                            )
+                        })?;
+                        self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                        set_volatile(built(builder.build_store(partial, initial))?)?;
+
+                        let node_type = self.list_node_type(*ty)?;
+                        let native_size = node_type
+                            .size_of()
+                            .ok_or(BackendError::UnsupportedType(*ty))?;
+                        let size = if native_size.get_type() == self.context.i64_type() {
+                            native_size
+                        } else {
+                            built(builder.build_int_cast(
+                                native_size,
+                                self.context.i64_type(),
+                                &format!("v{}.node_size", result.0),
+                            ))?
+                        };
+                        let source = FailureOrigin::from_span(*origin)
+                            .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                        let mut current = initial;
+                        for (index, element) in elements.iter().enumerate().rev() {
+                            let call = built(
+                                builder.build_call(
+                                    self.allocate_scanned,
+                                    &[
+                                        size.into(),
+                                        self.context
+                                            .i32_type()
+                                            .const_int(u64::from(source.file), false)
+                                            .into(),
+                                        self.context
+                                            .i64_type()
+                                            .const_int(source.start, false)
+                                            .into(),
+                                        self.context.i64_type().const_int(source.end, false).into(),
+                                    ],
+                                    &format!("v{}.node{index}", result.0),
+                                ),
+                            )?;
+                            let node = match call.try_as_basic_value().basic() {
+                                Some(BasicValueEnum::PointerValue(pointer)) => pointer,
+                                _ => return Err(BackendError::MissingValue(*result)),
+                            };
+                            let item = built(builder.build_struct_gep(
+                                node_type,
+                                node,
+                                0,
+                                &format!("v{}.node{index}.item", result.0),
+                            ))?;
+                            let next = built(builder.build_struct_gep(
+                                node_type,
+                                node,
+                                1,
+                                &format!("v{}.node{index}.next", result.0),
+                            ))?;
+                            built(builder.build_store(item, value(values, *element)?))?;
+                            built(builder.build_store(next, current))?;
+                            current = node;
+                            set_volatile(built(builder.build_store(partial, current))?)?;
+                        }
+                        self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                        set_volatile(built(builder.build_store(partial, null))?)?;
+                        values.insert(*result, current.into());
+                    }
+                }
             }
             Operation::Tuple {
                 result,
@@ -582,6 +785,44 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     &format!("v{}", result.0),
                 ))?;
                 values.insert(*result, projected);
+            }
+            Operation::ListHead {
+                result, list, ty, ..
+            } => {
+                let list_ty = value_types
+                    .get(list)
+                    .copied()
+                    .ok_or(BackendError::MissingValue(*list))?;
+                let node_type = self.list_node_type(list_ty)?;
+                let item = built(builder.build_struct_gep(
+                    node_type,
+                    pointer_value(values, *list)?,
+                    0,
+                    &format!("v{}.item", result.0),
+                ))?;
+                let loaded = built(builder.build_load(
+                    self.basic_type(*ty)?,
+                    item,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, loaded);
+            }
+            Operation::ListTail {
+                result, list, ty, ..
+            } => {
+                let node_type = self.list_node_type(*ty)?;
+                let next = built(builder.build_struct_gep(
+                    node_type,
+                    pointer_value(values, *list)?,
+                    1,
+                    &format!("v{}.next", result.0),
+                ))?;
+                let loaded = built(builder.build_load(
+                    self.basic_type(*ty)?,
+                    next,
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, loaded);
             }
             Operation::CheckedArithmetic {
                 result,
@@ -668,6 +909,12 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 arguments,
                 ..
             } => {
+                let roots = roots.ok_or_else(|| {
+                    BackendError::InvalidConcrete(vec![format!(
+                        "missing live-root set for collection point {function:?} {block:?}"
+                    )])
+                })?;
+                self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
                 let target = self
                     .functions
                     .get(called)
@@ -683,6 +930,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     .try_as_basic_value()
                     .basic()
                     .ok_or(BackendError::MissingValue(*result))?;
+                self.clear_value_roots(roots, builder, root_slots, value_types)?;
                 values.insert(*result, result_value);
             }
             Operation::Load {
@@ -715,6 +963,67 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     operation: operation_name(other),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn preserve_roots(
+        &self,
+        roots: &el_ir::CollectionPointRoots,
+        builder: &Builder<'ctx>,
+        values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+        slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        slot_types: &BTreeMap<SlotId, TypeId>,
+    ) -> Result<(), BackendError> {
+        for root in &roots.values {
+            let pointer = root_slots
+                .get(root)
+                .copied()
+                .ok_or(BackendError::MissingValue(*root))?;
+            set_volatile(built(builder.build_store(pointer, value(values, *root)?))?)?;
+        }
+        for slot in &roots.slots {
+            let pointer = slots
+                .get(slot)
+                .copied()
+                .ok_or(BackendError::MissingSlot(*slot))?;
+            let ty = slot_types
+                .get(slot)
+                .copied()
+                .ok_or(BackendError::MissingSlot(*slot))?;
+            let loaded = built(builder.build_load(
+                self.basic_type(ty)?,
+                pointer,
+                &format!("gc.root.q{}.touch", slot.0),
+            ))?;
+            let instruction = loaded.as_instruction_value().ok_or_else(|| {
+                BackendError::Builder("GC root touch is not an instruction".to_owned())
+            })?;
+            set_volatile(instruction)?;
+        }
+        Ok(())
+    }
+
+    fn clear_value_roots(
+        &self,
+        roots: &el_ir::CollectionPointRoots,
+        builder: &Builder<'ctx>,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        value_types: &BTreeMap<ValueId, TypeId>,
+    ) -> Result<(), BackendError> {
+        for root in &roots.values {
+            let pointer = root_slots
+                .get(root)
+                .copied()
+                .ok_or(BackendError::MissingValue(*root))?;
+            let ty = value_types
+                .get(root)
+                .copied()
+                .ok_or(BackendError::MissingValue(*root))?;
+            set_volatile(built(
+                builder.build_store(pointer, self.basic_type(ty)?.const_zero()),
+            )?)?;
         }
         Ok(())
     }
@@ -799,6 +1108,14 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         BasicValueEnum::IntValue(value) => value,
                         _ => return Err(BackendError::UnsupportedType(*subject_ty)),
                     }
+                } else if matches!(
+                    self.core.types.get(subject_ty.0 as usize),
+                    Some(Type::List(_))
+                ) {
+                    built(builder.build_is_null(
+                        pointer_value(values, *subject)?,
+                        &format!("v{}.empty", subject.0),
+                    ))?
                 } else {
                     match source {
                         BasicValueEnum::IntValue(value) => value,
@@ -818,13 +1135,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         SwitchValue::UnionMember(member) => discriminant
                             .get_type()
                             .const_int(u64::from(self.union_tag(*subject_ty, *member)?), false),
-                        SwitchValue::ListEmpty | SwitchValue::ListCons => {
-                            return Err(BackendError::UnsupportedTerminator {
-                                function: function.id,
-                                block: block.id,
-                                terminator: "list switch",
-                            });
-                        }
+                        SwitchValue::ListEmpty => discriminant.get_type().const_int(1, false),
+                        SwitchValue::ListCons => discriminant.get_type().const_zero(),
                     };
                     lowered_cases.push((value, self.block(blocks, *target)?));
                 }
@@ -1108,6 +1420,44 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
     }
 }
 
+fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
+    function
+        .parameters
+        .iter()
+        .chain(function.blocks.iter().flat_map(|block| &block.parameters))
+        .map(|parameter| (parameter.value, parameter.ty))
+        .chain(function.blocks.iter().flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Constant { result, ty, .. }
+                    | Operation::List { result, ty, .. }
+                    | Operation::Array { result, ty, .. }
+                    | Operation::Map { result, ty, .. }
+                    | Operation::Tuple { result, ty, .. }
+                    | Operation::TupleProject { result, ty, .. }
+                    | Operation::StructProject { result, ty, .. }
+                    | Operation::ListHead { result, ty, .. }
+                    | Operation::ListTail { result, ty, .. }
+                    | Operation::CheckedArithmetic { result, ty, .. }
+                    | Operation::Call { result, ty, .. }
+                    | Operation::UnionInject { result, ty, .. }
+                    | Operation::UnionProject { result, ty, .. }
+                    | Operation::Load { result, ty, .. } => Some((*result, *ty)),
+                    Operation::Compare { result, .. } => Some((*result, TypeId(2))),
+                    Operation::Store { .. } => None,
+                })
+        }))
+        .collect()
+}
+
+fn set_volatile(instruction: InstructionValue<'_>) -> Result<(), BackendError> {
+    instruction
+        .set_volatile(true)
+        .map_err(|error| BackendError::Builder(error.to_string()))
+}
+
 fn built<T>(result: Result<T, BuilderError>) -> Result<T, BackendError> {
     result.map_err(|error| BackendError::Builder(error.to_string()))
 }
@@ -1138,6 +1488,16 @@ fn struct_value<'ctx>(
 ) -> Result<StructValue<'ctx>, BackendError> {
     match value(values, id)? {
         BasicValueEnum::StructValue(value) => Ok(value),
+        _ => Err(BackendError::MissingValue(id)),
+    }
+}
+
+fn pointer_value<'ctx>(
+    values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+    id: ValueId,
+) -> Result<PointerValue<'ctx>, BackendError> {
+    match value(values, id)? {
+        BasicValueEnum::PointerValue(value) => Ok(value),
         _ => Err(BackendError::MissingValue(id)),
     }
 }
@@ -1198,6 +1558,8 @@ mod tests {
         assert!(llvm.as_str().contains("ret i32"));
         assert!(llvm.as_str().contains("define i32 @main()"));
         assert!(llvm.as_str().contains("call i32 @el.f1()"));
+        #[cfg(feature = "managed-runtime")]
+        assert!(llvm.as_str().contains("call void @__el_runtime_init()"));
         assert!(llvm.as_str().contains("@llvm.smul.with.overflow.i32"));
         assert!(llvm.as_str().contains("@llvm.sadd.with.overflow.i32"));
         assert!(
@@ -1273,6 +1635,10 @@ mod tests {
         );
         assert!(text.contains("{ ptr, i64 }"), "{text}");
         assert!(text.contains("switch i32"), "{text}");
+        assert!(
+            text.contains("store volatile { i32, i64, { ptr, i64 } }"),
+            "a managed union payload is rooted across its consuming call:\n{text}"
+        );
     }
 
     #[test]
@@ -1317,6 +1683,33 @@ mod tests {
     }
 
     #[test]
+    fn spills_live_managed_values_and_touches_live_slots_at_calls() {
+        let core = concrete(
+            "defmodule Main do\n  def noop() -> unit do\n    unit\n  end\n  def consume(value: string) -> i32 do\n    42\n  end\n  def from_slot(value: string) -> i32 do\n    mut held: string = value\n    noop()\n    consume(held)\n  end\n  def through_cleanup(value: string) -> string do\n    defer noop()\n    value\n  end\n  def main() -> i32 do\n    from_slot(through_cleanup(\"root\"))\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("managed roots lower and verify");
+        let text = llvm.as_str();
+
+        assert!(
+            text.contains("gc.root.v"),
+            "dedicated root slots are emitted:\n{text}"
+        );
+        assert!(
+            text.contains("store volatile { ptr, i64 }"),
+            "managed values are materialized as aligned base-pointer aggregates:\n{text}"
+        );
+        assert!(
+            text.contains("load volatile { ptr, i64 }, ptr %q0"),
+            "a managed local live across a call remains in scanned stack storage:\n{text}"
+        );
+        assert!(
+            text.contains("zeroinitializer, ptr %gc.root.v"),
+            "temporary roots are cleared after collection points:\n{text}"
+        );
+    }
+
+    #[test]
     fn rejects_malformed_cleanup_cfg_before_llvm_generation() {
         let mut core = concrete(
             "defmodule Main do\n  def cleanup() -> unit do\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    42\n  end\nend\n",
@@ -1352,6 +1745,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "managed-runtime"))]
     #[test]
     fn rejects_operations_outside_the_first_backend_slice() {
         let core = concrete(
@@ -1365,6 +1759,28 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_scanned_list_nodes_and_structural_patterns() {
+        let core = concrete(
+            "defmodule Main do\n  def first(values: [i32]) -> i32 do\n    match values do\n      [head | _] -> head\n      [] -> 0\n    end\n  end\n  def main() -> i32 do\n    first([42])\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("managed lists lower and verify");
+        let text = llvm.as_str();
+        assert!(
+            text.contains("call ptr @__el_runtime_alloc_scanned"),
+            "{text}"
+        );
+        assert!(text.contains("store i32 42"), "{text}");
+        assert!(text.contains("icmp eq ptr"), "{text}");
+        assert!(text.contains("load i32"), "{text}");
+        assert!(
+            text.contains("gc.partial") && text.contains("store volatile ptr"),
+            "partially constructed list spines must remain rooted:\n{text}"
+        );
     }
 
     #[test]
@@ -1402,6 +1818,23 @@ mod tests {
         assert!(metadata.len() > 0);
         assert!(!target.llvm_target_triple().is_empty());
         assert!(matches!(target.pointer_width(), 32 | 64));
+        std::fs::remove_file(output).expect("remove emitted object");
+    }
+
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn optimized_object_emission_accepts_volatile_managed_roots() {
+        let core = concrete(
+            "defmodule Main do\n  def consume(value: string) -> i32 do\n    42\n  end\n  def main() -> i32 do\n    consume(\"root\")\n  end\nend\n",
+        );
+        let output = std::env::temp_dir().join(format!(
+            "el-codegen-managed-root-release-test-{}.o",
+            std::process::id()
+        ));
+
+        emit_host_object_with_profile(&core, &output, CodegenProfile::Release)
+            .expect("O3 preserves and verifies volatile managed roots");
+        assert!(std::fs::metadata(&output).is_ok());
         std::fs::remove_file(output).expect("remove emitted object");
     }
 }

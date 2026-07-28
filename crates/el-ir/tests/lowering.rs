@@ -1,9 +1,11 @@
 use el_ir::{
-    CoreFailureCategory, EntryPointError, FunctionId, Operation, Terminator, ValueId,
-    executable_reachability_roots, lower, monomorphize, verify, verify_concrete,
+    CollectionEffect, ConcreteStruct, CoreFailureCategory, EntryPointError, FunctionId,
+    ManagedValueClass, Operation, Terminator, ValueId, collection_point_roots,
+    executable_reachability_roots, lower, managed_value_class, monomorphize,
+    operation_collection_effect, verify, verify_concrete,
 };
 use el_parser::parse;
-use el_resolve::{resolve, resolve_package};
+use el_resolve::{DeclId, resolve, resolve_package};
 use el_span::SourceMap;
 use el_types::{Type, TypeId, check};
 
@@ -29,6 +31,193 @@ fn lowered_package(sources: &[&str]) -> el_ir::GenericModule {
     let resolved = resolve_package(&parsed).expect("fixture resolves");
     let typed = el_types::check_package(&resolved).expect("fixture type checks");
     lower(&typed)
+}
+
+#[test]
+fn concrete_types_carry_collector_independent_managed_classification() {
+    let generic = lowered("defmodule Main do\n  def main() -> i32 do\n    0\n  end\nend\n");
+    let roots = executable_reachability_roots(&generic).expect("entry point");
+    let mut concrete = monomorphize(&generic, &roots).expect("concrete module");
+    let i64_ty = TypeId(1);
+    let string_ty = concrete
+        .types
+        .iter()
+        .position(|ty| matches!(ty, Type::String))
+        .map(|index| TypeId(index as u32))
+        .unwrap_or_else(|| {
+            let id = TypeId(concrete.types.len() as u32);
+            concrete.types.push(Type::String);
+            id
+        });
+    let mut add = |ty| {
+        let id = TypeId(concrete.types.len() as u32);
+        concrete.types.push(ty);
+        id
+    };
+    let list = add(Type::List(i64_ty));
+    let map = add(Type::Map {
+        key: i64_ty,
+        value: i64_ty,
+    });
+    let tuple = add(Type::Tuple(vec![i64_ty, string_ty]));
+    let union = add(Type::Union(vec![i64_ty, list]));
+    let array = add(Type::Array {
+        item: string_ty,
+        length: 2,
+    });
+    let function = add(Type::Function {
+        parameters: vec![string_ty],
+        result: i64_ty,
+    });
+    let declaration = DeclId(999);
+    let structure = add(Type::Struct {
+        declaration,
+        arguments: Vec::new(),
+    });
+    concrete.structs.push(ConcreteStruct {
+        declaration,
+        name: "ManagedFields".to_owned(),
+        arguments: Vec::new(),
+        fields: vec![("name".to_owned(), string_ty), ("items".to_owned(), list)],
+        origin: concrete.functions[0].span,
+    });
+
+    assert_eq!(
+        managed_value_class(&concrete, i64_ty),
+        Some(ManagedValueClass::Unmanaged)
+    );
+    assert_eq!(
+        managed_value_class(&concrete, function),
+        Some(ManagedValueClass::Unmanaged)
+    );
+    for ty in [string_ty, tuple, union, array, structure] {
+        assert_eq!(
+            managed_value_class(&concrete, ty),
+            Some(ManagedValueClass::ContainsBaseReferences)
+        );
+    }
+    for ty in [list, map] {
+        assert_eq!(
+            managed_value_class(&concrete, ty),
+            Some(ManagedValueClass::BaseReference)
+        );
+    }
+    assert_eq!(managed_value_class(&concrete, TypeId(u32::MAX)), None);
+}
+
+#[test]
+fn every_el_call_is_a_collection_point() {
+    let module = lowered(
+        "defmodule Main do\n  def identity(value: i64) -> i64 do\n    value\n  end\n  def main() -> i32 do\n    identity(1)\n    0\n  end\nend\n",
+    );
+    let operations = module.functions[1]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Call { .. }))
+    );
+    for operation in operations {
+        let expected = if matches!(operation, Operation::Call { .. }) {
+            CollectionEffect::MayCollect
+        } else {
+            CollectionEffect::CannotCollect
+        };
+        assert_eq!(operation_collection_effect(operation), expected);
+    }
+}
+
+#[test]
+fn non_empty_lists_are_collection_points_but_empty_lists_are_not() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    empty: [i32] = []\n    values: [i32] = [1 | empty]\n    0\n  end\nend\n",
+    );
+    let lists = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|operation| matches!(operation, Operation::List { .. }))
+        .collect::<Vec<_>>();
+
+    assert_eq!(lists.len(), 2);
+    assert_eq!(
+        operation_collection_effect(lists[0]),
+        CollectionEffect::CannotCollect
+    );
+    assert_eq!(
+        operation_collection_effect(lists[1]),
+        CollectionEffect::MayCollect
+    );
+}
+
+#[test]
+fn computes_managed_roots_across_calls_slots_and_cleanup_block_parameters() {
+    let generic = lowered(
+        "defmodule Main do\n  def noop() -> unit do\n    unit\n  end\n  def consume(value: string) -> i32 do\n    1\n  end\n  def from_value(value: string) -> i32 do\n    noop()\n    consume(value)\n  end\n  def from_slot(value: string) -> i32 do\n    mut held: string = value\n    noop()\n    consume(held)\n  end\n  def through_loop(value: string) -> i32 do\n    mut count: i32 = 1\n    while count > 0 do\n      noop()\n      count := count - 1\n    end\n    consume(value)\n  end\n  def through_cleanup(value: string) -> string do\n    defer noop()\n    value\n  end\n  def main() -> i32 do\n    from_value(\"value\") + from_slot(through_cleanup(\"slot\")) + through_loop(\"loop\")\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&generic).expect("entry point");
+    let concrete = monomorphize(&generic, &roots).expect("concrete module");
+
+    let from_value = concrete
+        .functions
+        .iter()
+        .find(|function| function.name == "from_value")
+        .expect("value fixture");
+    let value_points = collection_point_roots(&concrete, from_value);
+    assert_eq!(value_points.len(), 2);
+    assert_eq!(value_points[0].values, vec![from_value.parameters[0].value]);
+    assert!(value_points[0].slots.is_empty());
+    assert_eq!(value_points[1].values, vec![from_value.parameters[0].value]);
+
+    let from_slot = concrete
+        .functions
+        .iter()
+        .find(|function| function.name == "from_slot")
+        .expect("slot fixture");
+    let slot_points = collection_point_roots(&concrete, from_slot);
+    assert_eq!(slot_points.len(), 2);
+    assert!(slot_points[0].values.is_empty());
+    assert_eq!(slot_points[0].slots, vec![from_slot.slots[0].id]);
+    assert_eq!(
+        slot_points[1].values.len(),
+        1,
+        "the loaded slot is a call root"
+    );
+    assert!(slot_points[1].slots.is_empty());
+
+    let through_loop = concrete
+        .functions
+        .iter()
+        .find(|function| function.name == "through_loop")
+        .expect("loop fixture");
+    let loop_points = collection_point_roots(&concrete, through_loop);
+    assert_eq!(loop_points.len(), 2);
+    assert!(
+        loop_points
+            .iter()
+            .all(|point| point.values.contains(&through_loop.parameters[0].value)),
+        "the fixed point keeps a managed parameter live through the loop back edge"
+    );
+
+    let cleanup = concrete
+        .functions
+        .iter()
+        .find(|function| function.name == "through_cleanup")
+        .expect("cleanup fixture");
+    let cleanup_points = collection_point_roots(&concrete, cleanup);
+    assert_eq!(cleanup_points.len(), 1);
+    assert_eq!(cleanup_points[0].values.len(), 1);
+    assert!(
+        cleanup
+            .blocks
+            .iter()
+            .flat_map(|block| &block.parameters)
+            .any(|parameter| cleanup_points[0].values.contains(&parameter.value)),
+        "the saved managed result remains live while its deferred call runs"
+    );
 }
 
 #[test]
@@ -247,11 +436,16 @@ fn concrete_verifier_rejects_residuals_duplicates_and_abstract_layouts() {
     )
     .expect("baseline layout module");
     abstract_layout.structs.clear();
+    let errors = verify_concrete(&abstract_layout).expect_err("abstract layout is rejected");
     assert!(
-        verify_concrete(&abstract_layout)
-            .expect_err("abstract layout is rejected")
+        errors
             .iter()
             .any(|error| error.contains("has no concrete layout"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("has no managed-value classification"))
     );
 }
 

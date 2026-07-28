@@ -4,6 +4,8 @@ use el_ir::{ConcreteModule, Type, TypeId};
 use std::fmt;
 
 mod linker;
+#[cfg(feature = "managed-runtime")]
+pub use linker::link_host_managed_executable;
 pub use linker::{IoError, LinkerError, link_host_executable, link_host_objects};
 mod metadata;
 pub use metadata::{InvalidTargetMetadata, MetadataWriteError, TargetMetadata};

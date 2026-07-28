@@ -1,5 +1,7 @@
 #![cfg(feature = "llvm")]
 
+#[cfg(feature = "managed-runtime")]
+use el_codegen::link_host_managed_executable;
 use el_codegen::{emit_host_object_with_profile, link_host_objects};
 use el_driver::{BuildProfile, analyze_source};
 use el_ir::{executable_reachability_roots, monomorphize};
@@ -37,7 +39,7 @@ fn compile_runtime_failure_stub(directory: &Path) -> PathBuf {
     let object = directory.join("runtime.o");
     fs::write(
         &source,
-        "#include <stdint.h>\n#include <stdlib.h>\nvoid __el_runtime_fail(uint32_t category, uint32_t file, uint64_t start, uint64_t end) {\n  (void)file; (void)start; (void)end;\n  _Exit((int)(100u + category));\n}\n",
+        "#include <stdint.h>\n#include <stdlib.h>\nvoid __el_runtime_init(void) {}\nvoid __el_runtime_fail(uint32_t category, uint32_t file, uint64_t start, uint64_t end) {\n  (void)file; (void)start; (void)end;\n  _Exit((int)(100u + category));\n}\n",
     )
     .expect("write runtime test support");
     let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
@@ -79,6 +81,94 @@ fn build_and_run(
     Command::new(executable)
         .status()
         .expect("run native executable")
+}
+
+#[cfg(feature = "gc-stress-test")]
+fn build_and_run_managed(
+    directory: &Path,
+    name: &str,
+    source: &str,
+    profile: BuildProfile,
+) -> ExitStatus {
+    let mut sources = SourceMap::new();
+    let file = sources.add_file("src/main.el", source);
+    let generic = analyze_source(file, source).expect("source reaches Generic Core");
+    let roots = executable_reachability_roots(&generic).expect("select executable entry");
+    let concrete = monomorphize(&generic, &roots).expect("monomorphize executable");
+    let object = directory.join(format!("{name}.o"));
+    let executable = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+
+    emit_host_object_with_profile(&concrete, &object, profile.codegen_profile())
+        .expect("emit managed host object");
+    link_host_managed_executable(&[object.as_path()], &executable)
+        .expect("link managed native executable");
+    Command::new(executable)
+        .status()
+        .expect("run managed native executable")
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn managed_lists_survive_every_allocation_collection_in_all_root_positions() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  @type Held = [i32] | :none\n  def build(count: i32, tail: [i32]) -> [i32] do\n    if count == 0 do\n      tail\n    else\n      build(count - 1, [count | tail])\n    end\n  end\n  def length(values: [i32], count: i32) -> i32 do\n    match values do\n      [] -> count\n      [_ | tail] -> length(tail, count + 1)\n    end\n  end\n  def observe(values: [i32]) -> unit do\n    match values do\n      [] -> unit\n      [_ | _] -> unit\n    end\n  end\n  def preserve(values: [i32]) -> [i32] do\n    mut held: [i32] = values\n    defer do\n      observe(held)\n    end\n    if true do\n      defer observe(held)\n      held\n    else\n      []\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4, 5, 6, 7, 8]\n      observe(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    graph: [i32] = preserve(build(42, []))\n    held: Held = graph\n    pressure(512)\n    match held do\n      values: [i32] -> length(values, 0)\n      _ -> 0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-managed-list-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "reachable list graph must survive collection at every allocation in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "allocation-failure-test")]
+#[test]
+fn managed_allocation_failure_reports_origin_and_skips_cleanup() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def cleanup() -> unit do\n    1 / 0\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    values: [i32] = [1]\n    0\n  end\nend\n";
+    let mut sources = SourceMap::new();
+    let file = sources.add_file("src/main.el", source);
+    let generic = analyze_source(file, source).expect("source reaches Generic Core");
+    let roots = executable_reachability_roots(&generic).expect("select executable entry");
+    let concrete = monomorphize(&generic, &roots).expect("monomorphize executable");
+    let object = temp.0.join("allocation-failure.o");
+    let executable = temp.0.join(format!(
+        "allocation-failure{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    emit_host_object_with_profile(&concrete, &object, BuildProfile::Release.codegen_profile())
+        .expect("emit allocation-failure fixture");
+    link_host_managed_executable(&[object.as_path()], &executable)
+        .expect("link allocation-failure fixture");
+
+    let output = Command::new(executable)
+        .output()
+        .expect("run allocation-failure fixture");
+    let literal_start = source.rfind("[1]").expect("list literal") as u64;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        stderr,
+        format!(
+            "EL runtime failure 6 at file 0:{literal_start}..{}\n",
+            literal_start + 3
+        )
+    );
+    assert!(
+        !stderr.contains("failure 2"),
+        "allocation failure must terminate without running deferred cleanup"
+    );
 }
 
 #[test]

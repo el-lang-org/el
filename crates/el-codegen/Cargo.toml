@@ -20,6 +20,9 @@ el-types = { path = "../el-types", version = "=0.1.0" }
 [features]
 default = []
 llvm = ["dep:inkwell", "inkwell/llvm22-1-prefer-dynamic"]
+managed-runtime = ["el-runtime/boehm"]
+gc-stress-test = ["managed-runtime", "el-runtime/gc-stress-test"]
+allocation-failure-test = ["managed-runtime", "el-runtime/allocation-failure-test"]
 # Lets CI type-check the private Inkwell boundary when LLVM is unavailable.
 # It cannot link or execute backend tests.
 llvm-api-check = ["dep:inkwell", "inkwell/llvm22-1-no-llvm-linking"]

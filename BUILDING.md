@@ -40,9 +40,17 @@ The first command must report `22.1.8`. The active Darwin arm64 workstation has
 the pinned Homebrew LLVM at `/opt/homebrew/opt/llvm`. Set `LLVM_SYS_221_PREFIX`
 to that prefix for local backend checks.
 
-Enable the production backend with `el-codegen`'s `llvm` feature. A host without
-LLVM can still type-check the private Inkwell API boundary without linking or
-executing it:
+Enable the backend with `el-codegen`'s `llvm` feature. Managed executable builds
+also select `managed-runtime`; this makes the generated process entry initialize
+the collector and exposes the linker path that adds the matching runtime and GC
+archives:
+
+```sh
+cargo test -p el-codegen --features llvm,managed-runtime
+```
+
+A host without LLVM can still type-check the private Inkwell API boundary
+without linking or executing it:
 
 ```sh
 cargo check -p el-codegen --features llvm-api-check --tests
@@ -69,6 +77,22 @@ cd gc-8.2.12
 make check
 ```
 
-Runtime integration will encapsulate this native build behind `el-runtime` in
-Milestone 5. Passing the commands above alone does not make Darwin arm64 a
-supported EL target.
+Milestone 5 now encapsulates this native build behind `el-runtime`. Build the
+pinned collector and private runtime archive with:
+
+```sh
+cargo test -p el-runtime --features boehm
+cargo test -p el-runtime --features gc-stress-test
+cargo test --release -p el-runtime --features gc-stress-test
+LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm \
+  cargo test -p el-driver --features gc-stress-test --test native
+LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm \
+  cargo test -p el-driver --features allocation-failure-test --test native
+```
+
+The default workspace build remains frontend-friendly and does not require a C
+toolchain. `gc-stress-test` compiles the runtime so each managed allocation first
+requests a full collection; it is a compiler/runtime conformance mode, not an EL
+source option. `allocation-failure-test` is a separate conformance build that
+forces managed allocation failure; do not combine it with `gc-stress-test`.
+Passing these commands alone does not make Darwin arm64 a supported EL target.
