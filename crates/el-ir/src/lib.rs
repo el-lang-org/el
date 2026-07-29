@@ -2,9 +2,13 @@
 
 use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
-pub use el_types::{ArithmeticOperator, BufferAppendKind, ComparisonOperator, Type, TypeId};
+pub use el_types::{
+    ArithmeticOperator, BitstringByteOrder, BufferAppendKind, ComparisonOperator, EnumVisitKind,
+    Type, TypeId,
+};
 use el_types::{
-    LogicalOperator, TypedExpr, TypedExprKind, TypedItem, TypedPatternKind, TypedProgram,
+    LogicalOperator, TypedBitstringPatternSegmentKind, TypedBitstringSegmentKind, TypedExpr,
+    TypedExprKind, TypedItem, TypedPatternKind, TypedProgram,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,6 +29,28 @@ pub enum CoreFailureCategory {
     IntegerOverflow,
     DivisionByZero,
     IndexOutOfBounds,
+    BitstringSizeMismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BitstringSegment {
+    Integer {
+        value: ValueId,
+        source_ty: TypeId,
+        signed: bool,
+        byte_order: BitstringByteOrder,
+        width: u8,
+    },
+    Bytes {
+        value: ValueId,
+        size: Option<ValueId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BitstringPatternLength {
+    Fixed(u8),
+    Dynamic(ValueId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +200,58 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    StringCodepointView {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringGraphemeView {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringLength {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    Bitstring {
+        result: ValueId,
+        segments: Vec<BitstringSegment>,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BitstringPatternInteger {
+        result: ValueId,
+        bytes: ValueId,
+        prefix: Vec<BitstringPatternLength>,
+        signed: bool,
+        byte_order: BitstringByteOrder,
+        width: u8,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BitstringPatternBytes {
+        result: ValueId,
+        bytes: ValueId,
+        prefix: Vec<BitstringPatternLength>,
+        length: Option<ValueId>,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BitstringPatternCheck {
+        bytes: ValueId,
+        lengths: Vec<BitstringPatternLength>,
+        exact: bool,
+        failure: BlockId,
+        origin: Span,
+    },
     StringFromBytes {
         result: ValueId,
         bytes: ValueId,
@@ -257,6 +335,32 @@ pub enum Operation {
         result: ValueId,
         value: ValueId,
         known_length: Option<u64>,
+        ty: TypeId,
+        origin: Span,
+    },
+    EnumAt {
+        result: ValueId,
+        value: ValueId,
+        index: ValueId,
+        source_ty: TypeId,
+        ty: TypeId,
+        origin: Span,
+    },
+    EnumToList {
+        result: ValueId,
+        value: ValueId,
+        source_ty: TypeId,
+        ty: TypeId,
+        origin: Span,
+    },
+    EnumVisit {
+        result: ValueId,
+        value: ValueId,
+        initial: Option<ValueId>,
+        function: ValueId,
+        source_ty: TypeId,
+        function_ty: TypeId,
+        kind: EnumVisitKind,
         ty: TypeId,
         origin: Span,
     },
@@ -353,11 +457,26 @@ pub enum Operation {
         operand_ty: TypeId,
         origin: Span,
     },
+    FunctionRef {
+        result: ValueId,
+        function: FunctionId,
+        substitutions: Vec<(TypeId, TypeId)>,
+        ty: TypeId,
+        origin: Span,
+    },
     Call {
         result: ValueId,
         function: FunctionId,
         substitutions: Vec<(TypeId, TypeId)>,
         arguments: Vec<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
+    IndirectCall {
+        result: ValueId,
+        callee: ValueId,
+        arguments: Vec<ValueId>,
+        function_ty: TypeId,
         ty: TypeId,
         origin: Span,
     },
@@ -1007,6 +1126,77 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::StringCodepointView(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringCodepointView {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringGraphemeView(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringGraphemeView {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringLength(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringLength {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::Bitstring(typed_segments) => {
+                let mut segments = Vec::with_capacity(typed_segments.len());
+                for segment in typed_segments {
+                    let value = self.lower_expr(&segment.value)?;
+                    segments.push(match &segment.kind {
+                        TypedBitstringSegmentKind::Integer {
+                            signed,
+                            byte_order,
+                            width,
+                        } => BitstringSegment::Integer {
+                            value,
+                            source_ty: segment.value.ty,
+                            signed: *signed,
+                            byte_order: *byte_order,
+                            width: *width,
+                        },
+                        TypedBitstringSegmentKind::Bytes { size } => BitstringSegment::Bytes {
+                            value,
+                            size: if let Some(size) = size {
+                                Some(self.lower_expr(size)?)
+                            } else {
+                                None
+                            },
+                        },
+                    });
+                }
+                let failure = self
+                    .failure_target(CoreFailureCategory::BitstringSizeMismatch, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::Bitstring {
+                    result,
+                    segments,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::StringFromBytes(value) => {
                 let bytes = self.lower_expr(value)?;
                 let result = self.value();
@@ -1201,6 +1391,63 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::EnumAt { value, index } => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let index = self.lower_expr(index)?;
+                let result = self.value();
+                self.operations.push(Operation::EnumAt {
+                    result,
+                    value,
+                    index,
+                    source_ty,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::EnumToList(value) => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::EnumToList {
+                    result,
+                    value,
+                    source_ty,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::EnumVisit {
+                value,
+                initial,
+                function,
+                kind,
+            } => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let initial = if let Some(initial) = initial {
+                    Some(self.lower_expr(initial)?)
+                } else {
+                    None
+                };
+                let function_ty = function.ty;
+                let function = self.lower_expr(function)?;
+                let result = self.value();
+                self.operations.push(Operation::EnumVisit {
+                    result,
+                    value,
+                    initial,
+                    function,
+                    source_ty,
+                    function_ty,
+                    kind: *kind,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::Map(source_entries) => {
                 let mut entries = Vec::new();
                 for (key, value) in source_entries {
@@ -1346,6 +1593,38 @@ impl<'a> Lowerer<'a> {
                     function: self.functions[function],
                     substitutions: substitutions.clone(),
                     arguments,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::FunctionRef {
+                function,
+                substitutions,
+            } => {
+                let result = self.value();
+                self.operations.push(Operation::FunctionRef {
+                    result,
+                    function: self.functions[function],
+                    substitutions: substitutions.clone(),
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::IndirectCall { callee, arguments } => {
+                let function_ty = callee.ty;
+                let callee = self.lower_expr(callee)?;
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.lower_expr(argument))
+                    .collect::<Option<Vec<_>>>()?;
+                let result = self.value();
+                self.operations.push(Operation::IndirectCall {
+                    result,
+                    callee,
+                    arguments,
+                    function_ty,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -1912,7 +2191,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_pattern(
         &mut self,
-        pattern: &el_types::TypedPattern,
+        pattern: &'a el_types::TypedPattern,
         subject: ValueId,
         success: BlockId,
         failure: BlockId,
@@ -2040,6 +2319,87 @@ impl<'a> Lowerer<'a> {
                     bindings,
                 );
             }
+            TypedPatternKind::Bitstring(segments) => {
+                let mut lengths = Vec::with_capacity(segments.len());
+                let exact = !matches!(
+                    segments.last().map(|segment| &segment.kind),
+                    Some(TypedBitstringPatternSegmentKind::Bytes { size: None })
+                );
+                for segment in segments {
+                    for (symbol, (value, _)) in bindings.iter() {
+                        self.bindings.insert(*symbol, Binding::Value(*value));
+                    }
+                    let result = self.value();
+                    match &segment.kind {
+                        TypedBitstringPatternSegmentKind::Integer {
+                            signed,
+                            byte_order,
+                            width,
+                        } => {
+                            self.operations.push(Operation::BitstringPatternInteger {
+                                result,
+                                bytes: subject,
+                                prefix: lengths.clone(),
+                                signed: *signed,
+                                byte_order: *byte_order,
+                                width: *width,
+                                failure,
+                                ty: segment.pattern.ty,
+                                origin: segment.pattern.span,
+                            });
+                            lengths.push(BitstringPatternLength::Fixed(*width / 8));
+                        }
+                        TypedBitstringPatternSegmentKind::Bytes { size } => {
+                            let length = size.as_ref().and_then(|size| self.lower_expr(size));
+                            if size.is_some() && length.is_none() {
+                                return;
+                            }
+                            self.operations.push(Operation::BitstringPatternBytes {
+                                result,
+                                bytes: subject,
+                                prefix: lengths.clone(),
+                                length,
+                                failure,
+                                ty: segment.pattern.ty,
+                                origin: segment.pattern.span,
+                            });
+                            if let Some(length) = length {
+                                lengths.push(BitstringPatternLength::Dynamic(length));
+                            }
+                        }
+                    }
+                    let next = self.new_block();
+                    self.lower_pattern(&segment.pattern, result, next, failure, bindings);
+                    self.current_block = next;
+                    self.current_parameters = bindings
+                        .values()
+                        .map(|(_, ty)| CoreParameter {
+                            value: self.value(),
+                            ty: *ty,
+                            origin: segment.pattern.span,
+                        })
+                        .collect();
+                    for ((symbol, binding), parameter) in
+                        bindings.iter_mut().zip(self.current_parameters.iter())
+                    {
+                        binding.0 = parameter.value;
+                        self.bindings
+                            .insert(*symbol, Binding::Value(parameter.value));
+                    }
+                }
+                self.operations.push(Operation::BitstringPatternCheck {
+                    bytes: subject,
+                    lengths,
+                    exact,
+                    failure,
+                    origin: pattern.span,
+                });
+                self.finish_current(Terminator::Branch {
+                    target: success,
+                    arguments: pattern_arguments(bindings),
+                    origin: pattern.span,
+                });
+            }
             TypedPatternKind::Struct {
                 declaration,
                 fields,
@@ -2065,7 +2425,7 @@ impl<'a> Lowerer<'a> {
 
     fn lower_pattern_sequence(
         &mut self,
-        children: &[(&el_types::TypedPattern, ValueId)],
+        children: &[(&'a el_types::TypedPattern, ValueId)],
         success: BlockId,
         failure: BlockId,
         bindings: &mut BTreeMap<SymbolId, (ValueId, TypeId)>,
@@ -2224,8 +2584,10 @@ pub enum CollectionEffect {
 /// carry their explicit effects when they enter the representation.
 #[must_use]
 pub const fn operation_collection_effect(operation: &Operation) -> CollectionEffect {
-    if matches!(operation, Operation::Call { .. })
-        || matches!(operation, Operation::List { elements, .. } if !elements.is_empty())
+    if matches!(
+        operation,
+        Operation::Call { .. } | Operation::IndirectCall { .. } | Operation::EnumVisit { .. }
+    ) || matches!(operation, Operation::List { elements, .. } if !elements.is_empty())
         || matches!(operation, Operation::Map { entries, .. } if !entries.is_empty())
         || matches!(
             operation,
@@ -2236,9 +2598,11 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
             Operation::ListReverse { .. }
                 | Operation::MapToList { .. }
                 | Operation::StringCodepoints { .. }
+                | Operation::Bitstring { .. }
                 | Operation::StringFromBytes { .. }
                 | Operation::BytesFromList { .. }
                 | Operation::BytesToList { .. }
+                | Operation::EnumToList { .. }
                 | Operation::RuneToString { .. }
                 | Operation::BufferAppend { .. }
                 | Operation::BufferToBytes { .. }
@@ -2475,6 +2839,56 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::StringCodepoints { string, .. } => {
             live.values.insert(*string);
         }
+        Operation::StringCodepointView { string, .. }
+        | Operation::StringGraphemeView { string, .. } => {
+            live.values.insert(*string);
+        }
+        Operation::StringLength { string, .. } => {
+            live.values.insert(*string);
+        }
+        Operation::Bitstring { segments, .. } => {
+            for segment in segments {
+                match segment {
+                    BitstringSegment::Integer { value, .. } => {
+                        live.values.insert(*value);
+                    }
+                    BitstringSegment::Bytes { value, size } => {
+                        live.values.insert(*value);
+                        live.values.extend(size);
+                    }
+                }
+            }
+        }
+        Operation::BitstringPatternInteger { bytes, prefix, .. } => {
+            live.values.insert(*bytes);
+            live.values
+                .extend(prefix.iter().filter_map(|length| match length {
+                    BitstringPatternLength::Fixed(_) => None,
+                    BitstringPatternLength::Dynamic(value) => Some(*value),
+                }));
+        }
+        Operation::BitstringPatternBytes {
+            bytes,
+            prefix,
+            length,
+            ..
+        } => {
+            live.values.insert(*bytes);
+            live.values.extend(length);
+            live.values
+                .extend(prefix.iter().filter_map(|length| match length {
+                    BitstringPatternLength::Fixed(_) => None,
+                    BitstringPatternLength::Dynamic(value) => Some(*value),
+                }));
+        }
+        Operation::BitstringPatternCheck { bytes, lengths, .. } => {
+            live.values.insert(*bytes);
+            live.values
+                .extend(lengths.iter().filter_map(|length| match length {
+                    BitstringPatternLength::Fixed(_) => None,
+                    BitstringPatternLength::Dynamic(value) => Some(*value),
+                }));
+        }
         Operation::StringFromBytes { bytes, .. } => {
             live.values.insert(*bytes);
         }
@@ -2522,6 +2936,21 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::CollectionLength { value, .. } => {
             live.values.insert(*value);
         }
+        Operation::EnumAt { value, index, .. } => {
+            live.values.extend([*value, *index]);
+        }
+        Operation::EnumToList { value, .. } => {
+            live.values.insert(*value);
+        }
+        Operation::EnumVisit {
+            value,
+            initial,
+            function,
+            ..
+        } => {
+            live.values.extend([*value, *function]);
+            live.values.extend(initial);
+        }
         Operation::Struct { fields, .. } => {
             live.values.extend(fields.iter().map(|(_, value)| value));
         }
@@ -2560,6 +2989,13 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::Call { arguments, .. } => {
             live.values.extend(arguments);
         }
+        Operation::IndirectCall {
+            callee, arguments, ..
+        } => {
+            live.values.insert(*callee);
+            live.values.extend(arguments);
+        }
+        Operation::FunctionRef { .. } => {}
         Operation::UnionInject { value, .. } | Operation::UnionProject { value, .. } => {
             live.values.insert(*value);
         }
@@ -2585,6 +3021,12 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::SliceCopy { result, .. }
         | Operation::StringBytes { result, .. }
         | Operation::StringCodepoints { result, .. }
+        | Operation::StringCodepointView { result, .. }
+        | Operation::StringGraphemeView { result, .. }
+        | Operation::StringLength { result, .. }
+        | Operation::Bitstring { result, .. }
+        | Operation::BitstringPatternInteger { result, .. }
+        | Operation::BitstringPatternBytes { result, .. }
         | Operation::StringFromBytes { result, .. }
         | Operation::Utf8ErrorOffset { result, .. }
         | Operation::RuneToString { result, .. }
@@ -2598,6 +3040,9 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::BytesToList { result, .. }
         | Operation::BytesSlice { result, .. }
         | Operation::CollectionLength { result, .. }
+        | Operation::EnumAt { result, .. }
+        | Operation::EnumToList { result, .. }
+        | Operation::EnumVisit { result, .. }
         | Operation::Map { result, .. }
         | Operation::MapPut { result, .. }
         | Operation::MapRemove { result, .. }
@@ -2611,11 +3056,13 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::ListTail { result, .. }
         | Operation::CheckedArithmetic { result, .. }
         | Operation::Compare { result, .. }
+        | Operation::FunctionRef { result, .. }
         | Operation::Call { result, .. }
+        | Operation::IndirectCall { result, .. }
         | Operation::UnionInject { result, .. }
         | Operation::UnionProject { result, .. }
         | Operation::Load { result, .. } => Some(*result),
-        Operation::Store { .. } => None,
+        Operation::BitstringPatternCheck { .. } | Operation::Store { .. } => None,
     }
 }
 
@@ -2642,14 +3089,19 @@ fn classify_managed_type(
         | Type::Rune
         | Type::Utf8Error
         | Type::U8
+        | Type::U64
         | Type::Bool
         | Type::Unit
         | Type::Atom(_)
         | Type::Function { .. } => ManagedValueClass::Unmanaged,
         // String is a view-like pointer/length value and must retain its base.
-        Type::String | Type::Bytes | Type::Bits | Type::Buffer | Type::Slice(_) => {
-            ManagedValueClass::ContainsBaseReferences
-        }
+        Type::String
+        | Type::Bytes
+        | Type::Bits
+        | Type::Buffer
+        | Type::Slice(_)
+        | Type::CodepointView
+        | Type::GraphemeView => ManagedValueClass::ContainsBaseReferences,
         Type::List(_) | Type::Map { .. } => ManagedValueClass::BaseReference,
         Type::Array { item, .. } => aggregate_managed_class(module, [*item], visiting)?,
         Type::Tuple(elements) | Type::Union(elements) => {
@@ -2712,7 +3164,10 @@ enum NormalizedType {
     Buffer,
     Rune,
     Utf8Error,
+    CodepointView,
+    GraphemeView,
     U8,
+    U64,
     Atom(String),
     List(Box<Self>),
     Array {
@@ -2878,6 +3333,11 @@ impl<'a> Monomorphizer<'a> {
                         function,
                         substitutions,
                         ..
+                    }
+                    | Operation::FunctionRef {
+                        function,
+                        substitutions,
+                        ..
                     } = operation
                     {
                         let called = self
@@ -3039,7 +3499,10 @@ impl<'a> Monomorphizer<'a> {
             Type::Buffer => NormalizedType::Buffer,
             Type::Rune => NormalizedType::Rune,
             Type::Utf8Error => NormalizedType::Utf8Error,
+            Type::CodepointView => NormalizedType::CodepointView,
+            Type::GraphemeView => NormalizedType::GraphemeView,
             Type::U8 => NormalizedType::U8,
+            Type::U64 => NormalizedType::U64,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
                 NormalizedType::List(Box::new(self.normalize(*item, substitution)?))
@@ -3182,6 +3645,11 @@ impl<'a> Monomorphizer<'a> {
             | Operation::SliceCopy { ty, .. }
             | Operation::StringBytes { ty, .. }
             | Operation::StringCodepoints { ty, .. }
+            | Operation::StringCodepointView { ty, .. }
+            | Operation::StringGraphemeView { ty, .. }
+            | Operation::StringLength { ty, .. }
+            | Operation::BitstringPatternInteger { ty, .. }
+            | Operation::BitstringPatternBytes { ty, .. }
             | Operation::StringFromBytes { ty, .. }
             | Operation::Utf8ErrorOffset { ty, .. }
             | Operation::RuneToString { ty, .. }
@@ -3208,8 +3676,31 @@ impl<'a> Monomorphizer<'a> {
             | Operation::Load { ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
             }
+            Operation::EnumAt { source_ty, ty, .. }
+            | Operation::EnumToList { source_ty, ty, .. } => {
+                *source_ty = self.materialize_type(*source_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::EnumVisit {
+                source_ty,
+                function_ty,
+                ty,
+                ..
+            } => {
+                *source_ty = self.materialize_type(*source_ty, substitution)?;
+                *function_ty = self.materialize_type(*function_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
             Operation::Compare { operand_ty, .. } => {
                 *operand_ty = self.materialize_type(*operand_ty, substitution)?;
+            }
+            Operation::Bitstring { segments, ty, .. } => {
+                *ty = self.materialize_type(*ty, substitution)?;
+                for segment in segments {
+                    if let BitstringSegment::Integer { source_ty, .. } = segment {
+                        *source_ty = self.materialize_type(*source_ty, substitution)?;
+                    }
+                }
             }
             Operation::MapFetch { map_ty, ty, .. } => {
                 *map_ty = self.materialize_type(*map_ty, substitution)?;
@@ -3234,6 +3725,27 @@ impl<'a> Monomorphizer<'a> {
                 substitutions.clear();
                 *ty = self.materialize_type(*ty, substitution)?;
             }
+            Operation::FunctionRef {
+                function,
+                substitutions,
+                ty,
+                ..
+            } => {
+                let called = self
+                    .functions_by_id
+                    .get(function)
+                    .ok_or(MonomorphizationError::UnknownFunction(*function))?;
+                let key = self.call_key(called, substitutions, substitution)?;
+                *function = ids[&key];
+                substitutions.clear();
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::IndirectCall {
+                function_ty, ty, ..
+            } => {
+                *function_ty = self.materialize_type(*function_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
             Operation::UnionInject { member, ty, .. } => {
                 *member = self.materialize_type(*member, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
@@ -3248,7 +3760,7 @@ impl<'a> Monomorphizer<'a> {
                 *union_ty = self.materialize_type(*union_ty, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
             }
-            Operation::Store { .. } => {}
+            Operation::BitstringPatternCheck { .. } | Operation::Store { .. } => {}
         }
         Ok(())
     }
@@ -3275,7 +3787,10 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::Buffer => Type::Buffer,
             NormalizedType::Rune => Type::Rune,
             NormalizedType::Utf8Error => Type::Utf8Error,
+            NormalizedType::CodepointView => Type::CodepointView,
+            NormalizedType::GraphemeView => Type::GraphemeView,
             NormalizedType::U8 => Type::U8,
+            NormalizedType::U64 => Type::U64,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
             NormalizedType::Array { item, length } => Type::Array {
@@ -3409,7 +3924,10 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::Buffer
         | NormalizedType::Rune
         | NormalizedType::Utf8Error
+        | NormalizedType::CodepointView
+        | NormalizedType::GraphemeView
         | NormalizedType::U8
+        | NormalizedType::U64
         | NormalizedType::Atom(_) => {}
     }
 }
@@ -3426,6 +3944,11 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::SliceCopy { ty, .. }
         | Operation::StringBytes { ty, .. }
         | Operation::StringCodepoints { ty, .. }
+        | Operation::StringCodepointView { ty, .. }
+        | Operation::StringGraphemeView { ty, .. }
+        | Operation::StringLength { ty, .. }
+        | Operation::BitstringPatternInteger { ty, .. }
+        | Operation::BitstringPatternBytes { ty, .. }
         | Operation::StringFromBytes { ty, .. }
         | Operation::Utf8ErrorOffset { ty, .. }
         | Operation::RuneToString { ty, .. }
@@ -3449,15 +3972,41 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::ListHead { ty, .. }
         | Operation::ListTail { ty, .. }
         | Operation::CheckedArithmetic { ty, .. }
+        | Operation::FunctionRef { ty, .. }
         | Operation::Call { ty, .. }
         | Operation::Load { ty, .. } => output.push(*ty),
+        Operation::EnumAt { source_ty, ty, .. } | Operation::EnumToList { source_ty, ty, .. } => {
+            output.push(*source_ty);
+            output.push(*ty);
+        }
+        Operation::EnumVisit {
+            source_ty,
+            function_ty,
+            ty,
+            ..
+        } => {
+            output.extend([*source_ty, *function_ty, *ty]);
+        }
         Operation::Compare { operand_ty, .. } => output.push(*operand_ty),
+        Operation::Bitstring { segments, ty, .. } => {
+            output.push(*ty);
+            output.extend(segments.iter().filter_map(|segment| match segment {
+                BitstringSegment::Integer { source_ty, .. } => Some(*source_ty),
+                BitstringSegment::Bytes { .. } => None,
+            }));
+        }
         Operation::MapFetch { map_ty, ty, .. } => {
             output.push(*map_ty);
             output.push(*ty);
         }
         Operation::MapToList { map_ty, ty, .. } => {
             output.push(*map_ty);
+            output.push(*ty);
+        }
+        Operation::IndirectCall {
+            function_ty, ty, ..
+        } => {
+            output.push(*function_ty);
             output.push(*ty);
         }
         Operation::UnionInject { member, ty, .. } => {
@@ -3474,7 +4023,7 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
             output.push(*union_ty);
             output.push(*ty);
         }
-        Operation::Store { .. } => {}
+        Operation::BitstringPatternCheck { .. } | Operation::Store { .. } => {}
     }
 }
 
@@ -3585,6 +4134,37 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
         let values = function_value_types(function);
         for block in &function.blocks {
             for operation in &block.operations {
+                if let Operation::FunctionRef {
+                    function: referenced,
+                    substitutions,
+                    ty,
+                    ..
+                } = operation
+                {
+                    if !substitutions.is_empty() {
+                        errors.push(format!(
+                            "function value in {:?} contains a residual type substitution",
+                            function.id
+                        ));
+                    }
+                    let exact = match (signatures.get(referenced), module.types.get(ty.0 as usize))
+                    {
+                        (
+                            Some((parameters, result)),
+                            Some(Type::Function {
+                                parameters: expected_parameters,
+                                result: expected_result,
+                            }),
+                        ) => parameters == expected_parameters && result == expected_result,
+                        _ => false,
+                    };
+                    if !exact {
+                        errors.push(format!(
+                            "function value in {:?} does not have the target's exact concrete signature",
+                            function.id
+                        ));
+                    }
+                }
                 if let Operation::Call {
                     function: called,
                     substitutions,
@@ -3609,6 +4189,35 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
                     {
                         errors.push(format!(
                             "call in {:?} does not have the exact concrete signature",
+                            function.id
+                        ));
+                    }
+                }
+                if let Operation::IndirectCall {
+                    callee,
+                    arguments,
+                    function_ty,
+                    ty,
+                    ..
+                } = operation
+                {
+                    let exact = match module.types.get(function_ty.0 as usize) {
+                        Some(Type::Function { parameters, result }) => {
+                            values.get(callee) == Some(function_ty)
+                                && parameters.len() == arguments.len()
+                                && parameters
+                                    .iter()
+                                    .zip(arguments)
+                                    .all(|(expected, argument)| {
+                                        values.get(argument) == Some(expected)
+                                    })
+                                && result == ty
+                        }
+                        _ => false,
+                    };
+                    if !exact {
+                        errors.push(format!(
+                            "indirect call in {:?} does not have an exact concrete signature",
                             function.id
                         ));
                     }
@@ -3681,7 +4290,9 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
                 .operations
                 .iter()
                 .filter_map(|operation| match operation {
-                    Operation::Call { function, .. } => Some(*function),
+                    Operation::Call { function, .. } | Operation::FunctionRef { function, .. } => {
+                        Some(*function)
+                    }
                     _ => None,
                 })
         }) {
@@ -3751,6 +4362,12 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::SliceCopy { result, ty, .. }
                     | Operation::StringBytes { result, ty, .. }
                     | Operation::StringCodepoints { result, ty, .. }
+                    | Operation::StringCodepointView { result, ty, .. }
+                    | Operation::StringGraphemeView { result, ty, .. }
+                    | Operation::StringLength { result, ty, .. }
+                    | Operation::Bitstring { result, ty, .. }
+                    | Operation::BitstringPatternInteger { result, ty, .. }
+                    | Operation::BitstringPatternBytes { result, ty, .. }
                     | Operation::StringFromBytes { result, ty, .. }
                     | Operation::Utf8ErrorOffset { result, ty, .. }
                     | Operation::RuneToString { result, ty, .. }
@@ -3764,6 +4381,9 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::BytesToList { result, ty, .. }
                     | Operation::BytesSlice { result, ty, .. }
                     | Operation::CollectionLength { result, ty, .. }
+                    | Operation::EnumAt { result, ty, .. }
+                    | Operation::EnumToList { result, ty, .. }
+                    | Operation::EnumVisit { result, ty, .. }
                     | Operation::Map { result, ty, .. }
                     | Operation::MapPut { result, ty, .. }
                     | Operation::MapRemove { result, ty, .. }
@@ -3776,12 +4396,14 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::ListHead { result, ty, .. }
                     | Operation::ListTail { result, ty, .. }
                     | Operation::CheckedArithmetic { result, ty, .. }
+                    | Operation::FunctionRef { result, ty, .. }
                     | Operation::Call { result, ty, .. }
+                    | Operation::IndirectCall { result, ty, .. }
                     | Operation::UnionInject { result, ty, .. }
                     | Operation::UnionProject { result, ty, .. }
                     | Operation::Load { result, ty, .. } => Some((*result, *ty)),
                     Operation::Compare { result, .. } => Some((*result, TypeId(2))),
-                    Operation::Store { .. } => None,
+                    Operation::BitstringPatternCheck { .. } | Operation::Store { .. } => None,
                 })
         }))
         .collect()
@@ -3843,7 +4465,19 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
     let signatures = module
         .functions
         .iter()
-        .map(|function| (function.id, (function.parameters.len(), function.result)))
+        .map(|function| {
+            (
+                function.id,
+                (
+                    function
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.ty)
+                        .collect(),
+                    function.result,
+                ),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let structs_by_decl = module
         .structs
@@ -3926,7 +4560,11 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                 if let Operation::ArrayIndex { failure, .. }
                 | Operation::SliceSubslice { failure, .. }
                 | Operation::BitsSlice { failure, .. }
-                | Operation::BytesSlice { failure, .. } = operation
+                | Operation::BytesSlice { failure, .. }
+                | Operation::Bitstring { failure, .. }
+                | Operation::BitstringPatternInteger { failure, .. }
+                | Operation::BitstringPatternBytes { failure, .. }
+                | Operation::BitstringPatternCheck { failure, .. } = operation
                 {
                     predecessors.insert(*failure);
                     failure_predecessors.insert(*failure);
@@ -4123,7 +4761,10 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                         }
                         let compatible = match (case, module.types.get(subject_ty.0 as usize)) {
                             (SwitchValue::Boolean(_), Some(Type::Bool))
-                            | (SwitchValue::Integer(_), Some(Type::I32 | Type::I64 | Type::U8))
+                            | (
+                                SwitchValue::Integer(_),
+                                Some(Type::I32 | Type::I64 | Type::U8 | Type::U64),
+                            )
                             | (
                                 SwitchValue::ListEmpty | SwitchValue::ListCons,
                                 Some(Type::List(_)),
@@ -4220,7 +4861,7 @@ fn case_key(value: &SwitchValue) -> String {
 
 struct OperationVerifyContext<'a> {
     types: &'a [Type],
-    signatures: &'a BTreeMap<FunctionId, (usize, TypeId)>,
+    signatures: &'a BTreeMap<FunctionId, (Vec<TypeId>, TypeId)>,
     structs: &'a BTreeMap<DeclId, &'a CoreStruct>,
     slots: &'a BTreeMap<SlotId, TypeId>,
 }
@@ -4258,7 +4899,10 @@ fn verify_operation(
             ..
         } => {
             let valid = match (constant, types.get(ty.0 as usize)) {
-                (Constant::Integer(_), Some(Type::I32 | Type::I64 | Type::Usize | Type::U8))
+                (
+                    Constant::Integer(_),
+                    Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64),
+                )
                 | (Constant::Boolean(_), Some(Type::Bool))
                 | (Constant::Unit, Some(Type::Unit))
                 | (Constant::String(_), Some(Type::String)) => true,
@@ -4541,6 +5185,173 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::StringCodepointView {
+            result, string, ty, ..
+        }
+        | Operation::StringGraphemeView {
+            result, string, ty, ..
+        } => {
+            let result_ok = matches!(
+                (operation, types.get(ty.0 as usize)),
+                (
+                    Operation::StringCodepointView { .. },
+                    Some(Type::CodepointView)
+                ) | (
+                    Operation::StringGraphemeView { .. },
+                    Some(Type::GraphemeView)
+                )
+            );
+            if !matches!(
+                values
+                    .get(string)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::String)
+            ) || !result_ok
+            {
+                errors.push(format!("string view {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringLength {
+            result, string, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(string)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::String)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push(format!(
+                    "string grapheme length {result:?} has invalid types"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::Bitstring {
+            result,
+            segments,
+            ty,
+            ..
+        } => {
+            if !matches!(types.get(ty.0 as usize), Some(Type::Bytes)) {
+                errors.push(format!("bitstring {result:?} has a non-bytes result type"));
+            }
+            for segment in segments {
+                match segment {
+                    BitstringSegment::Integer {
+                        value,
+                        source_ty,
+                        width,
+                        ..
+                    } => {
+                        if values.get(value) != Some(source_ty)
+                            || !matches!(
+                                types.get(source_ty.0 as usize),
+                                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
+                            )
+                            || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
+                        {
+                            errors.push(format!(
+                                "bitstring {result:?} has an invalid integer segment"
+                            ));
+                        }
+                    }
+                    BitstringSegment::Bytes { value, size } => {
+                        if !matches!(
+                            values.get(value).and_then(|ty| types.get(ty.0 as usize)),
+                            Some(Type::Bytes)
+                        ) || size.is_some_and(|size| {
+                            !matches!(
+                                values.get(&size).and_then(|ty| types.get(ty.0 as usize)),
+                                Some(Type::Usize)
+                            )
+                        }) {
+                            errors
+                                .push(format!("bitstring {result:?} has an invalid bytes segment"));
+                        }
+                    }
+                }
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BitstringPatternInteger {
+            result,
+            bytes,
+            prefix,
+            signed,
+            width,
+            ty,
+            ..
+        } => {
+            let valid_prefix = prefix.iter().all(|length| match length {
+                BitstringPatternLength::Fixed(_) => true,
+                BitstringPatternLength::Dynamic(value) => matches!(
+                    values.get(value).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                ),
+            });
+            let valid_result = if *signed {
+                matches!(types.get(ty.0 as usize), Some(Type::I64))
+            } else {
+                matches!(types.get(ty.0 as usize), Some(Type::U64))
+            };
+            if !matches!(
+                values.get(bytes).and_then(|ty| types.get(ty.0 as usize)),
+                Some(Type::Bytes)
+            ) || !valid_prefix
+                || !valid_result
+                || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
+            {
+                errors.push(format!(
+                    "bitstring integer pattern extraction {result:?} is invalid"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BitstringPatternBytes {
+            result,
+            bytes,
+            prefix,
+            length,
+            ty,
+            ..
+        } => {
+            let valid_length = |value: &ValueId| {
+                matches!(
+                    values.get(value).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                )
+            };
+            if !matches!(
+                values.get(bytes).and_then(|ty| types.get(ty.0 as usize)),
+                Some(Type::Bytes)
+            ) || !prefix.iter().all(|item| match item {
+                BitstringPatternLength::Fixed(_) => true,
+                BitstringPatternLength::Dynamic(value) => valid_length(value),
+            }) || length.as_ref().is_some_and(|value| !valid_length(value))
+                || !matches!(types.get(ty.0 as usize), Some(Type::Bytes))
+            {
+                errors.push(format!(
+                    "bitstring bytes pattern extraction {result:?} is invalid"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BitstringPatternCheck { bytes, lengths, .. } => {
+            if !matches!(
+                values.get(bytes).and_then(|ty| types.get(ty.0 as usize)),
+                Some(Type::Bytes)
+            ) || lengths.iter().any(|length| match length {
+                BitstringPatternLength::Fixed(_) => false,
+                BitstringPatternLength::Dynamic(value) => !matches!(
+                    values.get(value).and_then(|ty| types.get(ty.0 as usize)),
+                    Some(Type::Usize)
+                ),
+            }) {
+                errors.push("bitstring pattern length check is invalid".to_owned());
+            }
+        }
         Operation::StringFromBytes {
             result, bytes, ty, ..
         } => {
@@ -4757,8 +5568,11 @@ fn verify_operation(
                         | Type::Bytes
                         | Type::Bits
                         | Type::Buffer
+                        | Type::List(_)
                         | Type::Slice(_)
-                        | Type::Map { .. },
+                        | Type::Map { .. }
+                        | Type::CodepointView
+                        | Type::GraphemeView,
                     ),
                     None,
                 ) => true,
@@ -4766,6 +5580,111 @@ fn verify_operation(
             };
             if !valid_source || !matches!(types.get(ty.0 as usize), Some(Type::Usize)) {
                 errors.push(format!("collection length {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::EnumAt {
+            result,
+            value,
+            index,
+            source_ty,
+            ty,
+            ..
+        } => {
+            let payload = option_payload_type(types, *ty);
+            let valid = values.get(value) == Some(source_ty)
+                && values.get(index).is_some_and(|index_ty| {
+                    matches!(types.get(index_ty.0 as usize), Some(Type::Usize))
+                })
+                && payload
+                    .is_some_and(|item| standard_iterable_item_matches(types, *source_ty, item));
+            if !valid {
+                errors.push(format!("Enum.at {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::EnumToList {
+            result,
+            value,
+            source_ty,
+            ty,
+            ..
+        } => {
+            let item = match types.get(ty.0 as usize) {
+                Some(Type::List(item)) => Some(*item),
+                _ => None,
+            };
+            let valid = values.get(value) == Some(source_ty)
+                && item.is_some_and(|item| {
+                    matches!(
+                        types.get(source_ty.0 as usize),
+                        Some(
+                            Type::Array { .. }
+                                | Type::Slice(_)
+                                | Type::CodepointView
+                                | Type::GraphemeView
+                        )
+                    ) && standard_iterable_item_matches(types, *source_ty, item)
+                });
+            if !valid {
+                errors.push(format!("Enum.to_list {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::EnumVisit {
+            result,
+            value,
+            initial,
+            function,
+            source_ty,
+            function_ty,
+            kind,
+            ty,
+            ..
+        } => {
+            let item = standard_iterable_item_type(types, *source_ty);
+            let valid_result = match kind {
+                EnumVisitKind::Each => {
+                    initial.is_none() && matches!(types.get(ty.0 as usize), Some(Type::Unit))
+                }
+                EnumVisitKind::Any | EnumVisitKind::All => {
+                    initial.is_none() && matches!(types.get(ty.0 as usize), Some(Type::Bool))
+                }
+                EnumVisitKind::Reduce => initial
+                    .as_ref()
+                    .is_some_and(|initial| values.get(initial) == Some(ty)),
+                EnumVisitKind::Filter => {
+                    initial.is_none()
+                        && item.is_some_and(|item| {
+                            matches!(types.get(ty.0 as usize), Some(Type::List(result)) if *result == item)
+                        })
+                }
+                EnumVisitKind::Map => {
+                    initial.is_none() && matches!(types.get(ty.0 as usize), Some(Type::List(_)))
+                }
+            };
+            let valid_function = item.is_some_and(|item| {
+                matches!(
+                    types.get(function_ty.0 as usize),
+                    Some(Type::Function { parameters, result })
+                        if (match kind {
+                                EnumVisitKind::Filter => matches!(types.get(result.0 as usize), Some(Type::Bool)),
+                                EnumVisitKind::Map => matches!(types.get(ty.0 as usize), Some(Type::List(item)) if item == result),
+                                _ => *result == *ty,
+                            })
+                            && if *kind == EnumVisitKind::Reduce {
+                                parameters.as_slice() == [*ty, item]
+                            } else {
+                                parameters.as_slice() == [item]
+                            }
+                )
+            });
+            if values.get(value) != Some(source_ty)
+                || values.get(function) != Some(function_ty)
+                || !valid_function
+                || !valid_result
+            {
+                errors.push(format!("Enum visit {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -4909,7 +5828,7 @@ fn verify_operation(
             );
             let supported = matches!(
                 types.get(operand_ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8) | Some(Type::Rune)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64) | Some(Type::Rune)
             ) || (!ordered && standard_eq_type(types, *operand_ty));
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
@@ -4919,25 +5838,102 @@ fn verify_operation(
             }
             define(*result, TypeId(2), values, errors);
         }
+        Operation::FunctionRef {
+            result,
+            function,
+            substitutions,
+            ty,
+            ..
+        } => {
+            let substitutions = substitutions.iter().copied().collect::<BTreeMap<_, _>>();
+            let exact = match (signatures.get(function), types.get(ty.0 as usize)) {
+                (
+                    Some((parameters, result)),
+                    Some(Type::Function {
+                        parameters: actual_parameters,
+                        result: actual_result,
+                    }),
+                ) => {
+                    parameters.len() == actual_parameters.len()
+                        && parameters
+                            .iter()
+                            .zip(actual_parameters)
+                            .all(|(declared, actual)| {
+                                type_matches_substitution(types, *declared, *actual, &substitutions)
+                            })
+                        && type_matches_substitution(types, *result, *actual_result, &substitutions)
+                }
+                _ => false,
+            };
+            if !exact {
+                errors.push(format!("function value {result:?} has a non-function type"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Call {
             result,
             function,
+            substitutions,
             arguments,
             ty,
             ..
         } => {
-            match signatures.get(function) {
-                Some((arity, _)) if *arity == arguments.len() => {}
-                Some((arity, _)) => errors.push(format!(
-                    "call to {function:?} has {} arguments, expected {arity}",
-                    arguments.len()
-                )),
-                None => errors.push(format!("call references unknown function {function:?}")),
+            let substitutions = substitutions.iter().copied().collect::<BTreeMap<_, _>>();
+            let exact = signatures
+                .get(function)
+                .is_some_and(|(parameters, result_ty)| {
+                    parameters.len() == arguments.len()
+                        && parameters
+                            .iter()
+                            .zip(arguments)
+                            .all(|(declared, argument)| {
+                                values.get(argument).is_some_and(|actual| {
+                                    type_matches_substitution(
+                                        types,
+                                        *declared,
+                                        *actual,
+                                        &substitutions,
+                                    )
+                                })
+                            })
+                        && type_matches_substitution(types, *result_ty, *ty, &substitutions)
+                });
+            if !exact {
+                errors.push(format!(
+                    "call to {function:?} has an invalid exact signature"
+                ));
             }
             for argument in arguments {
                 if !values.contains_key(argument) {
                     errors.push(format!("call uses undefined value {argument:?}"));
                 }
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::IndirectCall {
+            result,
+            callee,
+            arguments,
+            function_ty,
+            ty,
+            ..
+        } => {
+            let exact = match types.get(function_ty.0 as usize) {
+                Some(Type::Function { parameters, result }) => {
+                    values.get(callee) == Some(function_ty)
+                        && parameters.len() == arguments.len()
+                        && parameters
+                            .iter()
+                            .zip(arguments)
+                            .all(|(expected, argument)| values.get(argument) == Some(expected))
+                        && result == ty
+                }
+                _ => false,
+            };
+            if !exact {
+                errors.push(format!(
+                    "indirect call {result:?} has an invalid exact signature"
+                ));
             }
             define(*result, *ty, values, errors);
         }
@@ -5003,6 +5999,150 @@ fn verify_operation(
     }
 }
 
+fn type_matches_substitution(
+    types: &[Type],
+    declared: TypeId,
+    actual: TypeId,
+    substitutions: &BTreeMap<TypeId, TypeId>,
+) -> bool {
+    if let Some(substitution) = substitutions.get(&declared) {
+        return *substitution == actual;
+    }
+    if declared == actual {
+        return true;
+    }
+    match (types.get(declared.0 as usize), types.get(actual.0 as usize)) {
+        (Some(Type::List(left)), Some(Type::List(right)))
+        | (Some(Type::Slice(left)), Some(Type::Slice(right))) => {
+            type_matches_substitution(types, *left, *right, substitutions)
+        }
+        (
+            Some(Type::Array { item: left, length }),
+            Some(Type::Array {
+                item: right,
+                length: actual_length,
+            }),
+        ) => {
+            length == actual_length
+                && type_matches_substitution(types, *left, *right, substitutions)
+        }
+        (
+            Some(Type::Map {
+                key: left_key,
+                value: left_value,
+            }),
+            Some(Type::Map {
+                key: right_key,
+                value: right_value,
+            }),
+        ) => {
+            type_matches_substitution(types, *left_key, *right_key, substitutions)
+                && type_matches_substitution(types, *left_value, *right_value, substitutions)
+        }
+        (Some(Type::Tuple(left)), Some(Type::Tuple(right)))
+        | (Some(Type::Union(left)), Some(Type::Union(right))) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    type_matches_substitution(types, *left, *right, substitutions)
+                })
+        }
+        (
+            Some(Type::Function {
+                parameters: left,
+                result: left_result,
+            }),
+            Some(Type::Function {
+                parameters: right,
+                result: right_result,
+            }),
+        ) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    type_matches_substitution(types, *left, *right, substitutions)
+                })
+                && type_matches_substitution(types, *left_result, *right_result, substitutions)
+        }
+        (
+            Some(Type::Struct {
+                declaration: left,
+                arguments: left_arguments,
+            }),
+            Some(Type::Struct {
+                declaration: right,
+                arguments: right_arguments,
+            }),
+        ) => {
+            left == right
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| {
+                        type_matches_substitution(types, *left, *right, substitutions)
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn option_payload_type(types: &[Type], ty: TypeId) -> Option<TypeId> {
+    let Type::Union(members) = types.get(ty.0 as usize)? else {
+        return None;
+    };
+    let has_none = members.iter().any(
+        |member| matches!(types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none"),
+    );
+    let payload = members.iter().find_map(|member| match types.get(member.0 as usize) {
+        Some(Type::Tuple(fields))
+            if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(name)) if name == "some") =>
+        {
+            Some(fields[1])
+        }
+        _ => None,
+    });
+    has_none.then_some(payload).flatten()
+}
+
+fn standard_iterable_item_matches(types: &[Type], source: TypeId, item: TypeId) -> bool {
+    match types.get(source.0 as usize) {
+        Some(Type::List(expected) | Type::Array { item: expected, .. } | Type::Slice(expected)) => {
+            *expected == item
+        }
+        Some(Type::Bytes) => matches!(types.get(item.0 as usize), Some(Type::U8)),
+        Some(Type::CodepointView) => matches!(types.get(item.0 as usize), Some(Type::Rune)),
+        Some(Type::GraphemeView) => matches!(types.get(item.0 as usize), Some(Type::String)),
+        Some(Type::Map { key, value }) => matches!(
+            types.get(item.0 as usize),
+            Some(Type::Tuple(fields)) if fields.as_slice() == [*key, *value]
+        ),
+        _ => false,
+    }
+}
+
+fn standard_iterable_item_type(types: &[Type], source: TypeId) -> Option<TypeId> {
+    match types.get(source.0 as usize) {
+        Some(Type::List(item) | Type::Array { item, .. } | Type::Slice(item)) => Some(*item),
+        Some(Type::Bytes) => types
+            .iter()
+            .position(|ty| matches!(ty, Type::U8))
+            .map(|index| TypeId(index as u32)),
+        Some(Type::CodepointView) => types
+            .iter()
+            .position(|ty| matches!(ty, Type::Rune))
+            .map(|index| TypeId(index as u32)),
+        Some(Type::GraphemeView) => types
+            .iter()
+            .position(|ty| matches!(ty, Type::String))
+            .map(|index| TypeId(index as u32)),
+        Some(Type::Map { key, value }) => types
+            .iter()
+            .position(|ty| matches!(ty, Type::Tuple(fields) if fields.as_slice() == [*key, *value]))
+            .map(|index| TypeId(index as u32)),
+        _ => None,
+    }
+}
+
 fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
     match types.get(ty.0 as usize) {
         Some(
@@ -5017,6 +6157,7 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Rune
             | Type::Utf8Error
             | Type::U8
+            | Type::U64
             | Type::Atom(_),
         ) => true,
         Some(Type::Buffer) => false,
@@ -5195,9 +6336,39 @@ fn display_operation(operation: &Operation) -> String {
             tail.map_or_else(String::new, |tail| format!(" | v{}", tail.0)),
             ty.0
         ),
+        Operation::BitstringPatternInteger {
+            result,
+            bytes,
+            width,
+            ty,
+            ..
+        } => format!(
+            "v{} = bitstring_pattern_integer v{} width {}: t{}",
+            result.0, bytes.0, width, ty.0
+        ),
+        Operation::BitstringPatternBytes {
+            result, bytes, ty, ..
+        } => format!(
+            "v{} = bitstring_pattern_bytes v{}: t{}",
+            result.0, bytes.0, ty.0
+        ),
+        Operation::BitstringPatternCheck { bytes, exact, .. } => {
+            format!("bitstring_pattern_check v{} exact={exact}", bytes.0)
+        }
         Operation::ListReverse {
             result, list, ty, ..
         } => format!("v{} = list_reverse v{}: t{}", result.0, list.0, ty.0),
+        Operation::Bitstring {
+            result,
+            segments,
+            ty,
+            ..
+        } => format!(
+            "v{} = bitstring {} segments: t{}",
+            result.0,
+            segments.len(),
+            ty.0
+        ),
         Operation::Struct {
             result,
             declaration,
@@ -5317,6 +6488,21 @@ fn display_operation(operation: &Operation) -> String {
         Operation::StringCodepoints {
             result, string, ty, ..
         } => format!("v{} = string_codepoints v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringCodepointView {
+            result, string, ty, ..
+        } => format!(
+            "v{} = string_codepoint_view v{}: t{}",
+            result.0, string.0, ty.0
+        ),
+        Operation::StringGraphemeView {
+            result, string, ty, ..
+        } => format!(
+            "v{} = string_grapheme_view v{}: t{}",
+            result.0, string.0, ty.0
+        ),
+        Operation::StringLength {
+            result, string, ty, ..
+        } => format!("v{} = string_length v{}: t{}", result.0, string.0, ty.0),
         Operation::StringFromBytes {
             result, bytes, ty, ..
         } => format!("v{} = string_from_bytes v{}: t{}", result.0, bytes.0, ty.0),
@@ -5388,6 +6574,39 @@ fn display_operation(operation: &Operation) -> String {
         } => format!(
             "v{} = collection_length v{} known {:?}: t{}",
             result.0, value.0, known_length, ty.0
+        ),
+        Operation::EnumAt {
+            result,
+            value,
+            index,
+            source_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = enum_at v{} v{}: t{} -> t{}",
+            result.0, value.0, index.0, source_ty.0, ty.0
+        ),
+        Operation::EnumToList {
+            result,
+            value,
+            source_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = enum_to_list v{}: t{} -> t{}",
+            result.0, value.0, source_ty.0, ty.0
+        ),
+        Operation::EnumVisit {
+            result,
+            value,
+            function,
+            source_ty,
+            kind,
+            ty,
+            ..
+        } => format!(
+            "v{} = enum_{kind:?} v{} v{}: t{} -> t{}",
+            result.0, value.0, function.0, source_ty.0, ty.0
         ),
         Operation::Map {
             result,
@@ -5477,6 +6696,12 @@ fn display_operation(operation: &Operation) -> String {
             "v{} = compare.{operator:?} v{}, v{}: t{} -> t2",
             result.0, left.0, right.0, operand_ty.0
         ),
+        Operation::FunctionRef {
+            result,
+            function,
+            ty,
+            ..
+        } => format!("v{} = function f{}: t{}", result.0, function.0, ty.0),
         Operation::Call {
             result,
             function,
@@ -5492,6 +6717,25 @@ fn display_operation(operation: &Operation) -> String {
                 .map(|value| format!("v{}", value.0))
                 .collect::<Vec<_>>()
                 .join(", "),
+            ty.0
+        ),
+        Operation::IndirectCall {
+            result,
+            callee,
+            arguments,
+            function_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = call_indirect v{}({}): t{} -> t{}",
+            result.0,
+            callee.0,
+            arguments
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            function_ty.0,
             ty.0
         ),
         Operation::UnionInject {

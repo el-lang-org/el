@@ -651,17 +651,17 @@ verified managed runtime.
 4. [ ] **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
    `bits`, byte-aligned source bitstrings, conversions, bounds checks, and
    inspectable UTF-8 errors.
-5. [ ] **Unicode:** bundle Unicode 17.0.0 data and implement untailored UAX #29
+5. [x] **Unicode:** bundle Unicode 17.0.0 data and implement untailored UAX #29
    revision 47 grapheme segmentation independent of host locale.
-6. [ ] **Views:** eager codepoint/grapheme collections and lazy views that retain
+6. [x] **Views:** eager codepoint/grapheme collections and lazy views that retain
    source backing storage.
 7. [x] **Buffer:** explicit value-style byte/string append operations and immutable
    conversion snapshots.
-8. [ ] **Function values:** exact monomorphic direct code targets, indirect calls,
+8. [x] **Function values:** exact monomorphic direct code targets, indirect calls,
    visibility behavior, and generic specialization from expected types.
 9. [ ] **Numbers:** remaining integer widths, pointer-sized integers, floats,
    explicit checked conversions, shifts, bitwise operations, and wrapping APIs.
-10. [ ] **Collection helpers:** `Enum` traversal machinery needed by the data layer
+10. [x] **Collection helpers:** `Enum` traversal machinery needed by the data layer
     plus the fixed List/Array/Slice/Bytes operations. Protocol surface integration
     is completed in Milestone 7.
 
@@ -682,7 +682,7 @@ verified managed runtime.
 - [ ] **Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
   graphs under GC stress, and diagnose integer indexing on `string`.
 
-**Implementation progress (2026-07-28)**
+**Implementation progress (2026-07-29)**
 
 - [x] Completed the struct value slice end to end: nominal and generic all-fields
   construction, direct field projection, source-order initializer evaluation,
@@ -856,6 +856,140 @@ verified managed runtime.
   MSB-first indexing, exact repacking, retained source storage, and index failures.
   Byte-aligned `<<...>>` construction/pattern lowering and `Concat` remain before
   the text/binary deliverable closes.
+- [x] Added byte-aligned source `<<...>>` construction end to end. Empty
+  construction, integer segments at every v1 width, signed/unsigned fit checks,
+  target-independent big/little order, target-native order, complete unsized
+  `bytes` segments, and exact runtime-sized `bytes` segments now lower through a
+  dedicated verified Core operation. Segment operands and size expressions retain
+  left-to-right, exactly-once evaluation; statically known literal/value size
+  violations are rejected during checking, while dynamic violations use the stable
+  `bitstring_size_mismatch` failure category without truncation or padding. LLVM
+  allocates pointer-free output, keeps managed inputs visible across collection,
+  and copies bytes in source order. Typed AST, Generic/Concrete Core, LLVM, and
+  development/release collection-at-every-allocation regressions cover exact byte
+  layout, empty output, integer-fit failures, and byte-size failures. Source
+  `<<...>>` patterns and `Concat` remain open, so the broader text/binary deliverable
+  is not yet closed.
+- [x] Added byte-aligned source `<<...>>` patterns end to end. Empty patterns,
+  signed and unsigned integer literals/bindings at every v1 width, big/little/native
+  decoding, runtime-sized retained `bytes` views, final unsized remainder capture,
+  and size expressions using outer or earlier-segment bindings now flow through the
+  Typed AST, verified Generic/Concrete Core, and LLVM. Unsigned captures use the
+  specified `u64` type; short input, literal mismatch, and leftover input take the
+  next match arm without an unrecoverable failure. Development/release GC-stress
+  regressions cover exact decoding, bounds-safe normal failure, view retention,
+  signed extension, maximum `u64`, and all source widths and byte orders. `Concat`
+  remains open in Milestone 7, so the broader text/binary deliverable remains open.
+- [x] Completed named monomorphic function values end to end. Bare and qualified
+  ordinary function references now form exact structural function values, generic
+  references specialize from their expected function type, local bindings shadow
+  bare function names, and visibility is enforced when a function is named while
+  already-returned private values remain callable. Calls through function-valued
+  locals and returned values lower to verified indirect calls with exact parameter
+  and result types; function values implement none of `Eq`, `Ord`, `Hash`, or
+  `Show`.
+- [x] Extended reachability and monomorphization through referenced code targets,
+  including deterministic reuse of generic specializations, and lowered the private
+  representation to LLVM code pointers without exposing it across Core IR. Typed
+  AST and Generic/Concrete Core negative tests reject ambiguous generic references,
+  inexact signatures, invalid targets, and mistyped indirect calls. LLVM coverage
+  verifies code-pointer phis and indirect calls, while development/release
+  collection-at-every-allocation native tests retain managed string arguments across
+  indirect calls. `Concat` remains a Milestone 7 protocol deliverable, and the
+  broader Milestone 6 text/binary deliverable remains open.
+- [x] Added the non-higher-order `Enum` traversal foundation for every standard
+  iterable currently available in Milestone 6: lists, fixed arrays, slices,
+  `bytes`, and insertion-ordered maps. `Enum.count` returns a target-width
+  `usize`; `Enum.at` performs zero-based traversal and returns `{:some, item}` or
+  `:none` without an unrecoverable bounds failure; and `Enum.to_list` produces a
+  fresh logical list in deterministic iteration order, with map items represented
+  as `{key, value}` tuples.
+- [x] Added exact Typed AST and Generic/Concrete Core verification for iterable
+  source, item, index, option, and list-result types. LLVM lowers list/map cursor
+  traversal, array/slice/byte positional access, and rooted array/slice list
+  materialization without exposing cursor representation. Development/release
+  collection-at-every-allocation tests cover hits, misses, all five iteration
+  orders, fresh outputs, and retained managed string elements. Higher-order
+  `Enum.map`, `filter`, `reduce`, `each`, `any`, and `all`, Unicode views, and the
+  Milestone 7 protocol surface remain open, so the collection-helper deliverable
+  is not yet closed.
+- [x] Added the callback-only `Enum.each`, `Enum.any`, and `Enum.all` traversal
+  slice for lists, fixed arrays, slices, `bytes`, and insertion-ordered maps.
+  Callback arguments use exact named monomorphic function types; traversal is
+  deterministic, `each` visits the complete input, `any` stops on the first true
+  result, and `all` stops on the first false result. Empty inputs use the specified
+  false/true identities for `any`/`all`.
+- [x] Lowered visitor traversal through a verified collecting Core operation and
+  rooted both the iterable and the current callback item across every indirect
+  call. LLVM coverage exercises cursor and positional loops, while development and
+  release collection-at-every-allocation tests cover all five iterable categories,
+  managed string callback arguments, empty inputs, and short-circuiting before a
+  deliberately failing later callback. List-producing higher-order traversal and
+  reduction remained open at this point.
+- [x] Added strict left-to-right `Enum.reduce` for every current standard iterable.
+  The explicit initial value fixes the accumulator type and context-types the exact
+  named reducer signature `(accumulator, item) -> accumulator`; empty inputs return
+  that initial value unchanged. Typed AST and Generic/Concrete Core verification
+  reject mismatched accumulator, item, callback, and result types.
+- [x] Reused the rooted visitor loops for reduction while keeping the live
+  accumulator in a volatile collector-visible stack root across every indirect
+  reducer call. LLVM and development/release collection-at-every-allocation tests
+  cover lists, arrays, slices, bytes, insertion-ordered maps, empty inputs, strict
+  order, accumulator threading, and managed string accumulators. `Enum.map` and
+  `filter` remain open, so the collection-helper deliverable is not yet closed.
+- [x] Added `Enum.filter` across lists, arrays, slices, bytes, and maps. Predicates
+  use exact `(item) -> bool` named function values, every input is visited in its
+  deterministic order, and accepted items are appended to a fresh logical list
+  without exposing the private construction tail.
+- [x] The shared collecting visitor operation now roots the current item and fresh
+  list head across predicate calls and node allocations. Typed/Core rejection tests,
+  LLVM cursor and positional-loop coverage, and development/release GC-stress tests
+  cover empty-capable filtering, stable order, map tuple items, bytes, and managed
+  strings whose predicate allocates. `Enum.map` remains open, so the collection-
+  helper deliverable is not yet closed.
+- [x] Completed `Enum.map` for lists, fixed arrays, slices, `bytes`, and maps.
+  Mapper arguments use exact `(item) -> result` named function values, including
+  generic specialization from the source item and an expected list result; every
+  input is transformed once in deterministic order into a fresh logical `[result]`.
+- [x] Extended the verified collecting visitor so a mapper's returned value remains
+  in a volatile collector-visible root while its list node is allocated. Typed AST,
+  Generic/Concrete Core, and LLVM tests cover type-changing results and rooted
+  indirect-call loops. Development/release collection-at-every-allocation tests
+  cover all five iterable categories, empty inputs, map tuple order, bytes, and
+  managed callback results. This closes the Milestone 6 collection-helper
+  deliverable; protocol-backed `Iterable` integration remains in Milestone 7.
+- [x] Added the pinned Unicode 17.0.0 extended-grapheme boundary foundation and
+  `String.length`. Official `GraphemeBreakProperty`, `Indic_Conjunct_Break`, and
+  `Extended_Pictographic` inputs generate checked-in deterministic range tables;
+  segmentation implements the untailored UAX #29 revision 47 rules without host
+  locale, ICU, normalization, or case-folding dependencies. Build metadata now
+  records `unicode_version = "17.0.0"`, and the private runtime ABI advanced to
+  revision 4 for non-allocating next-boundary and cluster-count operations.
+- [x] Added exact Typed AST and Generic/Concrete Core verification for
+  `String.length(string) -> usize`, plus verified LLVM lowering through the private
+  count operation. The bundled official Unicode 17.0.0 `GraphemeBreakTest.txt`
+  corpus checks every boundary and count in all 766 cases, while native development
+  and release tests cover empty text, combining sequences, regional-indicator
+  flags, emoji ZWJ families, and mixed text. `String.graphemes`, both lazy views,
+  and their allocation/retention tests remain before the Unicode and views
+  deliverables close.
+- [x] Completed `String.graphemes(text) -> [string]` and the named
+  `String.CodepointView`/`String.GraphemeView` lazy traversal types. Eager
+  graphemes collect through the grapheme view, so `length`, eager collection,
+  and lazy traversal all use the same pinned Unicode 17.0.0 UAX #29 revision 47
+  boundary routine. Codepoint traversal decodes guaranteed-valid UTF-8 directly
+  and never reads beyond a scalar.
+- [x] Lazy views retain the source allocation base separately from their current
+  data pointer and byte length. The complete Milestone 6 `Enum` helper surface
+  accepts both views with source-order `count`, `at`, `to_list`, callback visits,
+  filtering, mapping, and reduction; grapheme items are immutable string slices
+  and codepoint items are `rune` values. Typed AST and Generic/Concrete Core
+  verification cover the opaque view types and item contracts, LLVM tests cover
+  the shared next-boundary path, and development/release collection-at-every-
+  allocation regressions cover empty, combining-mark, supplementary-scalar,
+  regional-indicator, and emoji-ZWJ inputs plus retained eager and lazy results.
+  This closes the Unicode and views deliverable groups; direct full-corpus checks
+  through all three public APIs remain in the open Milestone 6 conformance test.
 
 ### Milestone 7 — Protocols and iteration
 

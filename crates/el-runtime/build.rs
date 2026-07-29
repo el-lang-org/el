@@ -14,6 +14,7 @@ fn run(command: &mut Command, description: &str) {
 fn main() {
     println!("cargo:rerun-if-changed=src/native/runtime.c");
     println!("cargo:rerun-if-changed=src/native/runtime.h");
+    println!("cargo:rerun-if-changed=src/native/unicode_grapheme_data.inc");
     println!("cargo:rerun-if-changed=../../runtime/vendor/boehm-gc/gc-8.2.12.tar.gz");
 
     if env::var_os("CARGO_FEATURE_BOEHM").is_none() {

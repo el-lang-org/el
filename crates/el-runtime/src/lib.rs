@@ -8,7 +8,9 @@
 use std::path::{Path, PathBuf};
 
 /// Current private compiler/runtime ABI revision.
-pub const PRIVATE_ABI_VERSION: u32 = 3;
+pub const PRIVATE_ABI_VERSION: u32 = 4;
+/// Unicode data version fixed by the EL v1 language contract.
+pub const UNICODE_VERSION: &str = "17.0.0";
 
 /// Symbol called by generated code for source-mandated unrecoverable failures.
 pub const FAILURE_SYMBOL: &str = "__el_runtime_fail";
@@ -25,6 +27,10 @@ pub const REGISTER_GLOBALS_SYMBOL: &str = "__el_runtime_register_managed_globals
 pub const HASH_SEED_SYMBOL: &str = "__el_runtime_hash_seed";
 /// Validates UTF-8 and returns the input length or the first invalid sequence offset.
 pub const UTF8_VALIDATE_SYMBOL: &str = "__el_runtime_utf8_validate";
+/// Finds the next Unicode extended-grapheme boundary at or after an input boundary.
+pub const GRAPHEME_NEXT_SYMBOL: &str = "__el_runtime_grapheme_next";
+/// Counts Unicode extended grapheme clusters in valid UTF-8.
+pub const GRAPHEME_COUNT_SYMBOL: &str = "__el_runtime_grapheme_count";
 
 /// Static archives required when linking a managed EL executable.
 #[cfg(feature = "boehm")]
@@ -67,9 +73,12 @@ pub enum RuntimeCallEffect {
 #[must_use]
 pub fn runtime_call_effect(symbol: &str) -> Option<RuntimeCallEffect> {
     match symbol {
-        INITIALIZE_SYMBOL | REGISTER_GLOBALS_SYMBOL | HASH_SEED_SYMBOL | UTF8_VALIDATE_SYMBOL => {
-            Some(RuntimeCallEffect::NonAllocating)
-        }
+        INITIALIZE_SYMBOL
+        | REGISTER_GLOBALS_SYMBOL
+        | HASH_SEED_SYMBOL
+        | UTF8_VALIDATE_SYMBOL
+        | GRAPHEME_NEXT_SYMBOL
+        | GRAPHEME_COUNT_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         ALLOCATE_SCANNED_SYMBOL | ALLOCATE_ATOMIC_SYMBOL => Some(RuntimeCallEffect::Allocating),
         FAILURE_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         _ => None,
@@ -117,8 +126,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_abi_tracks_the_utf8_validation_boundary() {
-        assert_eq!(PRIVATE_ABI_VERSION, 3);
+    fn private_abi_tracks_the_unicode_segmentation_boundary() {
+        assert_eq!(PRIVATE_ABI_VERSION, 4);
     }
 
     #[test]
@@ -151,6 +160,14 @@ mod tests {
         );
         assert_eq!(
             runtime_call_effect(UTF8_VALIDATE_SYMBOL),
+            Some(RuntimeCallEffect::NonAllocating)
+        );
+        assert_eq!(
+            runtime_call_effect(GRAPHEME_NEXT_SYMBOL),
+            Some(RuntimeCallEffect::NonAllocating)
+        );
+        assert_eq!(
+            runtime_call_effect(GRAPHEME_COUNT_SYMBOL),
             Some(RuntimeCallEffect::NonAllocating)
         );
         assert_eq!(

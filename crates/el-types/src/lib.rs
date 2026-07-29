@@ -24,7 +24,10 @@ pub enum Type {
     Buffer,
     Rune,
     Utf8Error,
+    CodepointView,
+    GraphemeView,
     U8,
+    U64,
     Atom(String),
     List(TypeId),
     Array {
@@ -156,6 +159,25 @@ pub enum TypedPatternKind {
         field_count: usize,
         fields: Vec<(usize, TypedPattern)>,
     },
+    Bitstring(Vec<TypedBitstringPatternSegment>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedBitstringPatternSegment {
+    pub pattern: TypedPattern,
+    pub kind: TypedBitstringPatternSegmentKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedBitstringPatternSegmentKind {
+    Integer {
+        signed: bool,
+        byte_order: BitstringByteOrder,
+        width: u8,
+    },
+    Bytes {
+        size: Option<TypedExpr>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +302,10 @@ pub enum TypedExprKind {
     SliceCopy(Box<TypedExpr>),
     StringBytes(Box<TypedExpr>),
     StringCodepoints(Box<TypedExpr>),
+    StringCodepointView(Box<TypedExpr>),
+    StringGraphemeView(Box<TypedExpr>),
+    StringLength(Box<TypedExpr>),
+    Bitstring(Vec<TypedBitstringSegment>),
     StringFromBytes(Box<TypedExpr>),
     Utf8ErrorOffset(Box<TypedExpr>),
     RuneToString(Box<TypedExpr>),
@@ -309,6 +335,17 @@ pub enum TypedExprKind {
         value: Box<TypedExpr>,
         known_length: Option<u64>,
     },
+    EnumAt {
+        value: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+    },
+    EnumToList(Box<TypedExpr>),
+    EnumVisit {
+        value: Box<TypedExpr>,
+        initial: Option<Box<TypedExpr>>,
+        function: Box<TypedExpr>,
+        kind: EnumVisitKind,
+    },
     If {
         condition: Box<TypedExpr>,
         then_block: TypedBlock,
@@ -321,6 +358,10 @@ pub enum TypedExprKind {
     },
     Ascription(Box<TypedExpr>),
     Local(SymbolId),
+    FunctionRef {
+        function: DeclId,
+        substitutions: Vec<(TypeId, TypeId)>,
+    },
     Binary {
         operator: ArithmeticOperator,
         left: Box<TypedExpr>,
@@ -341,9 +382,48 @@ pub enum TypedExprKind {
         substitutions: Vec<(TypeId, TypeId)>,
         arguments: Vec<TypedExpr>,
     },
+    IndirectCall {
+        callee: Box<TypedExpr>,
+        arguments: Vec<TypedExpr>,
+    },
     UnionInject {
         member: TypeId,
         value: Box<TypedExpr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitstringByteOrder {
+    Big,
+    Little,
+    Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnumVisitKind {
+    Each,
+    Any,
+    All,
+    Reduce,
+    Filter,
+    Map,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedBitstringSegment {
+    pub value: TypedExpr,
+    pub kind: TypedBitstringSegmentKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TypedBitstringSegmentKind {
+    Integer {
+        signed: bool,
+        byte_order: BitstringByteOrder,
+        width: u8,
+    },
+    Bytes {
+        size: Option<TypedExpr>,
     },
 }
 
@@ -406,6 +486,7 @@ enum PatternShape {
     ListEmpty,
     ListCons(Box<(TypeId, PatternShape)>, Box<(TypeId, PatternShape)>),
     Struct(DeclId, Vec<(TypeId, PatternShape)>),
+    Bitstring(String),
 }
 
 /// Resolves canonical types and checks every function body before producing a Typed AST.
@@ -685,7 +766,10 @@ impl<'a> Checker<'a> {
                 "Buffer" => Some(self.intern(Type::Buffer)),
                 "rune" => Some(self.intern(Type::Rune)),
                 "String.Utf8Error" => Some(self.intern(Type::Utf8Error)),
+                "String.CodepointView" => Some(self.intern(Type::CodepointView)),
+                "String.GraphemeView" => Some(self.intern(Type::GraphemeView)),
                 "u8" => Some(self.intern(Type::U8)),
+                "u64" => Some(self.intern(Type::U64)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
                         "E2100",
@@ -1411,6 +1495,7 @@ impl<'a> Checker<'a> {
             }),
             "string" => self.check_string(node),
             "rune" => self.check_rune(node),
+            "bitstring_expr" => self.check_bitstring(node, owner, scopes),
             "atom" => self.check_atom(node),
             "list_literal" => self.check_list(node, expected, owner, scopes),
             "array_literal" => self.check_array(node, expected, owner, scopes),
@@ -1420,7 +1505,7 @@ impl<'a> Checker<'a> {
             "tuple_literal" => self.check_tuple(node, expected, owner, scopes),
             "struct_literal" => self.check_struct_literal(node, expected, owner, scopes),
             "ascription_expr" => self.check_ascription(node, owner, scopes),
-            "qualified_value" | "identifier" => self.check_name(node, scopes),
+            "qualified_value" | "identifier" => self.check_name(node, expected, owner, scopes),
             "additive_expr" | "multiplicative_expr" => {
                 self.check_binary(node, expected, owner, scopes)
             }
@@ -1463,7 +1548,7 @@ impl<'a> Checker<'a> {
             "integer" | "additive_expr" | "multiplicative_expr" => members
                 .iter()
                 .copied()
-                .filter(|member| matches!(self.types[member.0 as usize], Type::I32 | Type::I64 | Type::U8))
+                .filter(|member| matches!(self.types[member.0 as usize], Type::I32 | Type::I64 | Type::U8 | Type::U64))
                 .collect::<Vec<_>>(),
             "kw_true" | "kw_false" => members
                 .iter()
@@ -1787,7 +1872,7 @@ impl<'a> Checker<'a> {
             let pattern_node = &arm_node.children[0];
             let mut arm_scope = BTreeMap::new();
             let (mut pattern, shape) =
-                self.check_pattern(pattern_node, subject.ty, owner, &mut arm_scope)?;
+                self.check_pattern(pattern_node, subject.ty, owner, scopes, &mut arm_scope)?;
             let reachable =
                 pattern_is_useful(&matrix, vec![shape.clone()], vec![subject.ty], &self.types);
             if !reachable {
@@ -1848,6 +1933,7 @@ impl<'a> Checker<'a> {
         node: &Node,
         subject: TypeId,
         owner: DeclId,
+        scopes: &[BTreeMap<String, Local>],
         bindings: &mut BTreeMap<String, Local>,
     ) -> Option<(TypedPattern, PatternShape)> {
         let (kind, irrefutable, shape) = match node.kind.as_str() {
@@ -1908,10 +1994,28 @@ impl<'a> Checker<'a> {
             "integer"
                 if matches!(
                     self.types[subject.0 as usize],
-                    Type::I32 | Type::I64 | Type::U8
+                    Type::I32 | Type::I64 | Type::U8 | Type::U64
                 ) =>
             {
                 let value = integer_value(node)?;
+                let in_range = match self.types[subject.0 as usize] {
+                    Type::I32 => (i32::MIN as i128..=i32::MAX as i128).contains(&value),
+                    Type::I64 => (i64::MIN as i128..=i64::MAX as i128).contains(&value),
+                    Type::U8 => (0..=u8::MAX as i128).contains(&value),
+                    Type::U64 => (0..=u64::MAX as i128).contains(&value),
+                    _ => unreachable!("guard accepts only integer pattern types"),
+                };
+                if !in_range {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2106",
+                        node.span,
+                        format!(
+                            "integer literal is out of range for `{}`",
+                            self.type_name(subject)
+                        ),
+                    ));
+                    return None;
+                }
                 (
                     TypedPatternKind::Integer(value),
                     false,
@@ -1993,7 +2097,8 @@ impl<'a> Checker<'a> {
                 let mut patterns = Vec::new();
                 let mut shapes = Vec::new();
                 for (child, ty) in node.children.iter().zip(elements) {
-                    let (pattern, shape) = self.check_pattern(child, ty, owner, bindings)?;
+                    let (pattern, shape) =
+                        self.check_pattern(child, ty, owner, scopes, bindings)?;
                     patterns.push(pattern);
                     shapes.push((ty, shape));
                 }
@@ -2017,9 +2122,9 @@ impl<'a> Checker<'a> {
                     (TypedPatternKind::ListEmpty, false, PatternShape::ListEmpty)
                 } else {
                     let (head, head_shape) =
-                        self.check_pattern(&node.children[0], item, owner, bindings)?;
+                        self.check_pattern(&node.children[0], item, owner, scopes, bindings)?;
                     let (tail, tail_shape) =
-                        self.check_pattern(&node.children[1], subject, owner, bindings)?;
+                        self.check_pattern(&node.children[1], subject, owner, scopes, bindings)?;
                     (
                         TypedPatternKind::ListCons {
                             head: Box::new(head),
@@ -2032,6 +2137,110 @@ impl<'a> Checker<'a> {
                         ),
                     )
                 }
+            }
+            "bitstring_pattern" => {
+                if !matches!(self.types[subject.0 as usize], Type::Bytes) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2157",
+                        node.span,
+                        "bitstring pattern requires a bytes subject",
+                    ));
+                    return None;
+                }
+                let mut segments = Vec::with_capacity(node.children.len());
+                for segment in &node.children {
+                    let pattern_node = segment.children.first()?;
+                    let modifiers = segment.children.get(1)?;
+                    let is_bytes = modifiers
+                        .children
+                        .iter()
+                        .any(|modifier| modifier.kind.as_str() == "modifier_bytes");
+                    let size_node = modifiers
+                        .children
+                        .iter()
+                        .find(|modifier| modifier.kind.as_str() == "size_modifier")
+                        .and_then(|modifier| modifier.children.first());
+                    let (pattern, kind) = if is_bytes {
+                        let mut size_scopes = scopes.to_vec();
+                        size_scopes.push(bindings.clone());
+                        let usize_ty = self.intern(Type::Usize);
+                        let size = if let Some(size) = size_node {
+                            Some(self.check_expr(size, Some(usize_ty), owner, &mut size_scopes)?)
+                        } else {
+                            None
+                        };
+                        let pattern =
+                            self.check_pattern(pattern_node, subject, owner, scopes, bindings)?;
+                        (pattern.0, TypedBitstringPatternSegmentKind::Bytes { size })
+                    } else {
+                        let signed = modifiers
+                            .children
+                            .iter()
+                            .any(|modifier| modifier.kind.as_str() == "modifier_signed");
+                        let byte_order = if modifiers
+                            .children
+                            .iter()
+                            .any(|modifier| modifier.kind.as_str() == "modifier_little")
+                        {
+                            BitstringByteOrder::Little
+                        } else if modifiers
+                            .children
+                            .iter()
+                            .any(|modifier| modifier.kind.as_str() == "modifier_native")
+                        {
+                            BitstringByteOrder::Native
+                        } else {
+                            BitstringByteOrder::Big
+                        };
+                        let width = size_node
+                            .and_then(integer_value)
+                            .and_then(|width| u8::try_from(width).ok())?;
+                        let integer_ty = if signed {
+                            TypeId(1)
+                        } else {
+                            self.intern(Type::U64)
+                        };
+                        let (pattern, _) =
+                            self.check_pattern(pattern_node, integer_ty, owner, scopes, bindings)?;
+                        if let TypedPatternKind::Integer(value) = &pattern.kind {
+                            let minimum = if signed { -(1_i128 << (width - 1)) } else { 0 };
+                            let maximum = if signed {
+                                (1_i128 << (width - 1)) - 1
+                            } else if width == 64 {
+                                u64::MAX as i128
+                            } else {
+                                (1_i128 << width) - 1
+                            };
+                            if *value < minimum || *value > maximum {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "E2158",
+                                    pattern.span,
+                                    "integer pattern does not fit its bitstring segment",
+                                ));
+                                return None;
+                            }
+                        }
+                        (
+                            pattern,
+                            TypedBitstringPatternSegmentKind::Integer {
+                                signed,
+                                byte_order,
+                                width,
+                            },
+                        )
+                    };
+                    segments.push(TypedBitstringPatternSegment { pattern, kind });
+                }
+                let irrefutable = matches!(segments.as_slice(), [TypedBitstringPatternSegment {
+                    pattern,
+                    kind: TypedBitstringPatternSegmentKind::Bytes { size: None },
+                }] if pattern.facts.irrefutable);
+                let shape = if irrefutable {
+                    PatternShape::Wildcard
+                } else {
+                    PatternShape::Bitstring(bitstring_pattern_shape(&segments))
+                };
+                (TypedPatternKind::Bitstring(segments), irrefutable, shape)
             }
             "struct_pattern" => {
                 let Type::Struct {
@@ -2103,8 +2312,13 @@ impl<'a> Checker<'a> {
                     };
                     let field_ty =
                         self.resolve_type(&structure.fields[index].ty, &substitutions)?;
-                    let (pattern, field_shape) =
-                        self.check_pattern(&field_node.children[1], field_ty, owner, bindings)?;
+                    let (pattern, field_shape) = self.check_pattern(
+                        &field_node.children[1],
+                        field_ty,
+                        owner,
+                        scopes,
+                        bindings,
+                    )?;
                     shapes[index].1 = field_shape;
                     fields.push((index, pattern));
                 }
@@ -2173,7 +2387,7 @@ impl<'a> Checker<'a> {
             .filter(|ty| {
                 matches!(
                     self.types[ty.0 as usize],
-                    Type::I32 | Type::I64 | Type::Usize | Type::U8
+                    Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64
                 )
             })
             .unwrap_or(TypeId(1));
@@ -2186,6 +2400,7 @@ impl<'a> Checker<'a> {
             Type::I64 => i64::MAX as u128,
             Type::Usize => usize::MAX as u128,
             Type::U8 => u8::MAX as u128,
+            Type::U64 => u64::MAX as u128,
             _ => unreachable!(),
         };
         if value.is_none_or(|value| value > limit) {
@@ -2217,6 +2432,121 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_bitstring(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let bytes_ty = self.intern(Type::Bytes);
+        let usize_ty = self.intern(Type::Usize);
+        let mut segments = Vec::with_capacity(node.children.len());
+        for segment in &node.children {
+            let value_node = segment.children.first()?;
+            let modifiers = segment.children.get(1)?;
+            let is_bytes = modifiers
+                .children
+                .iter()
+                .any(|modifier| modifier.kind.as_str() == "modifier_bytes");
+            let size_node = modifiers
+                .children
+                .iter()
+                .find(|modifier| modifier.kind.as_str() == "size_modifier")
+                .and_then(|modifier| modifier.children.first());
+            let (value, kind) = if is_bytes {
+                let value = self.check_expr(value_node, Some(bytes_ty), owner, scopes)?;
+                let size = if let Some(size) = size_node {
+                    Some(self.check_expr(size, Some(usize_ty), owner, scopes)?)
+                } else {
+                    None
+                };
+                if let (
+                    Some(actual),
+                    Some(TypedExpr {
+                        kind: TypedExprKind::Integer(expected),
+                        ..
+                    }),
+                ) = (known_bytes_length(&value), size.as_ref())
+                    && actual != *expected as u128
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2156",
+                        value.span,
+                        "statically known bytes value does not match its bitstring segment size",
+                    ));
+                    return None;
+                }
+                (value, TypedBitstringSegmentKind::Bytes { size })
+            } else {
+                let value = self.check_expr(value_node, None, owner, scopes)?;
+                if !matches!(
+                    self.types[value.ty.0 as usize],
+                    Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64
+                ) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2154",
+                        value.span,
+                        "integer bitstring segments require an integer operand",
+                    ));
+                    return None;
+                }
+                let width = size_node
+                    .and_then(integer_value)
+                    .and_then(|width| u8::try_from(width).ok())?;
+                let signed = modifiers
+                    .children
+                    .iter()
+                    .any(|modifier| modifier.kind.as_str() == "modifier_signed");
+                let byte_order = if modifiers
+                    .children
+                    .iter()
+                    .any(|modifier| modifier.kind.as_str() == "modifier_little")
+                {
+                    BitstringByteOrder::Little
+                } else if modifiers
+                    .children
+                    .iter()
+                    .any(|modifier| modifier.kind.as_str() == "modifier_native")
+                {
+                    BitstringByteOrder::Native
+                } else {
+                    BitstringByteOrder::Big
+                };
+                if let TypedExprKind::Integer(literal) = &value.kind {
+                    let maximum = if signed {
+                        (1_i128 << (width - 1)) - 1
+                    } else if width == 64 {
+                        u64::MAX as i128
+                    } else {
+                        (1_i128 << width) - 1
+                    };
+                    if *literal > maximum {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2155",
+                            value.span,
+                            "integer literal does not fit its bitstring segment",
+                        ));
+                        return None;
+                    }
+                }
+                (
+                    value,
+                    TypedBitstringSegmentKind::Integer {
+                        signed,
+                        byte_order,
+                        width,
+                    },
+                )
+            };
+            segments.push(TypedBitstringSegment { value, kind });
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::Bitstring(segments),
+            ty: bytes_ty,
+            span: node.span,
+        })
+    }
+
     fn check_rune(&mut self, node: &Node) -> Option<TypedExpr> {
         let Some(Value::Rune { decoded, .. }) = &node.value else {
             return None;
@@ -2228,21 +2558,122 @@ impl<'a> Checker<'a> {
         })
     }
 
-    fn check_name(&mut self, node: &Node, scopes: &[BTreeMap<String, Local>]) -> Option<TypedExpr> {
-        let name = unqualified_name(node)?;
-        if let Some(local) = lookup(scopes, &name) {
+    fn check_name(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &[BTreeMap<String, Local>],
+    ) -> Option<TypedExpr> {
+        let local_name = unqualified_name(node);
+        if let Some(local) = local_name.as_ref().and_then(|name| lookup(scopes, name)) {
             return Some(TypedExpr {
                 kind: TypedExprKind::Local(local.symbol),
                 ty: local.ty,
                 span: node.span,
             });
         }
+        if let Some(reference) = self.check_function_reference(node, expected, owner) {
+            return Some(reference);
+        }
+        let name = node.children.iter().map(text).collect::<Vec<_>>().join(".");
         self.diagnostics.push(Diagnostic::error(
             "E2107",
             node.span,
             format!("unknown value `{name}`"),
         ));
         None
+    }
+
+    fn check_function_reference(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+    ) -> Option<TypedExpr> {
+        let name = self.call_name(node, owner)?;
+        let function = *self.functions_by_name.get(&name)?;
+        let called = self
+            .program
+            .functions
+            .iter()
+            .find(|candidate| candidate.id == function)?;
+        if called.visibility == Visibility::Private
+            && called.module_name != self.owner_module(owner)?
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2138",
+                node.span,
+                format!("function `{name}` is private"),
+            ));
+            return None;
+        }
+        let signature = self.signatures[&function].clone();
+        let mut substitutions = BTreeMap::new();
+        if let Some(expected) = expected {
+            let Type::Function { parameters, result } = self.types[expected.0 as usize].clone()
+            else {
+                let found = self.intern(Type::Function {
+                    parameters: signature.parameters.clone(),
+                    result: signature.result,
+                });
+                self.type_mismatch(node.span, expected, found);
+                return None;
+            };
+            let declared = self.intern(Type::Function {
+                parameters: signature.parameters.clone(),
+                result: signature.result,
+            });
+            let expected_function = self.intern(Type::Function { parameters, result });
+            if !unify_types(&self.types, declared, expected_function, &mut substitutions) {
+                self.type_mismatch(node.span, expected_function, declared);
+                return None;
+            }
+        }
+        if let Some(missing) = signature
+            .type_parameters
+            .iter()
+            .find(|parameter| !substitutions.contains_key(parameter))
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2112",
+                node.span,
+                format!(
+                    "cannot infer generic type parameter `{}` for function value",
+                    self.type_name(*missing)
+                ),
+            ));
+            return None;
+        }
+        for (parameter, protocol) in &signature.constraints {
+            let concrete = self.apply_substitutions(*parameter, &substitutions);
+            if !self.type_satisfies(concrete, protocol, owner) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2120",
+                    node.span,
+                    format!(
+                        "type `{}` does not satisfy `{protocol}`",
+                        self.type_name(concrete)
+                    ),
+                ));
+                return None;
+            }
+        }
+        let parameters = signature
+            .parameters
+            .iter()
+            .map(|parameter| self.apply_substitutions(*parameter, &substitutions))
+            .collect();
+        let result = self.apply_substitutions(signature.result, &substitutions);
+        let ty = self.intern(Type::Function { parameters, result });
+        Some(TypedExpr {
+            kind: TypedExprKind::FunctionRef {
+                function,
+                substitutions: substitutions.into_iter().collect(),
+            },
+            ty,
+            span: node.span,
+        })
     }
 
     fn check_binary(
@@ -2304,7 +2735,7 @@ impl<'a> Checker<'a> {
         );
         let supported = matches!(
             self.types[left.ty.0 as usize],
-            Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Rune
+            Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64 | Type::Rune
         ) || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
         if !supported {
             self.diagnostics.push(Diagnostic::error(
@@ -2378,31 +2809,56 @@ impl<'a> Checker<'a> {
             .position(|part| part.kind.as_str() == "call_arguments")
             .map(|index| index + 1);
         let (mut value, suffix_start) = if let Some(call) = call {
-            if node.children[call + 1..]
-                .iter()
-                .any(|part| part.kind.as_str() == "call_arguments")
-            {
-                self.diagnostics.push(Diagnostic::error(
-                    "E2109",
-                    node.span,
-                    "indirect calls are not implemented in this slice",
-                ));
-                return None;
-            }
             let final_expected = (call + 1 == node.children.len())
                 .then_some(expected)
                 .flatten();
-            (
-                self.check_call(node, final_expected, owner, scopes)?,
-                call + 1,
-            )
+            let callee = node.children.first()?;
+            let qualified = callee.kind.as_str() == "qualified_value" && callee.children.len() > 1;
+            let shadowed = !qualified
+                && unqualified_name(callee)
+                    .as_ref()
+                    .is_some_and(|name| lookup(scopes, name).is_some());
+            if shadowed {
+                let callee = self.check_expr(callee, None, owner, scopes)?;
+                (
+                    self.check_indirect_call(
+                        callee,
+                        &node.children[call].children,
+                        node.span,
+                        final_expected,
+                        owner,
+                        scopes,
+                    )?,
+                    call + 1,
+                )
+            } else {
+                (
+                    self.check_call(node, final_expected, owner, scopes)?,
+                    call + 1,
+                )
+            }
         } else {
+            let primary_expected = (node.children.len() == 1).then_some(expected).flatten();
             (
-                self.check_expr(node.children.first()?, None, owner, scopes)?,
+                self.check_expr(node.children.first()?, primary_expected, owner, scopes)?,
                 1,
             )
         };
         for access in &node.children[suffix_start..] {
+            if access.kind.as_str() == "call_arguments" {
+                let final_expected = std::ptr::eq(access, node.children.last()?)
+                    .then_some(expected)
+                    .flatten();
+                value = self.check_indirect_call(
+                    value,
+                    &access.children,
+                    access.span,
+                    final_expected,
+                    owner,
+                    scopes,
+                )?;
+                continue;
+            }
             if access.kind.as_str() == "index_access" {
                 let (item, length) = match self.types[value.ty.0 as usize] {
                     Type::Array { item, length } => (item, Some(length)),
@@ -2496,6 +2952,56 @@ impl<'a> Checker<'a> {
             return None;
         }
         Some(value)
+    }
+
+    fn check_indirect_call(
+        &mut self,
+        callee: TypedExpr,
+        argument_nodes: &[Node],
+        span: Span,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let Type::Function { parameters, result } = self.types[callee.ty.0 as usize].clone() else {
+            self.diagnostics.push(Diagnostic::error(
+                "E2109",
+                callee.span,
+                format!("`{}` is not callable", self.type_name(callee.ty)),
+            ));
+            return None;
+        };
+        if argument_nodes.len() != parameters.len() {
+            self.diagnostics.push(Diagnostic::error(
+                "E2111",
+                span,
+                format!(
+                    "function value expects {} arguments but received {}",
+                    parameters.len(),
+                    argument_nodes.len()
+                ),
+            ));
+            return None;
+        }
+        let arguments = argument_nodes
+            .iter()
+            .zip(parameters)
+            .map(|(argument, parameter)| self.check_expr(argument, Some(parameter), owner, scopes))
+            .collect::<Option<Vec<_>>>()?;
+        if let Some(expected) = expected
+            && expected != result
+        {
+            self.type_mismatch(span, expected, result);
+            return None;
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::IndirectCall {
+                callee: Box::new(callee),
+                arguments,
+            },
+            ty: result,
+            span,
+        })
     }
 
     fn check_struct_literal(
@@ -2685,14 +3191,26 @@ impl<'a> Checker<'a> {
                     | "Map.fetch"
                     | "Map.new"
                     | "Map.size"
+                    | "Enum.count"
+                    | "Enum.at"
                     | "Enum.to_list"
+                    | "Enum.each"
+                    | "Enum.any"
+                    | "Enum.all"
+                    | "Enum.reduce"
+                    | "Enum.filter"
+                    | "Enum.map"
                     | "Slice.from_array"
                     | "Slice.subslice"
                     | "Slice.copy"
                     | "Slice.length"
                     | "String.byte_size"
+                    | "String.length"
                     | "String.bytes"
                     | "String.codepoints"
+                    | "String.graphemes"
+                    | "String.codepoint_view"
+                    | "String.grapheme_view"
                     | "String.from_bytes"
                     | "String.utf8_error_offset"
                     | "Rune.to_string"
@@ -2928,9 +3446,15 @@ impl<'a> Checker<'a> {
             });
         }
         let required = match name {
-            "Slice.subslice" | "Bytes.slice" | "Bits.slice" | "Map.put" => 3,
+            "Slice.subslice" | "Bytes.slice" | "Bits.slice" | "Map.put" | "Enum.reduce" => 3,
             "Map.remove"
             | "Map.fetch"
+            | "Enum.at"
+            | "Enum.each"
+            | "Enum.any"
+            | "Enum.all"
+            | "Enum.filter"
+            | "Enum.map"
             | "Buffer.append_byte"
             | "Buffer.append_bytes"
             | "Buffer.append_string" => 2,
@@ -3027,6 +3551,9 @@ impl<'a> Checker<'a> {
                 },
                 usize_ty,
             ),
+            ("String.length", Type::String) => {
+                (TypedExprKind::StringLength(Box::new(first)), usize_ty)
+            }
             ("String.bytes", Type::String) => {
                 let ty = self.intern(Type::Bytes);
                 (TypedExprKind::StringBytes(Box::new(first)), ty)
@@ -3035,6 +3562,25 @@ impl<'a> Checker<'a> {
                 let rune_ty = self.intern(Type::Rune);
                 let ty = self.intern(Type::List(rune_ty));
                 (TypedExprKind::StringCodepoints(Box::new(first)), ty)
+            }
+            ("String.graphemes", Type::String) => {
+                let string_ty = self.intern(Type::String);
+                let view_ty = self.intern(Type::GraphemeView);
+                let view = TypedExpr {
+                    kind: TypedExprKind::StringGraphemeView(Box::new(first)),
+                    ty: view_ty,
+                    span,
+                };
+                let ty = self.intern(Type::List(string_ty));
+                (TypedExprKind::EnumToList(Box::new(view)), ty)
+            }
+            ("String.codepoint_view", Type::String) => {
+                let ty = self.intern(Type::CodepointView);
+                (TypedExprKind::StringCodepointView(Box::new(first)), ty)
+            }
+            ("String.grapheme_view", Type::String) => {
+                let ty = self.intern(Type::GraphemeView);
+                (TypedExprKind::StringGraphemeView(Box::new(first)), ty)
             }
             ("String.from_bytes", Type::Bytes) => {
                 let ok_atom = self.intern(Type::Atom("ok".to_owned()));
@@ -3183,10 +3729,229 @@ impl<'a> Checker<'a> {
                 },
                 usize_ty,
             ),
+            (
+                "Enum.count",
+                Type::List(_)
+                | Type::Slice(_)
+                | Type::Bytes
+                | Type::Map { .. }
+                | Type::CodepointView
+                | Type::GraphemeView,
+            ) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: None,
+                },
+                usize_ty,
+            ),
+            ("Enum.count", Type::Array { length, .. }) => (
+                TypedExprKind::CollectionLength {
+                    value: Box::new(first),
+                    known_length: Some(length),
+                },
+                usize_ty,
+            ),
+            ("Enum.at", source) => {
+                let item = match source {
+                    Type::List(item) | Type::Array { item, .. } | Type::Slice(item) => item,
+                    Type::Bytes => self.intern(Type::U8),
+                    Type::Map { key, value } => self.intern(Type::Tuple(vec![key, value])),
+                    Type::CodepointView => self.intern(Type::Rune),
+                    Type::GraphemeView => self.intern(Type::String),
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2151",
+                            arguments[0].span,
+                            "`Enum.at` requires a standard iterable value",
+                        ));
+                        return None;
+                    }
+                };
+                let index = self.check_expr(arguments[1], Some(usize_ty), owner, scopes)?;
+                let some_atom = self.intern(Type::Atom("some".to_owned()));
+                let none_atom = self.intern(Type::Atom("none".to_owned()));
+                let some = self.intern(Type::Tuple(vec![some_atom, item]));
+                let ty = self.normalize_union(vec![some, none_atom], span)?;
+                (
+                    TypedExprKind::EnumAt {
+                        value: Box::new(first),
+                        index: Box::new(index),
+                    },
+                    ty,
+                )
+            }
+            ("Enum.to_list", Type::List(_)) => {
+                let ty = first.ty;
+                let inner = TypedExpr {
+                    kind: TypedExprKind::ListReverse(Box::new(first)),
+                    ty,
+                    span,
+                };
+                (TypedExprKind::ListReverse(Box::new(inner)), ty)
+            }
+            ("Enum.to_list", Type::Array { item, .. } | Type::Slice(item)) => {
+                let ty = self.intern(Type::List(item));
+                (TypedExprKind::EnumToList(Box::new(first)), ty)
+            }
+            ("Enum.to_list", Type::Bytes) => {
+                let u8_ty = self.intern(Type::U8);
+                let ty = self.intern(Type::List(u8_ty));
+                (TypedExprKind::BytesToList(Box::new(first)), ty)
+            }
             ("Enum.to_list", Type::Map { key, value }) => {
                 let pair = self.intern(Type::Tuple(vec![key, value]));
                 let ty = self.intern(Type::List(pair));
                 (TypedExprKind::MapToList(Box::new(first)), ty)
+            }
+            ("Enum.to_list", Type::CodepointView) => {
+                let item = self.intern(Type::Rune);
+                let ty = self.intern(Type::List(item));
+                (TypedExprKind::EnumToList(Box::new(first)), ty)
+            }
+            ("Enum.to_list", Type::GraphemeView) => {
+                let item = self.intern(Type::String);
+                let ty = self.intern(Type::List(item));
+                (TypedExprKind::EnumToList(Box::new(first)), ty)
+            }
+            (
+                "Enum.each" | "Enum.any" | "Enum.all" | "Enum.reduce" | "Enum.filter" | "Enum.map",
+                source,
+            ) => {
+                let item = match source {
+                    Type::List(item) | Type::Array { item, .. } | Type::Slice(item) => item,
+                    Type::Bytes => self.intern(Type::U8),
+                    Type::Map { key, value } => self.intern(Type::Tuple(vec![key, value])),
+                    Type::CodepointView => self.intern(Type::Rune),
+                    Type::GraphemeView => self.intern(Type::String),
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2151",
+                            arguments[0].span,
+                            format!("`{name}` requires a standard iterable value"),
+                        ));
+                        return None;
+                    }
+                };
+                let kind = match name {
+                    "Enum.each" => EnumVisitKind::Each,
+                    "Enum.any" => EnumVisitKind::Any,
+                    "Enum.all" => EnumVisitKind::All,
+                    "Enum.reduce" => EnumVisitKind::Reduce,
+                    "Enum.filter" => EnumVisitKind::Filter,
+                    "Enum.map" => EnumVisitKind::Map,
+                    _ => unreachable!("matched Enum visit intrinsic"),
+                };
+                let initial = if kind == EnumVisitKind::Reduce {
+                    Some(self.check_expr(arguments[1], expected, owner, scopes)?)
+                } else {
+                    None
+                };
+                let expected_map_item = (kind == EnumVisitKind::Map)
+                    .then_some(expected)
+                    .flatten()
+                    .and_then(|expected| match self.types.get(expected.0 as usize) {
+                        Some(Type::List(item)) => Some(*item),
+                        _ => None,
+                    });
+                let mut prechecked_function = None;
+                let callback_result = match kind {
+                    EnumVisitKind::Each => self.intern(Type::Unit),
+                    EnumVisitKind::Any | EnumVisitKind::All => self.intern(Type::Bool),
+                    EnumVisitKind::Reduce => initial.as_ref()?.ty,
+                    EnumVisitKind::Filter => self.intern(Type::Bool),
+                    EnumVisitKind::Map if expected_map_item.is_some() => expected_map_item?,
+                    EnumVisitKind::Map => {
+                        let function_node = arguments[1];
+                        let shadowed = unqualified_name(function_node)
+                            .as_ref()
+                            .is_some_and(|name| lookup(scopes, name).is_some());
+                        let inferred_function_ty = if shadowed {
+                            None
+                        } else {
+                            self.call_name(function_node, owner)
+                                .and_then(|name| self.functions_by_name.get(&name).copied())
+                                .and_then(|function| self.signatures.get(&function).cloned())
+                                .and_then(|signature| {
+                                    let [parameter] = signature.parameters.as_slice() else {
+                                        return None;
+                                    };
+                                    let mut substitutions = BTreeMap::new();
+                                    if !unify_types(
+                                        &self.types,
+                                        *parameter,
+                                        item,
+                                        &mut substitutions,
+                                    ) || signature
+                                        .type_parameters
+                                        .iter()
+                                        .any(|parameter| !substitutions.contains_key(parameter))
+                                    {
+                                        return None;
+                                    }
+                                    let result =
+                                        self.apply_substitutions(signature.result, &substitutions);
+                                    Some(self.intern(Type::Function {
+                                        parameters: vec![item],
+                                        result,
+                                    }))
+                                })
+                        };
+                        let function =
+                            self.check_expr(function_node, inferred_function_ty, owner, scopes)?;
+                        let Some(Type::Function { parameters, result }) =
+                            self.types.get(function.ty.0 as usize)
+                        else {
+                            self.diagnostics.push(Diagnostic::error(
+                                "E2109",
+                                arguments[1].span,
+                                "`Enum.map` requires a named function value",
+                            ));
+                            return None;
+                        };
+                        if parameters.as_slice() != [item] {
+                            let expected = self.intern(Type::Function {
+                                parameters: vec![item],
+                                result: *result,
+                            });
+                            self.type_mismatch(function.span, expected, function.ty);
+                            return None;
+                        }
+                        let result = *result;
+                        prechecked_function = Some(function);
+                        result
+                    }
+                };
+                let function_ty = self.intern(Type::Function {
+                    parameters: if kind == EnumVisitKind::Reduce {
+                        vec![callback_result, item]
+                    } else {
+                        vec![item]
+                    },
+                    result: callback_result,
+                });
+                let function = if let Some(function) = prechecked_function {
+                    function
+                } else {
+                    self.check_expr(
+                        arguments[usize::from(kind == EnumVisitKind::Reduce) + 1],
+                        Some(function_ty),
+                        owner,
+                        scopes,
+                    )?
+                };
+                (
+                    TypedExprKind::EnumVisit {
+                        value: Box::new(first),
+                        initial: initial.map(Box::new),
+                        function: Box::new(function),
+                        kind,
+                    },
+                    match kind {
+                        EnumVisitKind::Filter => self.intern(Type::List(item)),
+                        EnumVisitKind::Map => self.intern(Type::List(callback_result)),
+                        _ => callback_result,
+                    },
+                )
             }
             ("Map.put", Type::Map { key, value }) => {
                 if !self.type_satisfies(key, "Eq", owner)
@@ -3406,11 +4171,13 @@ impl<'a> Checker<'a> {
             | Type::Bits
             | Type::Rune
             | Type::U8
+            | Type::U64
             | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
             }
             Type::Buffer => false,
             Type::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
+            Type::CodepointView | Type::GraphemeView => protocol == "Iterable",
             Type::List(item) => match protocol {
                 "Iterable" | "Concat" => true,
                 "Eq" | "Ord" | "Show" | "Hash" => self.type_satisfies(*item, protocol, owner),
@@ -3470,7 +4237,10 @@ impl<'a> Checker<'a> {
             Type::Buffer => "Buffer".to_owned(),
             Type::Rune => "rune".to_owned(),
             Type::Utf8Error => "String.Utf8Error".to_owned(),
+            Type::CodepointView => "String.CodepointView".to_owned(),
+            Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
+            Type::U64 => "u64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.type_name(*item)),
@@ -3538,7 +4308,10 @@ impl<'a> Checker<'a> {
             Type::Buffer => "00:Buffer".to_owned(),
             Type::Rune => "00:rune".to_owned(),
             Type::Utf8Error => "00:String.Utf8Error".to_owned(),
+            Type::CodepointView => "00:String.CodepointView".to_owned(),
+            Type::GraphemeView => "00:String.GraphemeView".to_owned(),
             Type::U8 => "00:u8".to_owned(),
+            Type::U64 => "00:u64".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
             Type::Array { item, length } => format!("02a:[{};{length}]", self.type_key(*item)),
@@ -3588,6 +4361,36 @@ impl<'a> Checker<'a> {
     }
 }
 
+fn known_bytes_length(expression: &TypedExpr) -> Option<u128> {
+    match &expression.kind {
+        TypedExprKind::StringBytes(value) => match &value.kind {
+            TypedExprKind::String(value) => Some(value.len() as u128),
+            _ => None,
+        },
+        TypedExprKind::BytesFromList(value) => match &value.kind {
+            TypedExprKind::List {
+                elements,
+                tail: None,
+            } => Some(elements.len() as u128),
+            _ => None,
+        },
+        TypedExprKind::Bitstring(segments) => segments.iter().try_fold(0_u128, |total, segment| {
+            let length = match &segment.kind {
+                TypedBitstringSegmentKind::Integer { width, .. } => u128::from(*width / 8),
+                TypedBitstringSegmentKind::Bytes { size: Some(size) } => match size.kind {
+                    TypedExprKind::Integer(size) => size as u128,
+                    _ => return None,
+                },
+                TypedBitstringSegmentKind::Bytes { size: None } => {
+                    known_bytes_length(&segment.value)?
+                }
+            };
+            total.checked_add(length)
+        }),
+        _ => None,
+    }
+}
+
 fn unify_types(
     types: &[Type],
     left: TypeId,
@@ -3616,6 +4419,7 @@ fn unify_types(
         (Type::Rune, Type::Rune) => true,
         (Type::Utf8Error, Type::Utf8Error) => true,
         (Type::U8, Type::U8) => true,
+        (Type::U64, Type::U64) => true,
         (Type::Atom(left), Type::Atom(right)) => left == right,
         (Type::List(left), Type::List(right)) => unify_types(types, *left, *right, substitutions),
         (
@@ -3834,6 +4638,7 @@ enum PatternConstructor {
     ListEmpty,
     ListCons,
     Struct(DeclId),
+    Bitstring(String),
 }
 
 fn pattern_is_useful(
@@ -4004,6 +4809,7 @@ fn shape_constructor(shape: &PatternShape) -> Option<PatternConstructor> {
         PatternShape::ListEmpty => Some(PatternConstructor::ListEmpty),
         PatternShape::ListCons(_, _) => Some(PatternConstructor::ListCons),
         PatternShape::Struct(declaration, _) => Some(PatternConstructor::Struct(*declaration)),
+        PatternShape::Bitstring(shape) => Some(PatternConstructor::Bitstring(shape.clone())),
     }
 }
 
@@ -4013,6 +4819,39 @@ fn shape_components(shape: &PatternShape) -> Vec<(TypeId, PatternShape)> {
         PatternShape::ListCons(head, tail) => vec![(**head).clone(), (**tail).clone()],
         _ => Vec::new(),
     }
+}
+
+fn bitstring_pattern_shape(segments: &[TypedBitstringPatternSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| {
+            let (pattern, _) = verified_pattern_shape(&segment.pattern);
+            match &segment.kind {
+                TypedBitstringPatternSegmentKind::Integer {
+                    signed,
+                    byte_order,
+                    width,
+                } => format!("i:{signed}:{byte_order:?}:{width}:{pattern:?}"),
+                TypedBitstringPatternSegmentKind::Bytes { size } => {
+                    let size = match size {
+                        None => "rest".to_owned(),
+                        Some(size) => match &size.kind {
+                            TypedExprKind::Integer(value) => format!("literal:{value}"),
+                            TypedExprKind::Local(symbol) => format!("local:{}", symbol.0),
+                            _ => format!(
+                                "expr:{}:{}:{}",
+                                size.span.file().as_u32(),
+                                size.span.start(),
+                                size.span.end()
+                            ),
+                        },
+                    };
+                    format!("b:{size}:{pattern:?}")
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn verified_pattern_shape(pattern: &TypedPattern) -> (PatternShape, bool) {
@@ -4063,6 +4902,20 @@ fn verified_pattern_shape(pattern: &TypedPattern) -> (PatternShape, bool) {
                 }
             }
             (PatternShape::Struct(*declaration, shapes), irrefutable)
+        }
+        TypedPatternKind::Bitstring(segments) => {
+            let irrefutable = matches!(segments.as_slice(), [TypedBitstringPatternSegment {
+                pattern,
+                kind: TypedBitstringPatternSegmentKind::Bytes { size: None },
+            }] if verified_pattern_shape(pattern).1);
+            if irrefutable {
+                (PatternShape::Wildcard, true)
+            } else {
+                (
+                    PatternShape::Bitstring(bitstring_pattern_shape(segments)),
+                    false,
+                )
+            }
         }
     }
 }
@@ -4453,6 +5306,14 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
                 collect_expr_locals(element, output);
             }
         }
+        TypedExprKind::Bitstring(segments) => {
+            for segment in segments {
+                collect_expr_locals(&segment.value, output);
+                if let TypedBitstringSegmentKind::Bytes { size: Some(size) } = &segment.kind {
+                    collect_expr_locals(size, output);
+                }
+            }
+        }
         TypedExprKind::Map(entries) => {
             for (key, value) in entries {
                 collect_expr_locals(key, output);
@@ -4486,6 +5347,9 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::SliceCopy(value)
         | TypedExprKind::StringBytes(value)
         | TypedExprKind::StringCodepoints(value)
+        | TypedExprKind::StringCodepointView(value)
+        | TypedExprKind::StringGraphemeView(value)
+        | TypedExprKind::StringLength(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -4495,7 +5359,24 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::BitsToBytes(value)
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
+        | TypedExprKind::EnumToList(value)
         | TypedExprKind::CollectionLength { value, .. } => collect_expr_locals(value, output),
+        TypedExprKind::EnumAt { value, index } => {
+            collect_expr_locals(value, output);
+            collect_expr_locals(index, output);
+        }
+        TypedExprKind::EnumVisit {
+            value,
+            initial,
+            function,
+            ..
+        } => {
+            collect_expr_locals(value, output);
+            if let Some(initial) = initial {
+                collect_expr_locals(initial, output);
+            }
+            collect_expr_locals(function, output);
+        }
         TypedExprKind::BytesSlice {
             value,
             start,
@@ -4541,6 +5422,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         TypedExprKind::Match { subject, arms, .. } => {
             collect_expr_locals(subject, output);
             for arm in arms {
+                collect_pattern_expr_locals(&arm.pattern, output);
                 collect_block_locals(&arm.body, output);
             }
         }
@@ -4558,13 +5440,55 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
                 collect_expr_locals(argument, output);
             }
         }
+        TypedExprKind::IndirectCall { callee, arguments } => {
+            collect_expr_locals(callee, output);
+            for argument in arguments {
+                collect_expr_locals(argument, output);
+            }
+        }
         TypedExprKind::Integer(_)
         | TypedExprKind::Boolean(_)
         | TypedExprKind::Unit
         | TypedExprKind::String(_)
         | TypedExprKind::Rune(_)
+        | TypedExprKind::FunctionRef { .. }
         | TypedExprKind::BufferNew
         | TypedExprKind::Atom(_) => {}
+    }
+}
+
+fn collect_pattern_expr_locals(pattern: &TypedPattern, output: &mut BTreeSet<SymbolId>) {
+    match &pattern.kind {
+        TypedPatternKind::Tuple(elements) => {
+            for element in elements {
+                collect_pattern_expr_locals(element, output);
+            }
+        }
+        TypedPatternKind::ListCons { head, tail } => {
+            collect_pattern_expr_locals(head, output);
+            collect_pattern_expr_locals(tail, output);
+        }
+        TypedPatternKind::Struct { fields, .. } => {
+            for (_, field) in fields {
+                collect_pattern_expr_locals(field, output);
+            }
+        }
+        TypedPatternKind::Bitstring(segments) => {
+            for segment in segments {
+                if let TypedBitstringPatternSegmentKind::Bytes { size: Some(size) } = &segment.kind
+                {
+                    collect_expr_locals(size, output);
+                }
+                collect_pattern_expr_locals(&segment.pattern, output);
+            }
+        }
+        TypedPatternKind::Wildcard
+        | TypedPatternKind::Binding { .. }
+        | TypedPatternKind::Boolean(_)
+        | TypedPatternKind::Integer(_)
+        | TypedPatternKind::Atom(_)
+        | TypedPatternKind::UnionMember { .. }
+        | TypedPatternKind::ListEmpty => {}
     }
 }
 
@@ -4587,7 +5511,7 @@ fn verify_expr(
         TypedExprKind::Integer(_)
             if !matches!(
                 types.get(expression.ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
             ) =>
         {
             errors.push("integer expression has a non-integer type".to_owned());
@@ -4880,6 +5804,95 @@ fn verify_expr(
                 errors.push("string codepoints conversion has incorrect types".to_owned());
             }
         }
+        TypedExprKind::StringCodepointView(value) | TypedExprKind::StringGraphemeView(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let valid = matches!(types.get(value.ty.0 as usize), Some(Type::String))
+                && matches!(
+                    (&expression.kind, types.get(expression.ty.0 as usize)),
+                    (
+                        TypedExprKind::StringCodepointView(_),
+                        Some(Type::CodepointView)
+                    ) | (
+                        TypedExprKind::StringGraphemeView(_),
+                        Some(Type::GraphemeView)
+                    )
+                );
+            if !valid {
+                errors.push("string lazy view has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::StringLength(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::String))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Usize))
+            {
+                errors.push("string grapheme length has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::Bitstring(segments) => {
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::Bytes)) {
+                errors.push("bitstring construction has a non-bytes type".to_owned());
+            }
+            for segment in segments {
+                verify_expr(
+                    &segment.value,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+                match &segment.kind {
+                    TypedBitstringSegmentKind::Integer { width, .. } => {
+                        if !matches!(
+                            types.get(segment.value.ty.0 as usize),
+                            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
+                        ) || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
+                        {
+                            errors.push("integer bitstring segment is invalid".to_owned());
+                        }
+                    }
+                    TypedBitstringSegmentKind::Bytes { size } => {
+                        if !matches!(types.get(segment.value.ty.0 as usize), Some(Type::Bytes)) {
+                            errors.push("bytes bitstring segment has a non-bytes value".to_owned());
+                        }
+                        if let Some(size) = size {
+                            verify_expr(
+                                size,
+                                types,
+                                type_count,
+                                declarations,
+                                symbols,
+                                mutable_symbols,
+                                errors,
+                            );
+                            if !matches!(types.get(size.ty.0 as usize), Some(Type::Usize)) {
+                                errors.push(
+                                    "bytes bitstring segment has a non-usize size".to_owned(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         TypedExprKind::StringFromBytes(value) => {
             verify_expr(
                 value,
@@ -5149,8 +6162,11 @@ fn verify_expr(
                         | Type::Bytes
                         | Type::Bits
                         | Type::Buffer
+                        | Type::List(_)
                         | Type::Slice(_)
-                        | Type::Map { .. },
+                        | Type::Map { .. }
+                        | Type::CodepointView
+                        | Type::GraphemeView,
                     ),
                     None,
                 ) => true,
@@ -5158,6 +6174,173 @@ fn verify_expr(
             };
             if !matches!(types.get(expression.ty.0 as usize), Some(Type::Usize)) || !valid_source {
                 errors.push("collection length has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::EnumAt { value, index } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                index,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let payload = option_payload(types, expression.ty);
+            let valid_item = match (types.get(value.ty.0 as usize), payload) {
+                (
+                    Some(Type::List(item) | Type::Array { item, .. } | Type::Slice(item)),
+                    Some(payload),
+                ) => *item == payload,
+                (Some(Type::Bytes), Some(payload)) => {
+                    matches!(types.get(payload.0 as usize), Some(Type::U8))
+                }
+                (Some(Type::Map { key, value }), Some(payload)) => matches!(
+                    types.get(payload.0 as usize),
+                    Some(Type::Tuple(fields)) if fields.as_slice() == [*key, *value]
+                ),
+                (Some(Type::CodepointView), Some(payload)) => {
+                    matches!(types.get(payload.0 as usize), Some(Type::Rune))
+                }
+                (Some(Type::GraphemeView), Some(payload)) => {
+                    matches!(types.get(payload.0 as usize), Some(Type::String))
+                }
+                _ => false,
+            };
+            if !matches!(types.get(index.ty.0 as usize), Some(Type::Usize)) || !valid_item {
+                errors.push("Enum.at has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::EnumToList(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let source_item = match types.get(value.ty.0 as usize) {
+                Some(Type::Array { item, .. } | Type::Slice(item)) => Some(*item),
+                Some(Type::CodepointView) => types
+                    .iter()
+                    .position(|ty| matches!(ty, Type::Rune))
+                    .map(|index| TypeId(index as u32)),
+                Some(Type::GraphemeView) => types
+                    .iter()
+                    .position(|ty| matches!(ty, Type::String))
+                    .map(|index| TypeId(index as u32)),
+                _ => None,
+            };
+            if !matches!(
+                (source_item, types.get(expression.ty.0 as usize)),
+                (Some(source), Some(Type::List(item))) if source == *item
+            ) {
+                errors.push("Enum.to_list has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::EnumVisit {
+            value,
+            initial,
+            function,
+            kind,
+        } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if let Some(initial) = initial {
+                verify_expr(
+                    initial,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            verify_expr(
+                function,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let item = match types.get(value.ty.0 as usize) {
+                Some(Type::List(item) | Type::Array { item, .. } | Type::Slice(item)) => {
+                    Some(*item)
+                }
+                Some(Type::Bytes) => types
+                    .iter()
+                    .position(|ty| matches!(ty, Type::U8))
+                    .map(|index| TypeId(index as u32)),
+                Some(Type::Map { key, value }) => types
+                    .iter()
+                    .position(|ty| matches!(ty, Type::Tuple(fields) if fields.as_slice() == [*key, *value]))
+                    .map(|index| TypeId(index as u32)),
+                Some(Type::CodepointView) => types.iter().position(|ty| matches!(ty, Type::Rune)).map(|index| TypeId(index as u32)),
+                Some(Type::GraphemeView) => types.iter().position(|ty| matches!(ty, Type::String)).map(|index| TypeId(index as u32)),
+                _ => None,
+            };
+            let valid_result = match kind {
+                EnumVisitKind::Each => {
+                    initial.is_none()
+                        && matches!(types.get(expression.ty.0 as usize), Some(Type::Unit))
+                }
+                EnumVisitKind::Any | EnumVisitKind::All => {
+                    initial.is_none()
+                        && matches!(types.get(expression.ty.0 as usize), Some(Type::Bool))
+                }
+                EnumVisitKind::Reduce => initial
+                    .as_ref()
+                    .is_some_and(|initial| initial.ty == expression.ty),
+                EnumVisitKind::Filter => {
+                    initial.is_none()
+                        && item.is_some_and(|item| {
+                            matches!(types.get(expression.ty.0 as usize), Some(Type::List(result)) if *result == item)
+                        })
+                }
+                EnumVisitKind::Map => {
+                    initial.is_none()
+                        && matches!(types.get(expression.ty.0 as usize), Some(Type::List(_)))
+                }
+            };
+            let valid_function = item.is_some_and(|item| {
+                matches!(
+                    types.get(function.ty.0 as usize),
+                    Some(Type::Function { parameters, result })
+                        if (match kind {
+                                EnumVisitKind::Filter => matches!(types.get(result.0 as usize), Some(Type::Bool)),
+                                EnumVisitKind::Map => matches!(types.get(expression.ty.0 as usize), Some(Type::List(item)) if item == result),
+                                _ => *result == expression.ty,
+                            })
+                            && if *kind == EnumVisitKind::Reduce {
+                                parameters.as_slice() == [expression.ty, item]
+                            } else {
+                                parameters.as_slice() == [item]
+                            }
+                )
+            });
+            if !valid_function || !valid_result {
+                errors.push("Enum visit has incorrect types".to_owned());
             }
         }
         TypedExprKind::Array(elements) => {
@@ -5384,7 +6567,15 @@ fn verify_expr(
                 }
                 matrix.push(vec![shape]);
                 let mut nested_symbols = symbols.clone();
-                verify_pattern(&arm.pattern, types, type_count, &mut nested_symbols, errors);
+                verify_pattern(
+                    &arm.pattern,
+                    types,
+                    type_count,
+                    declarations,
+                    &mut nested_symbols,
+                    mutable_symbols,
+                    errors,
+                );
                 let mut nested_mutable = mutable_symbols.clone();
                 for item in &arm.body.items {
                     verify_item(
@@ -5477,7 +6668,7 @@ fn verify_expr(
             );
             let supported = matches!(
                 types.get(left.ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::Rune)
+                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64 | Type::Rune)
             ) || (!ordered && standard_eq_type(types, left.ty));
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
@@ -5526,6 +6717,52 @@ fn verify_expr(
                 );
             }
         }
+        TypedExprKind::FunctionRef { function, .. } => {
+            if !declarations.contains(function) {
+                errors.push(format!(
+                    "function value references unknown function {function:?}"
+                ));
+            }
+            if !matches!(
+                types.get(expression.ty.0 as usize),
+                Some(Type::Function { .. })
+            ) {
+                errors.push("function value has a non-function type".to_owned());
+            }
+        }
+        TypedExprKind::IndirectCall { callee, arguments } => {
+            verify_expr(
+                callee,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let signature = match types.get(callee.ty.0 as usize) {
+                Some(Type::Function { parameters, result }) => Some((parameters, *result)),
+                _ => None,
+            };
+            for argument in arguments {
+                verify_expr(
+                    argument,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            if !matches!(signature, Some((parameters, result))
+                if parameters.len() == arguments.len()
+                    && parameters.iter().zip(arguments).all(|(expected, argument)| *expected == argument.ty)
+                    && result == expression.ty)
+            {
+                errors.push("indirect call does not match its exact function type".to_owned());
+            }
+        }
         TypedExprKind::UnionInject { member, value } => {
             verify_expr(
                 value,
@@ -5548,6 +6785,25 @@ fn verify_expr(
     }
 }
 
+fn option_payload(types: &[Type], ty: TypeId) -> Option<TypeId> {
+    let Type::Union(members) = types.get(ty.0 as usize)? else {
+        return None;
+    };
+    let has_none = members.iter().any(
+        |member| matches!(types.get(member.0 as usize), Some(Type::Atom(name)) if name == "none"),
+    );
+    let payload = members.iter().find_map(|member| match types.get(member.0 as usize) {
+        Some(Type::Tuple(fields))
+            if fields.len() == 2
+                && matches!(types.get(fields[0].0 as usize), Some(Type::Atom(name)) if name == "some") =>
+        {
+            Some(fields[1])
+        }
+        _ => None,
+    });
+    has_none.then_some(payload).flatten()
+}
+
 fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
     match types.get(ty.0 as usize) {
         Some(
@@ -5562,6 +6818,7 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Rune
             | Type::Utf8Error
             | Type::U8
+            | Type::U64
             | Type::Atom(_),
         ) => true,
         Some(Type::Buffer) => false,
@@ -5617,7 +6874,9 @@ fn verify_pattern(
     pattern: &TypedPattern,
     types: &[Type],
     type_count: u32,
+    declarations: &BTreeSet<DeclId>,
     symbols: &mut BTreeMap<SymbolId, TypeId>,
+    mutable_symbols: &BTreeSet<SymbolId>,
     errors: &mut Vec<String>,
 ) {
     if pattern.ty.0 >= type_count {
@@ -5652,7 +6911,15 @@ fn verify_pattern(
                 errors.push("tuple pattern has an incorrect type or arity".to_owned());
             }
             for child in elements {
-                verify_pattern(child, types, type_count, symbols, errors);
+                verify_pattern(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
             }
         }
         TypedPatternKind::ListEmpty => {
@@ -5665,8 +6932,24 @@ fn verify_pattern(
             {
                 errors.push("list pattern components have incorrect types".to_owned());
             }
-            verify_pattern(head, types, type_count, symbols, errors);
-            verify_pattern(tail, types, type_count, symbols, errors);
+            verify_pattern(
+                head,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_pattern(
+                tail,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
         }
         TypedPatternKind::Struct {
             declaration,
@@ -5682,7 +6965,62 @@ fn verify_pattern(
                 if *index >= *field_count || !seen.insert(*index) {
                     errors.push("struct pattern has an invalid field index".to_owned());
                 }
-                verify_pattern(child, types, type_count, symbols, errors);
+                verify_pattern(
+                    child,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+        }
+        TypedPatternKind::Bitstring(segments) => {
+            if !matches!(types.get(pattern.ty.0 as usize), Some(Type::Bytes)) {
+                errors.push("bitstring pattern has a non-bytes type".to_owned());
+            }
+            for segment in segments {
+                match &segment.kind {
+                    TypedBitstringPatternSegmentKind::Integer { signed, width, .. } => {
+                        let valid_ty = if *signed {
+                            matches!(types.get(segment.pattern.ty.0 as usize), Some(Type::I64))
+                        } else {
+                            matches!(types.get(segment.pattern.ty.0 as usize), Some(Type::U64))
+                        };
+                        if !valid_ty || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64) {
+                            errors.push("integer bitstring pattern segment is invalid".to_owned());
+                        }
+                    }
+                    TypedBitstringPatternSegmentKind::Bytes { size } => {
+                        if !matches!(types.get(segment.pattern.ty.0 as usize), Some(Type::Bytes)) {
+                            errors.push("bytes bitstring pattern segment is invalid".to_owned());
+                        }
+                        if let Some(size) = size {
+                            verify_expr(
+                                size,
+                                types,
+                                type_count,
+                                declarations,
+                                symbols,
+                                mutable_symbols,
+                                errors,
+                            );
+                            if !matches!(types.get(size.ty.0 as usize), Some(Type::Usize)) {
+                                errors.push("bitstring pattern size is not usize".to_owned());
+                            }
+                        }
+                    }
+                }
+                verify_pattern(
+                    &segment.pattern,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
             }
         }
         TypedPatternKind::Wildcard
@@ -5729,7 +7067,10 @@ impl TypedProgram {
             Type::Buffer => "Buffer".to_owned(),
             Type::Rune => "rune".to_owned(),
             Type::Utf8Error => "String.Utf8Error".to_owned(),
+            Type::CodepointView => "String.CodepointView".to_owned(),
+            Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
+            Type::U64 => "u64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.display_type(*item)),
@@ -5888,6 +7229,10 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::SliceCopy(_) => "slice copy".to_owned(),
         TypedExprKind::StringBytes(_) => "string bytes".to_owned(),
         TypedExprKind::StringCodepoints(_) => "string codepoints".to_owned(),
+        TypedExprKind::StringCodepointView(_) => "string codepoint view".to_owned(),
+        TypedExprKind::StringGraphemeView(_) => "string grapheme view".to_owned(),
+        TypedExprKind::StringLength(_) => "string grapheme length".to_owned(),
+        TypedExprKind::Bitstring(_) => "bitstring".to_owned(),
         TypedExprKind::StringFromBytes(_) => "string from bytes".to_owned(),
         TypedExprKind::Utf8ErrorOffset(_) => "UTF-8 error offset".to_owned(),
         TypedExprKind::RuneToString(_) => "rune to string".to_owned(),
@@ -5902,10 +7247,29 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::BytesToList(_) => "bytes to list".to_owned(),
         TypedExprKind::BytesSlice { .. } => "bytes slice".to_owned(),
         TypedExprKind::CollectionLength { .. } => "collection length".to_owned(),
+        TypedExprKind::EnumAt { .. } => "enum at".to_owned(),
+        TypedExprKind::EnumToList(_) => "enum to list".to_owned(),
+        TypedExprKind::EnumVisit { kind, .. } => format!("enum {kind:?}"),
         TypedExprKind::If { .. } => "if".to_owned(),
         TypedExprKind::Match { exhaustive, .. } => format!("match exhaustive={exhaustive}"),
         TypedExprKind::Ascription(_) => "ascription".to_owned(),
         TypedExprKind::Local(symbol) => format!("local s{}", symbol.0),
+        TypedExprKind::FunctionRef {
+            function,
+            substitutions,
+        } => format!(
+            "function d{} [{}]",
+            function.0,
+            substitutions
+                .iter()
+                .map(|(from, to)| format!(
+                    "{}={}",
+                    program.display_type(*from),
+                    program.display_type(*to)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         TypedExprKind::Binary { operator, .. } => format!("binary {operator:?}"),
         TypedExprKind::Comparison { operator, .. } => format!("comparison {operator:?}"),
         TypedExprKind::Logical { operator, .. } => format!("logical {operator:?}"),
@@ -5926,6 +7290,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        TypedExprKind::IndirectCall { .. } => "indirect call".to_owned(),
         TypedExprKind::UnionInject { member, .. } => {
             format!("inject {}", program.display_type(*member))
         }
@@ -5962,6 +7327,14 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
                 write_expr(program, output, value, depth + 1);
             }
         }
+        TypedExprKind::Bitstring(segments) => {
+            for segment in segments {
+                write_expr(program, output, &segment.value, depth + 1);
+                if let TypedBitstringSegmentKind::Bytes { size: Some(size) } = &segment.kind {
+                    write_expr(program, output, size, depth + 1);
+                }
+            }
+        }
         TypedExprKind::StructProject { value, .. } => {
             write_expr(program, output, value, depth + 1);
         }
@@ -5973,6 +7346,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::SliceCopy(value)
         | TypedExprKind::StringBytes(value)
         | TypedExprKind::StringCodepoints(value)
+        | TypedExprKind::StringLength(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -5982,8 +7356,25 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::BitsToBytes(value)
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
+        | TypedExprKind::EnumToList(value)
         | TypedExprKind::CollectionLength { value, .. } => {
             write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::EnumAt { value, index } => {
+            write_expr(program, output, value, depth + 1);
+            write_expr(program, output, index, depth + 1);
+        }
+        TypedExprKind::EnumVisit {
+            value,
+            initial,
+            function,
+            ..
+        } => {
+            write_expr(program, output, value, depth + 1);
+            if let Some(initial) = initial {
+                write_expr(program, output, initial, depth + 1);
+            }
+            write_expr(program, output, function, depth + 1);
         }
         TypedExprKind::BufferAppend { buffer, value, .. } => {
             write_expr(program, output, buffer, depth + 1);
@@ -6068,6 +7459,12 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
             write_expr(program, output, value, depth + 1);
         }
         TypedExprKind::Call { arguments, .. } => {
+            for argument in arguments {
+                write_expr(program, output, argument, depth + 1);
+            }
+        }
+        TypedExprKind::IndirectCall { callee, arguments } => {
+            write_expr(program, output, callee, depth + 1);
             for argument in arguments {
                 write_expr(program, output, argument, depth + 1);
             }

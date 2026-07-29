@@ -410,6 +410,30 @@ fn descendants(pair: Pair<'_, Rule>) -> impl Iterator<Item = Pair<'_, Rule>> {
 fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
     let mut span = pair_span(file, &pair);
     let rule = pair.as_rule();
+    if rule == Rule::pattern_literal {
+        let mut parts = pair.clone().into_inner();
+        if parts
+            .next()
+            .is_some_and(|part| part.as_rule() == Rule::unary_minus)
+        {
+            let literal = parts.next().expect("negative pattern has a literal");
+            let mut node = build_node(file, literal)?;
+            if let Some(Value::Integer {
+                spelling, digits, ..
+            }) = &mut node.value
+            {
+                spelling.insert(0, '-');
+                digits.insert(0, '-');
+                node.span = span;
+                return Ok(Node {
+                    kind: SyntaxKind::new("pattern_literal"),
+                    span,
+                    value: None,
+                    children: vec![node],
+                });
+            }
+        }
+    }
     if is_left_associative(rule) && pair.clone().into_inner().count() > 1 {
         return build_left_associative(file, pair);
     }
@@ -652,6 +676,7 @@ fn is_transparent(rule: Rule) -> bool {
             | Rule::block_item
             | Rule::expression
             | Rule::pipeline_expr
+            | Rule::segment_expression
             | Rule::ascription_expr
             | Rule::logical_or_expr
             | Rule::logical_and_expr

@@ -1027,12 +1027,15 @@ fn parse_type(
                     span: node.span,
                 });
             }
-            if matches!(written.as_str(), "Buffer" | "String.Utf8Error") {
+            if matches!(
+                written.as_str(),
+                "Buffer" | "String.Utf8Error" | "String.CodepointView" | "String.GraphemeView"
+            ) {
                 if node.children.len() != 1 {
                     diagnostics.push(Diagnostic::error(
                         "E2007",
                         node.span,
-                        "type `String.Utf8Error` expects 0 arguments",
+                        format!("type `{written}` expects 0 arguments"),
                     ));
                     return None;
                 }

@@ -51,8 +51,10 @@ impl TargetMetadata {
     #[must_use]
     pub fn reproducibility_text(&self) -> String {
         format!(
-            "llvm_target_triple = \"{}\"\npointer_width = {}\n",
-            self.llvm_target_triple, self.pointer_width
+            "llvm_target_triple = \"{}\"\npointer_width = {}\nunicode_version = \"{}\"\n",
+            self.llvm_target_triple,
+            self.pointer_width,
+            el_runtime::UNICODE_VERSION
         )
     }
 
@@ -133,7 +135,7 @@ mod tests {
         assert_eq!(metadata.pointer_width(), 64);
         assert_eq!(
             metadata.reproducibility_text(),
-            "llvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\n"
+            "llvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\nunicode_version = \"17.0.0\"\n"
         );
         assert_eq!(
             metadata.to_string(),

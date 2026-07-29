@@ -221,6 +221,117 @@ fn build_managed_executable(
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn named_function_values_call_indirectly_in_both_gc_stress_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def retain(text: string) -> string do\n    Rune.to_string('🙂')\n    text\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def apply(function: (string) -> string, value: string) -> string do\n    function(value)\n  end\n  def main() -> i32 do\n    first: (string) -> string = retain\n    second: (string) -> string = identity\n    text = apply(second, apply(first, \"é🙂\"))\n    if String.byte_size(text) == 7 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-function-values"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "indirect calls must preserve managed arguments in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn enum_count_at_and_to_list_preserve_order_and_managed_items() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def list_at(values: [string]) -> bool do\n    match Enum.at(values, 1) do\n      some: {:some, string} -> match some do\n        {:some, value} -> value == \"bb\"\n      end\n      _ -> false\n    end\n  end\n  def array_missing(values: [string; 2]) -> bool do\n    match Enum.at(values, 2) do\n      some: {:some, string} -> false\n      _ -> true\n    end\n  end\n  def slice_at(values: Slice(string)) -> bool do\n    match Enum.at(values, 0) do\n      some: {:some, string} -> match some do\n        {:some, value} -> value == \"a\"\n      end\n      _ -> false\n    end\n  end\n  def byte_at(values: bytes) -> bool do\n    match Enum.at(values, 1) do\n      some: {:some, u8} -> match some do\n        {:some, value} -> value == 66\n      end\n      _ -> false\n    end\n  end\n  def map_at(values: Map(i32, i32)) -> bool do\n    match Enum.at(values, 0) do\n      some: {:some, {i32, i32}} -> match some do\n        {:some, {key, value}} -> key == 1 and value == 50\n      end\n      _ -> false\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\"]\n    array: [string; 2] = #[\"a\", \"bb\"]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, i32) = %{1 => 50, 2 => 60}\n    list_copy = Enum.to_list(list)\n    array_list = Enum.to_list(array)\n    slice_list = Enum.to_list(slice)\n    byte_list = Enum.to_list(data)\n    map_list = Enum.to_list(map)\n    Rune.to_string('🙂')\n    if Enum.count(list) == 2 and Enum.count(array) == 2 and Enum.count(slice) == 2 and Enum.count(data) == 2 and Enum.count(map) == 2 and list_at(list) and array_missing(array) and slice_at(slice) and byte_at(data) and map_at(map) and list_copy == [\"a\", \"bb\"] and array_list == [\"a\", \"bb\"] and slice_list == [\"a\", \"bb\"] and byte_list == [65, 66] and map_list == [{1, 50}, {2, 60}] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(&temp.0, &format!("{label}-enum-traversal"), source, profile,)
+                .code(),
+            Some(42),
+            "Enum traversal must preserve order, absence, and managed items in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn enum_each_any_and_all_short_circuit_and_root_managed_items() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def retain(value: string) -> unit do\n    Rune.to_string('🙂')\n    String.byte_size(value)\n    unit\n  end\n  def any_first(value: i32) -> bool do\n    if value == 1 do\n      true\n    else\n      1 / 0 == 0\n    end\n  end\n  def all_first_false(value: i32) -> bool do\n    if value == 0 do\n      false\n    else\n      1 / 0 == 0\n    end\n  end\n  def byte_a(value: u8) -> bool do\n    if value == 65 do\n      true\n    else\n      1 / 0 == 0\n    end\n  end\n  def pair_positive(value: {i32, string}) -> bool do\n    match value do\n      {key, text} -> key > 0 and String.byte_size(text) > 0\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    false_first: [i32; 2] = #[0, 1]\n    slice = Slice.from_array(false_first)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    Enum.each(list, retain)\n    if Enum.any(array, any_first) and Enum.all(slice, all_first_false) == false and Enum.any(data, byte_a) and Enum.all(map, pair_positive) and Enum.any(empty, any_first) == false and Enum.all(empty, any_first) do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(&temp.0, &format!("{label}-enum-visits"), source, profile).code(),
+            Some(42),
+            "Enum visitors must preserve roots, empty identities, and short-circuit in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn enum_reduce_is_strict_left_to_right_and_roots_the_accumulator() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def ordered(total: i32, value: i32) -> i32 do\n    if total == 0 and value == 1 do\n      1\n    else\n      if total == 1 and value == 2 do\n        42\n      else\n        1 / 0\n      end\n    end\n  end\n  def ordered_byte(total: i32, value: u8) -> i32 do\n    if total == 0 and value == 65 do\n      1\n    else\n      if total == 1 and value == 66 do\n        42\n      else\n        1 / 0\n      end\n    end\n  end\n  def ordered_pair(total: i32, value: {i32, string}) -> i32 do\n    match value do\n      {key, _} -> ordered(total, key)\n    end\n  end\n  def last(previous: string, value: string) -> string do\n    Rune.to_string('🙂')\n    value\n  end\n  def main() -> i32 do\n    strings: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    final = Enum.reduce(strings, \"initial\", last)\n    if final == \"bb\" and Enum.reduce(array, 0 :: i32, ordered) == 42 and Enum.reduce(slice, 0 :: i32, ordered) == 42 and Enum.reduce(data, 0 :: i32, ordered_byte) == 42 and Enum.reduce(map, 0 :: i32, ordered_pair) == 42 and Enum.reduce(empty, 42 :: i32, ordered) == 42 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(&temp.0, &format!("{label}-enum-reduce"), source, profile).code(),
+            Some(42),
+            "Enum.reduce must preserve order and managed accumulators in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn enum_filter_preserves_order_and_managed_items() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def keep_text(value: string) -> bool do\n    Rune.to_string('🙂')\n    String.byte_size(value) > 1\n  end\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def byte_a(value: u8) -> bool do\n    value == 65\n  end\n  def positive_pair(value: {i32, string}) -> bool do\n    match value do\n      {key, _} -> key > 0\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\", \"ccc\"]\n    array: [i32; 3] = #[1, 0, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"ABA\")\n    map: Map(i32, string) = %{1 => \"one\", 0 => \"zero\", 2 => \"two\"}\n    if Enum.filter(list, keep_text) == [\"bb\", \"ccc\"] and Enum.filter(array, positive) == [1, 2] and Enum.filter(slice, positive) == [1, 2] and Enum.filter(data, byte_a) == [65, 65] and Enum.filter(map, positive_pair) == [{1, \"one\"}, {2, \"two\"}] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(&temp.0, &format!("{label}-enum-filter"), source, profile).code(),
+            Some(42)
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn enum_map_preserves_order_and_roots_managed_results() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def keep_text(value: string) -> string do\n    Rune.to_string('🙂')\n    value\n  end\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def byte_a(value: u8) -> bool do\n    value == 65\n  end\n  def pair_key(value: {i32, string}) -> i32 do\n    match value do\n      {key, _} -> key\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\", \"ccc\"]\n    array: [i32; 3] = #[1, 0, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"ABA\")\n    map: Map(i32, string) = %{1 => \"one\", 0 => \"zero\", 2 => \"two\"}\n    empty: [i32] = []\n    if Enum.map(list, keep_text) == [\"a\", \"bb\", \"ccc\"] and Enum.map(array, positive) == [true, false, true] and Enum.map(slice, positive) == [true, false, true] and Enum.map(data, byte_a) == [true, false, true] and Enum.map(map, pair_key) == [1, 0, 2] and Enum.map(empty, positive) == [] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(&temp.0, &format!("{label}-enum-map"), source, profile).code(),
+            Some(42)
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn managed_lists_survive_every_allocation_collection_in_all_root_positions() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  @type Held = [i32] | :none\n  def build(count: i32, tail: [i32]) -> [i32] do\n    if count == 0 do\n      tail\n    else\n      build(count - 1, [count | tail])\n    end\n  end\n  def length(values: [i32], count: i32) -> i32 do\n    match values do\n      [] -> count\n      [_ | tail] -> length(tail, count + 1)\n    end\n  end\n  def observe(values: [i32]) -> unit do\n    match values do\n      [] -> unit\n      [_ | _] -> unit\n    end\n  end\n  def preserve(values: [i32]) -> [i32] do\n    mut held: [i32] = values\n    defer do\n      observe(held)\n    end\n    if true do\n      defer observe(held)\n      held\n    else\n      []\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      temporary: [i32] = [1, 2, 3, 4, 5, 6, 7, 8]\n      observe(temporary)\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    graph: [i32] = preserve(build(42, []))\n    held: Held = graph\n    pressure(512)\n    match held do\n      values: [i32] -> length(values, 0)\n      _ -> 0\n    end\n  end\nend\n";
@@ -341,6 +452,75 @@ fn string_codepoints_decode_eagerly_in_order_under_gc_stress() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn string_length_uses_unicode_17_extended_graphemes() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def main() -> i32 do\n    if String.length(\"\") == 0 and String.length(\"A\") == 1 and String.length(\"é\") == 1 and String.length(\"🇸🇬\") == 1 and String.length(\"👩‍👩‍👧‍👦\") == 1 and String.length(\"Aé🇸🇬👩‍👩‍👧‍👦\") == 4 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-string-grapheme-length"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "String.length must use pinned grapheme boundaries in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn eager_graphemes_and_lazy_text_views_retain_source_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def is_smile(value: rune) -> bool do\n    value == '🙂'\n  end\n  def is_flag(value: string) -> bool do\n    value == \"🇸🇬\"\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.graphemes(\"Aé🇸🇬👩‍👩‍👧‍👦\")\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    graphemes = String.graphemes(\"Aé🇸🇬👩‍👩‍👧‍👦\")\n    codepoints = Enum.to_list(String.codepoint_view(\"Aé🙂\"))\n    lazy_graphemes = Enum.to_list(String.grapheme_view(\"Aé🇸🇬👩‍👩‍👧‍👦\"))\n    empty_codepoints = Enum.to_list(String.codepoint_view(\"\"))\n    empty_graphemes = Enum.to_list(String.grapheme_view(\"\"))\n    pressure(256)\n    if graphemes == [\"A\", \"é\", \"🇸🇬\", \"👩‍👩‍👧‍👦\"] and lazy_graphemes == graphemes and codepoints == ['A', 'e', '́', '🙂'] and empty_codepoints == [] and empty_graphemes == [] and Enum.count(String.codepoint_view(\"Aé🙂\")) == 4 and Enum.count(String.grapheme_view(\"Aé🇸🇬👩‍👩‍👧‍👦\")) == 4 and Enum.any(String.codepoint_view(\"A🙂\"), is_smile) and Enum.any(String.grapheme_view(\"é🇸🇬\"), is_flag) do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-string-lazy-views-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "eager graphemes and lazy views must preserve boundaries and roots in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn lazy_text_views_retain_allocated_string_backing() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      Rune.to_string('A')\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    text = Rune.to_string('🙂')\n    codepoints = Enum.to_list(String.codepoint_view(text))\n    graphemes = Enum.to_list(String.grapheme_view(text))\n    pressure(256)\n    if codepoints == ['🙂'] and graphemes == [\"🙂\"] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-allocated-string-lazy-views"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "lazy views must retain allocated string backing in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn string_from_bytes_validates_utf8_and_reports_first_invalid_offsets() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def valid_payload(value: {:ok, string}) -> string do\n    match value do\n      {:ok, text} -> text\n    end\n  end\n  def error_payload(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def decode(data: bytes) -> string do\n    match String.from_bytes(data) do\n      value: {:ok, string} -> valid_payload(value)\n      _ -> \"\"\n    end\n  end\n  def error_offset(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.from_bytes(Bytes.from_list([65, 195, 169]))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    source = Bytes.from_list([101, 204, 129, 240, 159, 153, 130])\n    text = decode(source)\n    pressure(256)\n    if String.byte_size(text) == 7 and String.bytes(text)[0] == 101 and error_offset(Bytes.from_list([97, 128])) == 1 and error_offset(Bytes.from_list([97, 194])) == 1 and error_offset(Bytes.from_list([224, 128, 128])) == 0 and error_offset(Bytes.from_list([237, 160, 128])) == 0 and error_offset(Bytes.from_list([244, 144, 128, 128])) == 0 and error_offset(Bytes.from_list([240, 159, 65, 130])) == 0 do\n      42\n    else\n      0\n    end\n  end\nend\n";
@@ -428,6 +608,118 @@ fn arbitrary_bit_views_pack_msb_first_and_preserve_backing() {
             .code(),
             Some(0),
             "bit indexing must fail out of bounds in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn byte_aligned_bitstring_construction_preserves_order_and_checks_sizes() {
+    let temp = TempDir::new();
+    let mut expected = vec![
+        0x12, 0x12, 0x34, 0x34, 0x12, 0x12, 0x34, 0x56, 0x12, 0x34, 0x56, 0x78, 0x01, 0x02, 0x03,
+        0x04, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xff, 0xfe,
+    ];
+    if cfg!(target_endian = "little") {
+        expected.extend([0x02, 0x01]);
+    } else {
+        expected.extend([0x01, 0x02]);
+    }
+    expected.extend([0xaa, 0xbb]);
+    let byte_checks = expected
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| format!("built[{index}] == {byte}"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let source = format!(
+        "defmodule Main do\n  def packet(data: bytes) -> bytes do\n    <<0x12::unsigned-big-size(8), 0x1234::unsigned-big-size(16), 0x1234::unsigned-little-size(16), 0x123456::unsigned-big-size(24), 0x12345678::unsigned-big-size(32), 0x0102030405::unsigned-big-size(40), 0x010203040506::unsigned-big-size(48), 0x01020304050607::unsigned-big-size(56), 0x0102030405060708::unsigned-big-size(64), 0 - 2::signed-big-size(16), 0x0102::unsigned-native-size(16), data::bytes>>\n  end\n  def main() -> i32 do\n    built = packet(Bytes.from_list([170, 187]))\n    empty = <<>>\n    if Bytes.byte_size(built) == {} and {byte_checks} and Bytes.byte_size(empty) == 0 do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        expected.len()
+    );
+    let size_mismatch = "defmodule Main do\n  def build(data: bytes, size: usize) -> bytes do\n    <<data::bytes-size(size)>>\n  end\n  def main() -> i32 do\n    build(Bytes.from_list([1]), 2)\n    0\n  end\nend\n";
+    let integer_mismatch = "defmodule Main do\n  def build(value: i32) -> bytes do\n    <<value::unsigned-big-size(8)>>\n  end\n  def main() -> i32 do\n    build(256)\n    0\n  end\nend\n";
+    let signed_integer_mismatch = "defmodule Main do\n  def build(value: i32) -> bytes do\n    <<value::signed-big-size(16)>>\n  end\n  def main() -> i32 do\n    build(32768)\n    0\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-bitstring-construction"),
+                &source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "bitstring construction must preserve exact bytes in {label}"
+        );
+        for (case, failing_source) in [
+            ("size", size_mismatch),
+            ("integer", integer_mismatch),
+            ("signed-integer", signed_integer_mismatch),
+        ] {
+            assert_eq!(
+                build_and_run_managed(
+                    &temp.0,
+                    &format!("{label}-bitstring-{case}-mismatch"),
+                    failing_source,
+                    profile,
+                )
+                .code(),
+                Some(1),
+                "bitstring {case} mismatch must fail in {label}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn byte_aligned_bitstring_patterns_decode_capture_and_fail_normally() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def parse(packet: bytes, size: usize) -> i32 do\n    match packet do\n      <<18::unsigned-big-size(8), signed::signed-little-size(16), prefix::bytes-size(size), rest::bytes-size(Bytes.byte_size(prefix))>> ->\n        pressure = Bytes.to_list(rest)\n        if signed == 513 and prefix[0] == 170 and prefix[1] == 187 and rest[0] == 204 and rest[1] == 221 do\n          match pressure do\n            [204 | [221 | []]] -> 42\n            _ -> 1\n          end\n        else\n          2\n        end\n      _ -> 0\n    end\n  end\n  def tail_size(packet: bytes) -> usize do\n    match packet do\n      <<7::unsigned-big-size(8), tail::bytes>> -> Bytes.byte_size(tail)\n      _ -> 99\n    end\n  end\n  def is_empty(packet: bytes) -> i32 do\n    match packet do\n      <<>> -> 1\n      _ -> 0\n    end\n  end\n  def signed_negative(packet: bytes) -> i32 do\n    match packet do\n      <<-2::signed-big-size(16)>> -> 1\n      _ -> 0\n    end\n  end\n  def unsigned_max(packet: bytes) -> i32 do\n    match packet do\n      <<value::unsigned-big-size(64)>> -> if value == 0xffffffffffffffff do\n        1\n      else\n        0\n      end\n      _ -> 0\n    end\n  end\n  def native_roundtrip(packet: bytes) -> i32 do\n    match packet do\n      <<value::unsigned-native-size(16)>> -> if value == 0x1234 do\n        1\n      else\n        0\n      end\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n    valid = <<18::unsigned-big-size(8), 513::signed-little-size(16), Bytes.from_list([170, 187])::bytes, Bytes.from_list([204, 221])::bytes>>\n    literal_mismatch = <<19::unsigned-big-size(8), 513::signed-little-size(16), Bytes.from_list([170, 187, 204, 221])::bytes>>\n    short = Bytes.from_list([18, 1, 2, 170, 187, 204])\n    leftover = Bytes.from_list([18, 1, 2, 170, 187, 204, 221, 238])\n    negative = <<0 - 2::signed-big-size(16)>>\n    if parse(valid, 2) == 42 and parse(literal_mismatch, 2) == 0 and parse(short, 2) == 0 and parse(leftover, 2) == 0 and tail_size(Bytes.from_list([7, 1, 2, 3])) == 3 and is_empty(<<>>) == 1 and is_empty(Bytes.from_list([1])) == 0 and signed_negative(negative) == 1 and unsigned_max(Bytes.from_list([255, 255, 255, 255, 255, 255, 255, 255])) == 1 and native_roundtrip(<<0x1234::unsigned-native-size(16)>>) == 1 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-bitstring-patterns"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "bitstring patterns must decode and fail normally in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn bitstring_patterns_decode_every_v1_integer_width_and_byte_order() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def decode(packet: bytes) -> i32 do\n    match packet do\n      <<a::unsigned-big-size(8), b::unsigned-big-size(24), c::unsigned-big-size(32), d::unsigned-big-size(40), e::unsigned-big-size(48), f::unsigned-big-size(56), g::unsigned-big-size(64), h::unsigned-little-size(24)>> -> if a == 0x12 and b == 0x123456 and c == 0x12345678 and d == 0x0102030405 and e == 0x010203040506 and f == 0x01020304050607 and g == 0x0102030405060708 and h == 0x123456 do\n        42\n      else\n        1\n      end\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n    decode(<<0x12::unsigned-big-size(8), 0x123456::unsigned-big-size(24), 0x12345678::unsigned-big-size(32), 0x0102030405::unsigned-big-size(40), 0x010203040506::unsigned-big-size(48), 0x01020304050607::unsigned-big-size(56), 0x0102030405060708::unsigned-big-size(64), 0x123456::unsigned-little-size(24)>>)\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-bitstring-pattern-widths"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "bitstring patterns must decode every width and byte order in {label}"
         );
     }
 }

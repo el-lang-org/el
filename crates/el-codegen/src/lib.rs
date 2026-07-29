@@ -169,20 +169,23 @@ pub fn compute_primitive_layouts(module: &ConcreteModule, abi: PrimitiveAbi) -> 
             Type::Rune => Some(abi.i32),
             Type::Utf8Error => Some(abi.usize),
             Type::I64 => Some(abi.i64),
+            Type::U64 => Some(abi.i64),
             Type::Usize => Some(abi.usize),
+            Type::Function { .. } => Some(abi.usize),
             Type::Bool => Some(abi.boolean),
             Type::Unit => Some(abi.unit),
             Type::String
             | Type::Bytes
             | Type::Bits
             | Type::Buffer
+            | Type::CodepointView
+            | Type::GraphemeView
             | Type::Atom(_)
             | Type::List(_)
             | Type::Array { .. }
             | Type::Slice(_)
             | Type::Map { .. }
             | Type::Tuple(_)
-            | Type::Function { .. }
             | Type::Struct { .. }
             | Type::Parameter { .. }
             | Type::Union(_) => None,

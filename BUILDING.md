@@ -96,3 +96,16 @@ requests a full collection; it is a compiler/runtime conformance mode, not an EL
 source option. `allocation-failure-test` is a separate conformance build that
 forces managed allocation failure; do not combine it with `gc-stress-test`.
 Passing these commands alone does not make Darwin arm64 a supported EL target.
+
+## Unicode data regeneration
+
+Unicode 17.0.0 source data and the official grapheme conformance corpus are
+checked in under `runtime/unicode/17.0.0`. Regenerate the deterministic private C
+range tables and conformance fixture after verifying those pinned inputs with:
+
+```sh
+python3 tools/generate_unicode_grapheme_tables.py
+```
+
+Normal builds consume the checked-in generated files and do not require Python,
+network access, a host Unicode library, or locale data.

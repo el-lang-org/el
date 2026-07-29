@@ -1,5 +1,5 @@
 use el_parser::parse;
-use el_resolve::resolve;
+use el_resolve::{resolve, resolve_package};
 use el_span::SourceMap;
 use el_types::{Type, TypeId, TypedExprKind, check, verify};
 
@@ -11,6 +11,20 @@ fn checked(source: &str) -> Result<el_types::TypedProgram, Vec<el_span::Diagnost
     check(&resolved)
 }
 
+fn checked_package(sources: &[&str]) -> Result<el_types::TypedProgram, Vec<el_span::Diagnostic>> {
+    let mut source_map = SourceMap::new();
+    let parsed = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let file = source_map.add_file(format!("src/{index}.el"), *source);
+            parse(file, source).expect("fixture parses")
+        })
+        .collect::<Vec<_>>();
+    let resolved = resolve_package(&parsed).expect("fixture resolves");
+    el_types::check_package(&resolved)
+}
+
 #[test]
 fn checks_bindings_mutation_calls_returns_and_generic_inference() {
     let source = "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    mut answer: i32 = identity(40)\n    answer := answer + 2\n    answer\n  end\nend\n";
@@ -20,6 +34,55 @@ fn checks_bindings_mutation_calls_returns_and_generic_inference() {
     assert_eq!(typed.functions[1].result, TypeId(0));
     assert!(typed.debug_tree().contains("call d0 [a=i32]: i32"));
     assert!(typed.debug_tree().contains("assign s1"));
+}
+
+#[test]
+fn checks_exact_named_function_values_and_indirect_calls() {
+    let source = "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  defp increment(value: i32) -> i32 do\n    value + 1\n  end\n  def private_value() -> (i32) -> i32 do\n    increment\n  end\n  def apply(function: (i32) -> i32, value: i32) -> i32 do\n    function(value)\n  end\n  def main() -> i32 do\n    chosen: (i32) -> i32 = identity\n    apply(chosen, private_value()(41)) - 41\n  end\nend\n";
+
+    let typed = checked(source).expect("named function values type check");
+    let debug = typed.debug_tree();
+    assert!(
+        debug.contains("function d0 [a=i32]: (i32) -> i32"),
+        "{debug}"
+    );
+    assert!(debug.contains("function d1 []: (i32) -> i32"), "{debug}");
+    assert!(debug.contains("indirect call: i32"), "{debug}");
+    verify(&typed).expect("function-value Typed AST verifies");
+}
+
+#[test]
+fn rejects_ambiguous_or_inexact_function_values() {
+    let ambiguous = "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def value() -> unit do\n    identity\n    unit\n  end\nend\n";
+    assert!(
+        checked(ambiguous)
+            .expect_err("generic function values require a concrete expected type")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2112")
+    );
+
+    let inexact = "defmodule Main do\n  def convert(value: i64) -> i64 do\n    value\n  end\n  def main() -> i32 do\n    function: (i32) -> i32 = convert\n    function(1)\n  end\nend\n";
+    assert!(
+        checked(inexact)
+            .expect_err("function parameter and result types are exact")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2113")
+    );
+}
+
+#[test]
+fn function_value_visibility_is_checked_when_named_not_when_called() {
+    let secrets = "defmodule Secrets do\n  defp hidden(value: i32) -> i32 do\n    value + 1\n  end\n  def expose() -> (i32) -> i32 do\n    hidden\n  end\nend\n";
+    let main = "defmodule Main do\n  def main() -> i32 do\n    Secrets.expose()(41)\n  end\nend\n";
+    checked_package(&[secrets, main]).expect("a returned private function value remains callable");
+
+    let invalid = "defmodule Main do\n  def main() -> i32 do\n    function: (i32) -> i32 = Secrets.hidden\n    function(41)\n  end\nend\n";
+    assert!(
+        checked_package(&[secrets, invalid])
+            .expect_err("external source cannot directly name a private function")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2138")
+    );
 }
 
 #[test]
@@ -440,6 +503,99 @@ fn checks_list_reverse_and_expected_empty_list_inference() {
 }
 
 #[test]
+fn checks_enum_count_at_and_to_list_for_standard_iterables() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    list: [i32] = [10, 20]\n    array: [i32; 2] = #[30, 40]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    Enum.count(list)\n    Enum.count(array)\n    Enum.count(slice)\n    Enum.count(data)\n    Enum.count(map)\n    Enum.at(list, 1)\n    Enum.at(array, 2)\n    Enum.at(slice, 0)\n    Enum.at(data, 1)\n    Enum.at(map, 0)\n    Enum.to_list(list)\n    Enum.to_list(array)\n    Enum.to_list(slice)\n    Enum.to_list(data)\n    Enum.to_list(map)\n    0\n  end\nend\n";
+
+    let typed = checked(source).expect("non-higher-order Enum traversal type checks");
+    let debug = typed.debug_tree();
+    assert_eq!(
+        debug.matches("collection length: usize").count(),
+        5,
+        "{debug}"
+    );
+    assert_eq!(debug.matches("enum at:").count(), 5, "{debug}");
+    assert!(debug.contains("enum to list: [i32]"), "{debug}");
+    assert!(debug.contains("bytes to list: [u8]"), "{debug}");
+    assert!(debug.contains("map to list: [{i32, string}]"), "{debug}");
+    verify(&typed).expect("Enum traversal Typed AST verifies");
+}
+
+#[test]
+fn rejects_enum_traversal_for_non_iterables_and_bad_indices() {
+    for (expression, code) in [
+        ("Enum.count(true)", "E2151"),
+        ("Enum.to_list(1)", "E2151"),
+        ("Enum.at(#[1], false)", "E2113"),
+    ] {
+        let source = format!(
+            "defmodule Main do\n  def main() -> i32 do\n    {expression}\n    0\n  end\nend\n"
+        );
+        assert!(
+            checked(&source)
+                .expect_err("invalid Enum traversal is rejected")
+                .iter()
+                .any(|diagnostic| diagnostic.code == code)
+        );
+    }
+}
+
+#[test]
+fn checks_enum_each_any_and_all_callbacks_for_standard_iterables() {
+    let source = "defmodule Main do\n  def consume(value: i32) -> unit do\n    unit\n  end\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def byte(value: u8) -> bool do\n    value == 65\n  end\n  def pair(value: {i32, string}) -> bool do\n    true\n  end\n  def main() -> bool do\n    list: [i32] = [1, 2]\n    array: [i32; 2] = #[1, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\"}\n    Enum.each(list, consume)\n    Enum.any(array, positive)\n    Enum.all(slice, positive)\n    Enum.any(data, byte)\n    Enum.all(map, pair)\n  end\nend\n";
+
+    let typed = checked(source).expect("Enum visit callbacks type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("enum Each: unit"), "{debug}");
+    assert_eq!(debug.matches("enum Any: bool").count(), 2, "{debug}");
+    assert_eq!(debug.matches("enum All: bool").count(), 2, "{debug}");
+    verify(&typed).expect("Enum visit Typed AST verifies");
+}
+
+#[test]
+fn rejects_enum_visit_callback_signature_mismatches() {
+    for source in [
+        "defmodule Main do\n  def wrong(value: i64) -> unit do\n    unit\n  end\n  def main() -> unit do\n    values: [i32; 1] = #[1]\n    Enum.each(values, wrong)\n  end\nend\n",
+        "defmodule Main do\n  def wrong(value: i32) -> i32 do\n    value\n  end\n  def main() -> bool do\n    values: [i32; 1] = #[1]\n    Enum.any(values, wrong)\n  end\nend\n",
+        "defmodule Main do\n  def predicate(value: i32) -> bool do\n    true\n  end\n  def main() -> bool do\n    Enum.all(42, predicate)\n  end\nend\n",
+        "defmodule Main do\n  def wrong(value: i64) -> bool do\n    true\n  end\n  def main() -> [bool] do\n    values: [i32; 1] = #[1]\n    Enum.map(values, wrong)\n  end\nend\n",
+    ] {
+        assert!(
+            checked(source).is_err(),
+            "invalid callback must be rejected"
+        );
+    }
+}
+
+#[test]
+fn checks_enum_reduce_with_explicit_accumulator_types() {
+    let source = "defmodule Main do\n  def add(total: i32, value: i32) -> i32 do\n    total + value\n  end\n  def keep(total: usize, value: u8) -> usize do\n    total\n  end\n  def main() -> i32 do\n    values: [i32] = [1, 2]\n    data = String.bytes(\"AB\")\n    Enum.reduce(data, 0 :: usize, keep)\n    Enum.reduce(values, 0, add)\n  end\nend\n";
+
+    let typed = checked(source).expect("Enum.reduce fixes its accumulator from the initial value");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("enum Reduce: usize"), "{debug}");
+    assert!(debug.contains("enum Reduce: i32"), "{debug}");
+    verify(&typed).expect("Enum.reduce Typed AST verifies");
+}
+
+#[test]
+fn checks_enum_filter_returns_the_source_item_list_type() {
+    let source = "defmodule Main do\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def main() -> [i32] do\n    values: [i32; 3] = #[1, 0, 2]\n    Enum.filter(values, positive)\n  end\nend\n";
+    let typed = checked(source).expect("Enum.filter type checks");
+    assert!(typed.debug_tree().contains("enum Filter: [i32]"));
+    verify(&typed).expect("Enum.filter Typed AST verifies");
+}
+
+#[test]
+fn checks_enum_map_returns_the_callback_result_list_type() {
+    let source = "defmodule Main do\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> [i32] do\n    values: [i32; 3] = #[1, 0, 2]\n    Enum.map(values, positive)\n    Enum.map(values, identity)\n    Enum.map(values, identity)\n  end\nend\n";
+    let typed = checked(source).expect("Enum.map type checks and specializes from its result");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("enum Map: [bool]"), "{debug}");
+    assert_eq!(debug.matches("enum Map: [i32]").count(), 2, "{debug}");
+    verify(&typed).expect("Enum.map Typed AST verifies");
+}
+
+#[test]
 fn rejects_list_reverse_for_non_list_values() {
     let source = "defmodule Main do\n  def main() -> i32 do\n    List.reverse(42)\n  end\nend\n";
     let diagnostics = checked(source).expect_err("List.reverse requires a list");
@@ -852,6 +1008,99 @@ fn checks_eager_string_codepoints() {
             .expect_err("String.codepoints rejects non-string inputs")
             .iter()
             .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_unicode_grapheme_length() {
+    let source = "defmodule Main do\n  def count(text: string) -> usize do\n    String.length(text)\n  end\n  def main() -> i32 do\n    if count(\"Aé🇸🇬👩‍👩‍👧‍👦\") == 4 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("String.length returns a grapheme count");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string grapheme length: usize"), "{debug}");
+    verify(&typed).expect("String.length Typed AST verifies");
+
+    let invalid = source.replace("String.length(text)", "String.length(1)");
+    assert!(
+        checked(&invalid)
+            .expect_err("String.length rejects non-string inputs")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2151")
+    );
+}
+
+#[test]
+fn checks_eager_graphemes_and_lazy_string_views() {
+    let source = "defmodule Main do\n  def graphemes(text: string) -> [string] do\n    String.graphemes(text)\n  end\n  def codepoint_view(text: string) -> String.CodepointView do\n    String.codepoint_view(text)\n  end\n  def grapheme_view(text: string) -> String.GraphemeView do\n    String.grapheme_view(text)\n  end\n  def main() -> i32 do\n    if graphemes(\"é🇸🇬\") == [\"é\", \"🇸🇬\"] and Enum.to_list(codepoint_view(\"A🙂\")) == ['A', '🙂'] and Enum.to_list(grapheme_view(\"é🇸🇬\")) == [\"é\", \"🇸🇬\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("grapheme APIs and lazy views type-check");
+    verify(&typed).expect("grapheme APIs and lazy views verify");
+
+    for call in [
+        "String.graphemes(1)",
+        "String.codepoint_view(1)",
+        "String.grapheme_view(1)",
+    ] {
+        let invalid = source.replace("String.graphemes(text)", call);
+        assert!(
+            checked(&invalid).is_err(),
+            "{call} rejects a non-string input"
+        );
+    }
+}
+
+#[test]
+fn checks_byte_aligned_bitstring_construction() {
+    let source = "defmodule Main do\n  def packet(prefix: bytes, value: i32, size: usize) -> bytes do\n    <<prefix::bytes-size(size), value::signed-little-size(16), 255::unsigned-big-size(8)>>\n  end\n  def empty() -> bytes do\n    <<>>\n  end\nend\n";
+    let typed = checked(source).expect("byte-aligned bitstring construction type-checks");
+    assert!(typed.debug_tree().contains("bitstring: bytes"));
+    verify(&typed).expect("bitstring Typed AST verifies");
+
+    for invalid in [
+        source.replace("prefix::bytes-size(size)", "1::bytes-size(size)"),
+        source.replace(
+            "value::signed-little-size(16)",
+            "true::signed-little-size(16)",
+        ),
+        source.replace("255::unsigned-big-size(8)", "256::unsigned-big-size(8)"),
+        source.replace(
+            "prefix::bytes-size(size)",
+            "String.bytes(\"x\")::bytes-size(2)",
+        ),
+    ] {
+        assert!(
+            checked(&invalid).is_err(),
+            "accepted invalid bitstring: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn checks_byte_aligned_bitstring_patterns_and_binding_order() {
+    let source = "defmodule Main do\n  def parse(packet: bytes, prefix_size: usize) -> usize do\n    match packet do\n      <<7::unsigned-big-size(8), prefix::bytes-size(prefix_size), rest::bytes-size(Bytes.byte_size(prefix))>> -> Bytes.byte_size(rest)\n      _ -> 0\n    end\n  end\n  def signed(packet: bytes) -> i32 do\n    match packet do\n      <<-2::signed-big-size(16)>> -> 1\n      _ -> 0\n    end\n  end\nend\n";
+    let typed = checked(source).expect("byte-aligned bitstring pattern type-checks");
+    assert!(typed.debug_tree().contains("Bitstring"));
+    verify(&typed).expect("bitstring-pattern Typed AST verifies");
+
+    for invalid in [
+        source.replace("packet: bytes", "packet: string"),
+        source.replace("prefix_size: usize", "prefix_size: i32"),
+        source.replace("7::unsigned-big-size(8)", "256::unsigned-big-size(8)"),
+        source.replace("-2::signed-big-size(16)", "-32769::signed-big-size(16)"),
+        source.replace("-2::signed-big-size(16)", "-1::unsigned-big-size(16)"),
+        source.replace(
+            "prefix::bytes-size(prefix_size), rest::bytes-size(Bytes.byte_size(prefix))",
+            "prefix::bytes-size(Bytes.byte_size(rest)), rest::bytes",
+        ),
+    ] {
+        assert!(
+            checked(&invalid).is_err(),
+            "accepted invalid bitstring pattern: {invalid}"
+        );
+    }
+
+    let duplicate = "defmodule Main do\n  def parse(packet: bytes) -> i32 do\n    match packet do\n      <<1::unsigned-big-size(8)>> -> 1\n      <<1::unsigned-big-size(8)>> -> 2\n      _ -> 0\n    end\n  end\nend\n";
+    assert!(
+        checked(duplicate).is_err(),
+        "accepted duplicate bitstring arm"
     );
 }
 

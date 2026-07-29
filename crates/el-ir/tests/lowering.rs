@@ -7,7 +7,7 @@ use el_ir::{
 use el_parser::parse;
 use el_resolve::{DeclId, resolve, resolve_package};
 use el_span::SourceMap;
-use el_types::{Type, TypeId, check};
+use el_types::{EnumVisitKind, Type, TypeId, check};
 
 fn lowered(source: &str) -> el_ir::GenericModule {
     let mut sources = SourceMap::new();
@@ -129,6 +129,84 @@ fn every_el_call_is_a_collection_point() {
         };
         assert_eq!(operation_collection_effect(operation), expected);
     }
+}
+
+#[test]
+fn lowers_and_specializes_named_function_values_and_indirect_calls() {
+    let module = lowered(
+        "defmodule Main do\n  def identity(value: a) -> a do\n    value\n  end\n  def increment(value: i32) -> i32 do\n    value + 1\n  end\n  def select(first: bool) -> (i32) -> i32 do\n    if first do\n      identity\n    else\n      increment\n    end\n  end\n  def apply(function: (i32) -> i32, value: i32) -> i32 do\n    function(value)\n  end\n  def main() -> i32 do\n    apply(select(false), 41)\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains(" = function f"), "{debug}");
+    assert!(debug.contains("call_indirect"), "{debug}");
+    let indirect = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::IndirectCall { .. }))
+        .expect("indirect call operation");
+    assert_eq!(
+        operation_collection_effect(indirect),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("function-value Generic Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("function targets specialize");
+    verify_concrete(&concrete).expect("function-value Concrete Core verifies");
+    assert!(
+        concrete
+            .functions
+            .iter()
+            .any(|function| function.name == "identity"
+                && function.specialization_arguments.len() == 1),
+        "generic function reference must retain its concrete specialization"
+    );
+
+    let mut invalid_reference = concrete.clone();
+    let wrong_target = invalid_reference
+        .functions
+        .iter()
+        .find(|function| function.name == "select")
+        .expect("select specialization")
+        .id;
+    let reference = invalid_reference
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::FunctionRef { function, .. } => Some(function),
+            _ => None,
+        })
+        .expect("concrete function reference");
+    *reference = wrong_target;
+    assert!(
+        verify_concrete(&invalid_reference)
+            .expect_err("a function reference must match its exact target signature")
+            .iter()
+            .any(|error| error.contains("function value"))
+    );
+
+    let mut invalid_call = concrete.clone();
+    let indirect = invalid_call
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::IndirectCall { function_ty, .. } => Some(function_ty),
+            _ => None,
+        })
+        .expect("concrete indirect call");
+    *indirect = TypeId(0);
+    assert!(
+        verify_concrete(&invalid_call)
+            .expect_err("an indirect call requires an exact function type")
+            .iter()
+            .any(|error| error.contains("indirect call"))
+    );
 }
 
 #[test]
@@ -837,6 +915,103 @@ fn lowers_list_reverse_as_an_allocating_verified_operation() {
 }
 
 #[test]
+fn lowers_enum_count_at_and_fresh_list_materialization() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    list: [i32] = [10, 20]\n    array: [i32; 2] = #[30, 40]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, i32) = %{1 => 50, 2 => 60}\n    Enum.count(list)\n    Enum.count(array)\n    Enum.count(slice)\n    Enum.count(data)\n    Enum.count(map)\n    Enum.at(list, 1)\n    Enum.at(array, 2)\n    Enum.at(slice, 0)\n    Enum.at(data, 1)\n    Enum.at(map, 0)\n    Enum.to_list(list)\n    Enum.to_list(array)\n    Enum.to_list(slice)\n    Enum.to_list(data)\n    Enum.to_list(map)\n    0\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert_eq!(debug.matches("collection_length").count(), 5, "{debug}");
+    assert_eq!(debug.matches("enum_at").count(), 5, "{debug}");
+    assert_eq!(debug.matches("enum_to_list").count(), 2, "{debug}");
+    assert!(debug.contains("bytes_to_list"), "{debug}");
+    assert!(debug.contains("map_to_list"), "{debug}");
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    for operation in operations
+        .iter()
+        .filter(|operation| matches!(operation, Operation::EnumToList { .. }))
+    {
+        assert_eq!(
+            operation_collection_effect(operation),
+            CollectionEffect::MayCollect
+        );
+    }
+    for operation in operations
+        .iter()
+        .filter(|operation| matches!(operation, Operation::EnumAt { .. }))
+    {
+        assert_eq!(
+            operation_collection_effect(operation),
+            CollectionEffect::CannotCollect
+        );
+    }
+    verify(&module).expect("Enum traversal Generic Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("Enum traversal monomorphizes");
+    verify_concrete(&concrete).expect("Enum traversal Concrete Core verifies");
+}
+
+#[test]
+fn lowers_short_circuiting_enum_visits_as_collecting_operations() {
+    let module = lowered(
+        "defmodule Main do\n  def consume(value: i32) -> unit do\n    unit\n  end\n  def positive(value: i32) -> bool do\n    value > 0\n  end\n  def add(total: i32, value: i32) -> i32 do\n    total + value\n  end\n  def visit() -> bool do\n    values: [i32] = [1, 2]\n    Enum.each(values, consume)\n    Enum.any(values, positive)\n    Enum.reduce(values, 0 :: i32, add)\n    Enum.filter(values, positive)\n    Enum.map(values, positive)\n    Enum.all(values, positive)\n  end\n  def main() -> i32 do\n    visit()\n    0\n  end\nend\n",
+    );
+    let operations = module
+        .functions
+        .iter()
+        .find(|function| function.name == "visit")
+        .expect("visit function")
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|operation| matches!(operation, Operation::EnumVisit { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 6);
+    assert!(operations.iter().all(|operation| {
+        operation_collection_effect(operation) == CollectionEffect::MayCollect
+    }));
+    let debug = module.debug_text();
+    assert!(debug.contains("enum_Each"), "{debug}");
+    assert!(debug.contains("enum_Any"), "{debug}");
+    assert!(debug.contains("enum_All"), "{debug}");
+    assert!(debug.contains("enum_Reduce"), "{debug}");
+    assert!(debug.contains("enum_Filter"), "{debug}");
+    assert!(debug.contains("enum_Map"), "{debug}");
+    verify(&module).expect("Enum visits Generic Core verify");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("Enum visits monomorphize");
+    verify_concrete(&concrete).expect("Enum visits Concrete Core verify");
+    let mut malformed = concrete.clone();
+    let visit = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.operations)
+        .find(|operation| {
+            matches!(
+                operation,
+                Operation::EnumVisit {
+                    kind: EnumVisitKind::Map,
+                    ..
+                }
+            )
+        })
+        .expect("map visitor operation");
+    if let Operation::EnumVisit { function_ty, .. } = visit {
+        *function_ty = TypeId(2);
+    }
+    assert!(
+        verify_concrete(&malformed)
+            .expect_err("mistyped Enum visitor is rejected")
+            .iter()
+            .any(|error| error.contains("Enum visit"))
+    );
+}
+
+#[test]
 fn lowers_arrays_and_maps_in_source_order() {
     let module = lowered(
         "defmodule Main do\n  def array() -> [i64; 2] do\n    #[1, 2]\n  end\n  def map() -> Map(i64, bool) do\n    %{1 => true, 2 => false}\n  end\nend\n",
@@ -1201,6 +1376,103 @@ fn lowers_eager_string_codepoint_decoding_as_an_allocating_operation() {
     let roots = executable_reachability_roots(&module).expect("entry point");
     let concrete = monomorphize(&module, &roots).expect("string codepoints specialize");
     verify_concrete(&concrete).expect("concrete string codepoints Core verifies");
+}
+
+#[test]
+fn lowers_unicode_grapheme_length_as_a_noncollecting_operation() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    String.length(\"Aé🇸🇬👩‍👩‍👧‍👦\")\n    0\n  end\nend\n",
+    );
+    let operation = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::StringLength { .. }))
+        .expect("String.length has an explicit Core operation");
+    assert_eq!(
+        operation_collection_effect(operation),
+        CollectionEffect::CannotCollect
+    );
+    assert!(module.debug_text().contains("string_length"));
+    verify(&module).expect("String.length Generic Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("String.length specializes");
+    verify_concrete(&concrete).expect("String.length Concrete Core verifies");
+}
+
+#[test]
+fn lowers_eager_graphemes_through_retained_lazy_views() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    graphemes = String.graphemes(\"é🇸🇬\")\n    codepoints = Enum.to_list(String.codepoint_view(\"A🙂\"))\n    lazy_graphemes = Enum.to_list(String.grapheme_view(\"é🇸🇬\"))\n    if graphemes == lazy_graphemes and codepoints == ['A', '🙂'] do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let operations = module.functions.iter().flat_map(|function| {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+    });
+    let collected = operations
+        .filter(|operation| matches!(operation, Operation::EnumToList { .. }))
+        .count();
+    assert_eq!(collected, 3);
+    verify(&module).expect("lazy string view Generic Core verifies");
+    let concrete = monomorphize(&module, &roots).expect("lazy string views specialize");
+    verify_concrete(&concrete).expect("lazy string view Concrete Core verifies");
+    assert!(
+        concrete
+            .types
+            .iter()
+            .any(|ty| matches!(ty, Type::CodepointView))
+    );
+    assert!(
+        concrete
+            .types
+            .iter()
+            .any(|ty| matches!(ty, Type::GraphemeView))
+    );
+}
+
+#[test]
+fn lowers_byte_aligned_bitstring_construction_with_a_failure_edge() {
+    let module = lowered(
+        "defmodule Main do\n  def packet(data: bytes, value: i32) -> bytes do\n    <<1::unsigned-big-size(8), value::signed-little-size(16), data::bytes>>\n  end\n  def main() -> i32 do\n    if Bytes.byte_size(packet(String.bytes(\"ok\"), 513)) == 5 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("bitstring 3 segments"), "{debug}");
+    assert!(debug.contains("fail BitstringSizeMismatch"), "{debug}");
+    let operation = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .find(|operation| matches!(operation, Operation::Bitstring { .. }))
+        .expect("bitstring construction operation");
+    assert_eq!(
+        operation_collection_effect(operation),
+        CollectionEffect::MayCollect
+    );
+    verify(&module).expect("bitstring Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("bitstring specializes");
+    verify_concrete(&concrete).expect("concrete bitstring Core verifies");
+}
+
+#[test]
+fn lowers_byte_aligned_bitstring_patterns_with_normal_failure_edges() {
+    let module = lowered(
+        "defmodule Main do\n  def parse(packet: bytes, prefix_size: usize) -> i32 do\n    match packet do\n      <<7::unsigned-big-size(8), prefix::bytes-size(prefix_size), rest::bytes-size(Bytes.byte_size(prefix))>> -> if Bytes.byte_size(rest) == prefix_size do\n        42\n      else\n        1\n      end\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n    parse(<<7::unsigned-big-size(8), String.bytes(\"ab\")::bytes, String.bytes(\"cd\")::bytes>>, 2)\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("bitstring_pattern_integer"), "{debug}");
+    assert!(debug.contains("bitstring_pattern_bytes"), "{debug}");
+    assert!(debug.contains("bitstring_pattern_check"), "{debug}");
+    verify(&module).expect("bitstring-pattern Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("bitstring pattern specializes");
+    verify_concrete(&concrete).expect("concrete bitstring-pattern Core verifies");
 }
 
 #[test]
