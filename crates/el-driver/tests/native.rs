@@ -7,6 +7,8 @@ use el_driver::{BuildProfile, analyze_source};
 use el_ir::{executable_reachability_roots, monomorphize};
 use el_span::SourceMap;
 use std::ffi::OsString;
+#[cfg(feature = "gc-stress-test")]
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -471,6 +473,97 @@ fn string_length_uses_unicode_17_extended_graphemes() {
             "String.length must use pinned grapheme boundaries in {label}"
         );
     }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn unicode_17_grapheme_break_test_matches_all_public_apis() {
+    let temp = TempDir::new();
+    let (source, case_count) = unicode_17_grapheme_public_api_source();
+    assert_eq!(
+        case_count, 766,
+        "pinned Unicode corpus changed unexpectedly"
+    );
+    assert_eq!(
+        build_and_run_managed(
+            &temp.0,
+            "unicode-17-public-grapheme-conformance",
+            &source,
+            BuildProfile::Development,
+        )
+        .code(),
+        Some(42),
+        "String.length, String.graphemes, and String.grapheme_view must match every Unicode 17 GraphemeBreakTest case",
+    );
+}
+
+#[cfg(feature = "gc-stress-test")]
+fn unicode_17_grapheme_public_api_source() -> (String, usize) {
+    const CORPUS: &str = include_str!("../../../runtime/unicode/17.0.0/GraphemeBreakTest.txt");
+
+    let mut source = String::from(
+        "defmodule Main do\n  def check(text: string, expected: [string]) -> bool do\n    String.length(text) == Enum.count(expected) and String.graphemes(text) == expected and Enum.to_list(String.grapheme_view(text)) == expected\n  end\n  def main() -> i32 do\n    mut valid: bool = true\n",
+    );
+    let mut case_count = 0;
+    for line in CORPUS.lines() {
+        let data = line
+            .split('#')
+            .next()
+            .expect("line has a data prefix")
+            .trim();
+        if data.is_empty() {
+            continue;
+        }
+
+        let mut codepoints = Vec::new();
+        let mut cluster = Vec::new();
+        let mut clusters = Vec::new();
+        for token in data.split_whitespace() {
+            match token {
+                "÷" => {
+                    if !cluster.is_empty() {
+                        clusters.push(std::mem::take(&mut cluster));
+                    }
+                }
+                "×" => {}
+                hexadecimal => {
+                    let codepoint =
+                        u32::from_str_radix(hexadecimal, 16).expect("valid corpus codepoint");
+                    char::from_u32(codepoint).expect("corpus codepoint is a Unicode scalar");
+                    codepoints.push(codepoint);
+                    cluster.push(codepoint);
+                }
+            }
+        }
+        assert!(
+            cluster.is_empty(),
+            "corpus case ends at a grapheme boundary"
+        );
+
+        let text = escaped_el_string(&codepoints);
+        let expected = clusters
+            .iter()
+            .map(|value| format!("\"{}\"", escaped_el_string(value)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            source,
+            "    valid := check(\"{text}\", [{expected}]) and valid"
+        )
+        .expect("write generated EL source");
+        case_count += 1;
+    }
+    source.push_str("    if valid do\n      42\n    else\n      0\n    end\n  end\nend\n");
+    (source, case_count)
+}
+
+#[cfg(feature = "gc-stress-test")]
+fn escaped_el_string(codepoints: &[u32]) -> String {
+    let mut escaped = String::new();
+    for codepoint in codepoints {
+        write!(escaped, "\\u{{{codepoint:X}}}").expect("write escaped EL string");
+    }
+    escaped
 }
 
 #[cfg(feature = "gc-stress-test")]

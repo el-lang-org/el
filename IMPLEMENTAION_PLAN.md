@@ -648,7 +648,7 @@ verified managed runtime.
 3. [x] **Maps:** immutable operations, `Eq`/`Hash` key requirements, seeded hashing,
    deterministic insertion order, duplicate replacement, and order-independent
    equality.
-4. [ ] **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
+4. [x] **Text and binary:** valid UTF-8 `string`, `rune`, `bytes`, arbitrary-length
    `bits`, byte-aligned source bitstrings, conversions, bounds checks, and
    inspectable UTF-8 errors.
 5. [x] **Unicode:** bundle Unicode 17.0.0 data and implement untailored UAX #29
@@ -673,7 +673,7 @@ verified managed runtime.
 - [x] Map insertion order across seeds and all update/remove/reinsert cases.
 - [ ] Bounds and numeric failure categories in debug and release.
 - [x] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
-- [ ] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
+- [x] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
   length APIs.
 - [ ] GC stress for nested composite graphs, views, base retention, immutable
   sharing, and function values.
@@ -854,8 +854,9 @@ verified managed runtime.
   LLVM preserves bases across the allocating packing path. Development/release
   collection-at-every-allocation tests cover empty, aligned, and non-aligned views,
   MSB-first indexing, exact repacking, retained source storage, and index failures.
-  Byte-aligned `<<...>>` construction/pattern lowering and `Concat` remain before
-  the text/binary deliverable closes.
+  Byte-aligned `<<...>>` construction and pattern lowering remained before the
+  concrete Milestone 6 text/binary surface was complete; protocol-backed `Concat`
+  is deferred to Milestone 7.
 - [x] Added byte-aligned source `<<...>>` construction end to end. Empty
   construction, integer segments at every v1 width, signed/unsigned fit checks,
   target-independent big/little order, target-native order, complete unsized
@@ -868,8 +869,8 @@ verified managed runtime.
   and copies bytes in source order. Typed AST, Generic/Concrete Core, LLVM, and
   development/release collection-at-every-allocation regressions cover exact byte
   layout, empty output, integer-fit failures, and byte-size failures. Source
-  `<<...>>` patterns and `Concat` remain open, so the broader text/binary deliverable
-  is not yet closed.
+  `<<...>>` patterns remained at this point; protocol-backed `Concat` belongs to
+  Milestone 7.
 - [x] Added byte-aligned source `<<...>>` patterns end to end. Empty patterns,
   signed and unsigned integer literals/bindings at every v1 width, big/little/native
   decoding, runtime-sized retained `bytes` views, final unsized remainder capture,
@@ -878,8 +879,9 @@ verified managed runtime.
   specified `u64` type; short input, literal mismatch, and leftover input take the
   next match arm without an unrecoverable failure. Development/release GC-stress
   regressions cover exact decoding, bounds-safe normal failure, view retention,
-  signed extension, maximum `u64`, and all source widths and byte orders. `Concat`
-  remains open in Milestone 7, so the broader text/binary deliverable remains open.
+  signed extension, maximum `u64`, and all source widths and byte orders. This
+  completes the concrete Milestone 6 text/binary deliverable; protocol-backed
+  `Concat` remains a Milestone 7 deliverable.
 - [x] Completed named monomorphic function values end to end. Bare and qualified
   ordinary function references now form exact structural function values, generic
   references specialize from their expected function type, local bindings shadow
@@ -895,8 +897,7 @@ verified managed runtime.
   inexact signatures, invalid targets, and mistyped indirect calls. LLVM coverage
   verifies code-pointer phis and indirect calls, while development/release
   collection-at-every-allocation native tests retain managed string arguments across
-  indirect calls. `Concat` remains a Milestone 7 protocol deliverable, and the
-  broader Milestone 6 text/binary deliverable remains open.
+  indirect calls. `Concat` remains a Milestone 7 protocol deliverable.
 - [x] Added the non-higher-order `Enum` traversal foundation for every standard
   iterable currently available in Milestone 6: lists, fixed arrays, slices,
   `bytes`, and insertion-ordered maps. `Enum.count` returns a target-width
@@ -988,8 +989,16 @@ verified managed runtime.
   the shared next-boundary path, and development/release collection-at-every-
   allocation regressions cover empty, combining-mark, supplementary-scalar,
   regional-indicator, and emoji-ZWJ inputs plus retained eager and lazy results.
-  This closes the Unicode and views deliverable groups; direct full-corpus checks
-  through all three public APIs remain in the open Milestone 6 conformance test.
+  This closes the Unicode and views deliverable groups; at this point, direct
+  full-corpus checks through all three public APIs remained in the open Milestone 6
+  conformance test.
+- [x] Closed the public Unicode conformance test by generating valid EL string
+  literals directly from every case in the pinned Unicode 17.0.0
+  `GraphemeBreakTest.txt`. One managed native program checks all 766 cases through
+  `String.length`, eager `String.graphemes`, and lazy
+  `Enum.to_list(String.grapheme_view(...))` under collection at every allocation.
+  Together with the existing development/release representative regressions, this
+  completes the Milestone 6 Unicode conformance matrix without host Unicode APIs.
 - [x] Completed the remaining integer-width foundation for `i8`, `i16`, `i32`,
   `i64`, `isize`, `u8`, `u16`, `u32`, `u64`, and `usize`. All widths now flow
   through type formation, contextual literal and pattern range checks, protocol
