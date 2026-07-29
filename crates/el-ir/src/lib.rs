@@ -3083,12 +3083,17 @@ fn classify_managed_type(
         return Some(ManagedValueClass::ContainsBaseReferences);
     }
     let class = match value {
-        Type::I32
+        Type::I8
+        | Type::I16
+        | Type::I32
         | Type::I64
+        | Type::Isize
         | Type::Usize
         | Type::Rune
         | Type::Utf8Error
         | Type::U8
+        | Type::U16
+        | Type::U32
         | Type::U64
         | Type::Bool
         | Type::Unit
@@ -3153,8 +3158,11 @@ pub enum MonomorphizationError {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NormalizedType {
+    I8,
+    I16,
     I32,
     I64,
+    Isize,
     Usize,
     Bool,
     Unit,
@@ -3167,6 +3175,8 @@ enum NormalizedType {
     CodepointView,
     GraphemeView,
     U8,
+    U16,
+    U32,
     U64,
     Atom(String),
     List(Box<Self>),
@@ -3488,8 +3498,11 @@ impl<'a> Monomorphizer<'a> {
             .get(ty.0 as usize)
             .ok_or(MonomorphizationError::InvalidType(ty))?
         {
+            Type::I8 => NormalizedType::I8,
+            Type::I16 => NormalizedType::I16,
             Type::I32 => NormalizedType::I32,
             Type::I64 => NormalizedType::I64,
+            Type::Isize => NormalizedType::Isize,
             Type::Usize => NormalizedType::Usize,
             Type::Bool => NormalizedType::Bool,
             Type::Unit => NormalizedType::Unit,
@@ -3502,6 +3515,8 @@ impl<'a> Monomorphizer<'a> {
             Type::CodepointView => NormalizedType::CodepointView,
             Type::GraphemeView => NormalizedType::GraphemeView,
             Type::U8 => NormalizedType::U8,
+            Type::U16 => NormalizedType::U16,
+            Type::U32 => NormalizedType::U32,
             Type::U64 => NormalizedType::U64,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
@@ -3776,8 +3791,11 @@ impl<'a> Monomorphizer<'a> {
 
     fn intern_normalized(&mut self, ty: &NormalizedType) -> TypeId {
         let materialized = match ty {
+            NormalizedType::I8 => Type::I8,
+            NormalizedType::I16 => Type::I16,
             NormalizedType::I32 => return TypeId(0),
             NormalizedType::I64 => return TypeId(1),
+            NormalizedType::Isize => Type::Isize,
             NormalizedType::Usize => Type::Usize,
             NormalizedType::Bool => return TypeId(2),
             NormalizedType::Unit => return TypeId(3),
@@ -3790,6 +3808,8 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::CodepointView => Type::CodepointView,
             NormalizedType::GraphemeView => Type::GraphemeView,
             NormalizedType::U8 => Type::U8,
+            NormalizedType::U16 => Type::U16,
+            NormalizedType::U32 => Type::U32,
             NormalizedType::U64 => Type::U64,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
@@ -3913,8 +3933,11 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
                 collect_layout_keys(argument, layouts);
             }
         }
-        NormalizedType::I32
+        NormalizedType::I8
+        | NormalizedType::I16
+        | NormalizedType::I32
         | NormalizedType::I64
+        | NormalizedType::Isize
         | NormalizedType::Usize
         | NormalizedType::Bool
         | NormalizedType::Unit
@@ -3927,6 +3950,8 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::CodepointView
         | NormalizedType::GraphemeView
         | NormalizedType::U8
+        | NormalizedType::U16
+        | NormalizedType::U32
         | NormalizedType::U64
         | NormalizedType::Atom(_) => {}
     }
@@ -4762,13 +4787,10 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                         let compatible = match (case, module.types.get(subject_ty.0 as usize)) {
                             (SwitchValue::Boolean(_), Some(Type::Bool))
                             | (
-                                SwitchValue::Integer(_),
-                                Some(Type::I32 | Type::I64 | Type::U8 | Type::U64),
-                            )
-                            | (
                                 SwitchValue::ListEmpty | SwitchValue::ListCons,
                                 Some(Type::List(_)),
                             ) => true,
+                            (SwitchValue::Integer(_), Some(ty)) if is_integer_type(ty) => true,
                             (SwitchValue::Atom(value), Some(Type::Atom(expected))) => {
                                 value == expected
                             }
@@ -4899,11 +4921,8 @@ fn verify_operation(
             ..
         } => {
             let valid = match (constant, types.get(ty.0 as usize)) {
-                (
-                    Constant::Integer(_),
-                    Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64),
-                )
-                | (Constant::Boolean(_), Some(Type::Bool))
+                (Constant::Integer(_), Some(ty)) if is_integer_type(ty) => true,
+                (Constant::Boolean(_), Some(Type::Bool))
                 | (Constant::Unit, Some(Type::Unit))
                 | (Constant::String(_), Some(Type::String)) => true,
                 (Constant::Rune(_), Some(Type::Rune)) => true,
@@ -5246,10 +5265,7 @@ fn verify_operation(
                         ..
                     } => {
                         if values.get(value) != Some(source_ty)
-                            || !matches!(
-                                types.get(source_ty.0 as usize),
-                                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
-                            )
+                            || !types.get(source_ty.0 as usize).is_some_and(is_integer_type)
                             || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
                         {
                             errors.push(format!(
@@ -5808,7 +5824,7 @@ fn verify_operation(
         } => {
             if values.get(left) != Some(ty)
                 || values.get(right) != Some(ty)
-                || !matches!(ty.0, 0 | 1)
+                || !types.get(ty.0 as usize).is_some_and(is_integer_type)
             {
                 errors.push(format!("arithmetic result {result:?} has invalid operands"));
             }
@@ -5826,10 +5842,10 @@ fn verify_operation(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = matches!(
-                types.get(operand_ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64) | Some(Type::Rune)
-            ) || (!ordered && standard_eq_type(types, *operand_ty));
+            let supported = types
+                .get(operand_ty.0 as usize)
+                .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::Rune))
+                || (!ordered && standard_eq_type(types, *operand_ty));
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
                 || !supported
@@ -6146,8 +6162,11 @@ fn standard_iterable_item_type(types: &[Type], source: TypeId) -> Option<TypeId>
 fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
     match types.get(ty.0 as usize) {
         Some(
-            Type::I32
+            Type::I8
+            | Type::I16
+            | Type::I32
             | Type::I64
+            | Type::Isize
             | Type::Usize
             | Type::Bool
             | Type::Unit
@@ -6157,6 +6176,8 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Rune
             | Type::Utf8Error
             | Type::U8
+            | Type::U16
+            | Type::U32
             | Type::U64
             | Type::Atom(_),
         ) => true,
@@ -6169,6 +6190,22 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_integer_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Usize
+    )
 }
 
 fn is_utf8_result_type(types: &[Type], ty: TypeId) -> bool {

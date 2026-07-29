@@ -1275,6 +1275,51 @@ fn checks_byte_indexing_as_u8_and_literal_range() {
 }
 
 #[test]
+fn checks_every_integer_width_and_rejects_out_of_range_literals() {
+    let source = "defmodule Main do\n  def i8_value() -> i8 do\n    127\n  end\n  def i16_value() -> i16 do\n    32767\n  end\n  def i32_value() -> i32 do\n    2147483647\n  end\n  def i64_value() -> i64 do\n    9223372036854775807\n  end\n  def isize_value() -> isize do\n    42\n  end\n  def u8_value() -> u8 do\n    255\n  end\n  def u16_value() -> u16 do\n    65535\n  end\n  def u32_value() -> u32 do\n    4294967295\n  end\n  def u64_value() -> u64 do\n    18446744073709551615\n  end\n  def usize_value() -> usize do\n    42\n  end\n  def main() -> i32 do\n    i8_value() + 1\n    i16_value() / 1\n    isize_value() % 2\n    u8_value() * 1\n    u16_value() - 1\n    u32_value() + 1\n    u64_value() / 1\n    usize_value() % 2\n    0\n  end\nend\n";
+    let typed = checked(source).expect("all integer widths type check");
+    for expected in [
+        Type::I8,
+        Type::I16,
+        Type::I32,
+        Type::I64,
+        Type::Isize,
+        Type::U8,
+        Type::U16,
+        Type::U32,
+        Type::U64,
+        Type::Usize,
+    ] {
+        assert!(typed.types.contains(&expected), "missing {expected:?}");
+    }
+    verify(&typed).expect("integer-width Typed AST verifies");
+
+    let cases = [
+        ("i8", "128".to_owned()),
+        ("i16", "32768".to_owned()),
+        ("i32", "2147483648".to_owned()),
+        ("i64", "9223372036854775808".to_owned()),
+        ("isize", (isize::MAX as u128 + 1).to_string()),
+        ("u8", "256".to_owned()),
+        ("u16", "65536".to_owned()),
+        ("u32", "4294967296".to_owned()),
+        ("u64", "18446744073709551616".to_owned()),
+        ("usize", (usize::MAX as u128 + 1).to_string()),
+    ];
+    for (ty, literal) in cases {
+        let source =
+            format!("defmodule Main do\n  def invalid() -> {ty} do\n    {literal}\n  end\nend\n");
+        assert!(
+            checked(&source)
+                .expect_err("out-of-range literal is rejected")
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E2106"),
+            "missing range diagnostic for {ty}"
+        );
+    }
+}
+
+#[test]
 fn checks_map_size_and_rejects_non_map_inputs() {
     let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    if Map.size(values) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("Map.size accepts an immutable map");

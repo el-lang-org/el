@@ -977,6 +977,58 @@ fn development_and_release_preserve_arithmetic_exit_semantics() {
 }
 
 #[test]
+fn every_integer_width_preserves_native_arithmetic_semantics() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let arithmetic = "defmodule Main do\n  def i8_value() -> i8 do\n    40 + 2\n  end\n  def i16_value() -> i16 do\n    44 - 2\n  end\n  def i32_value() -> i32 do\n    21 * 2\n  end\n  def i64_value() -> i64 do\n    84 / 2\n  end\n  def isize_value() -> isize do\n    85 % 43\n  end\n  def u8_value() -> u8 do\n    40 + 2\n  end\n  def u16_value() -> u16 do\n    44 - 2\n  end\n  def u32_value() -> u32 do\n    21 * 2\n  end\n  def u64_value() -> u64 do\n    18446744073709551615 / 18446744073709551615\n  end\n  def usize_value() -> usize do\n    85 % 43\n  end\n  def main() -> i32 do\n    if i8_value() == 42 and i16_value() == 42 and i32_value() == 42 and i64_value() == 42 and isize_value() == 42 and u8_value() == 42 and u16_value() == 42 and u32_value() == 42 and u64_value() == 1 and usize_value() == 42 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let overflows = [
+        (
+            "i8",
+            "defmodule Main do\n  def overflow() -> i8 do\n    127 + 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+        ),
+        (
+            "u16",
+            "defmodule Main do\n  def overflow() -> u16 do\n    65535 + 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+        ),
+        (
+            "u16-underflow",
+            "defmodule Main do\n  def overflow() -> u16 do\n    0 - 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+        ),
+    ];
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-integer-widths"),
+                arithmetic,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        for (ty, source) in overflows {
+            assert_eq!(
+                build_and_run(
+                    &temp.0,
+                    &runtime,
+                    &format!("{label}-{ty}-overflow"),
+                    source,
+                    profile,
+                )
+                .code(),
+                Some(101),
+                "{ty} overflow retains runtime category 1 in {label}"
+            );
+        }
+    }
+}
+
+#[test]
 fn struct_values_preserve_copy_and_reconstruction_semantics_natively() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);

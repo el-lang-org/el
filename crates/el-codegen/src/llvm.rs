@@ -873,13 +873,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
 
     fn basic_type(&self, ty: TypeId) -> Result<BasicTypeEnum<'ctx>, BackendError> {
         match self.core.types.get(ty.0 as usize) {
-            Some(Type::U8) => Ok(self.context.i8_type().into()),
+            Some(Type::I8 | Type::U8) => Ok(self.context.i8_type().into()),
+            Some(Type::I16 | Type::U16) => Ok(self.context.i16_type().into()),
+            Some(Type::U32) => Ok(self.context.i32_type().into()),
             Some(Type::U64) => Ok(self.context.i64_type().into()),
             Some(Type::Rune) => Ok(self.context.i32_type().into()),
             Some(Type::Utf8Error) => Ok(self.usize_type()?.into()),
             Some(Type::I32) => Ok(self.context.i32_type().into()),
             Some(Type::I64) => Ok(self.context.i64_type().into()),
-            Some(Type::Usize) => Ok(self.usize_type()?.into()),
+            Some(Type::Isize | Type::Usize) => Ok(self.usize_type()?.into()),
             Some(Type::Bool) => Ok(self.context.bool_type().into()),
             Some(Type::Unit) => Ok(self.context.struct_type(&[], false).into()),
             Some(Type::String) => Ok(self
@@ -1166,12 +1168,17 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
     ) -> Result<IntValue<'ctx>, BackendError> {
         match self.core.types.get(ty.0 as usize) {
             Some(
-                Type::I32
+                Type::I8
+                | Type::I16
+                | Type::I32
                 | Type::I64
+                | Type::Isize
                 | Type::Usize
                 | Type::Rune
                 | Type::Utf8Error
                 | Type::U8
+                | Type::U16
+                | Type::U32
                 | Type::U64
                 | Type::Bool
                 | Type::Atom(_),
@@ -2097,12 +2104,17 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             };
         match self.core.types.get(ty.0 as usize) {
             Some(
-                Type::I32
+                Type::I8
+                | Type::I16
+                | Type::I32
                 | Type::I64
+                | Type::Isize
                 | Type::Usize
                 | Type::Rune
                 | Type::Utf8Error
                 | Type::U8
+                | Type::U16
+                | Type::U32
                 | Type::U64
                 | Type::Bool
                 | Type::Atom(_),
@@ -5947,7 +5959,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         let source = integer_value(values, *value)?;
                         let source_signed = matches!(
                             self.core.types.get(source_ty.0 as usize),
-                            Some(Type::I32 | Type::I64)
+                            Some(Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize)
                         );
                         let source_width = source.get_type().get_bit_width();
                         let valid = if *signed {
@@ -6132,7 +6144,9 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                                 let source = integer_value(values, *value)?;
                                 let source_signed = matches!(
                                     self.core.types.get(source_ty.0 as usize),
-                                    Some(Type::I32 | Type::I64)
+                                    Some(
+                                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
+                                    )
                                 );
                                 let word = if source.get_type() == self.context.i64_type() {
                                     source
@@ -9456,12 +9470,17 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ) && !matches!(
                     self.core.types.get(operand_ty.0 as usize),
                     Some(
-                        Type::I32
+                        Type::I8
+                            | Type::I16
+                            | Type::I32
                             | Type::I64
+                            | Type::Isize
                             | Type::Usize
                             | Type::Rune
                             | Type::Utf8Error
                             | Type::U8
+                            | Type::U16
+                            | Type::U32
                             | Type::U64
                             | Type::Bool
                     )
@@ -9492,7 +9511,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 }
                 let unsigned = matches!(
                     self.core.types.get(operand_ty.0 as usize),
-                    Some(Type::Rune | Type::U8 | Type::U64 | Type::Usize)
+                    Some(Type::Rune | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize)
                 );
                 let predicate = match operator {
                     ComparisonOperator::Equal => IntPredicate::EQ,
@@ -9890,15 +9909,25 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         builder: &Builder<'ctx>,
         blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
     ) -> Result<IntValue<'ctx>, BackendError> {
+        let signed = self
+            .core
+            .types
+            .get(ty.0 as usize)
+            .is_some_and(is_signed_integer_type);
         match operator {
             ArithmeticOperator::Add
             | ArithmeticOperator::Subtract
             | ArithmeticOperator::Multiply => {
-                let intrinsic = match operator {
-                    ArithmeticOperator::Add => "llvm.sadd.with.overflow",
-                    ArithmeticOperator::Subtract => "llvm.ssub.with.overflow",
-                    ArithmeticOperator::Multiply => "llvm.smul.with.overflow",
-                    ArithmeticOperator::Divide | ArithmeticOperator::Remainder => unreachable!(),
+                let intrinsic = match (operator, signed) {
+                    (ArithmeticOperator::Add, true) => "llvm.sadd.with.overflow",
+                    (ArithmeticOperator::Subtract, true) => "llvm.ssub.with.overflow",
+                    (ArithmeticOperator::Multiply, true) => "llvm.smul.with.overflow",
+                    (ArithmeticOperator::Add, false) => "llvm.uadd.with.overflow",
+                    (ArithmeticOperator::Subtract, false) => "llvm.usub.with.overflow",
+                    (ArithmeticOperator::Multiply, false) => "llvm.umul.with.overflow",
+                    (ArithmeticOperator::Divide | ArithmeticOperator::Remainder, _) => {
+                        unreachable!()
+                    }
                 };
                 let declaration = Intrinsic::find(intrinsic)
                     .and_then(|intrinsic| {
@@ -9958,49 +9987,54 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     blocks,
                 )?;
 
-                let minimum = match self.core.types.get(ty.0 as usize) {
-                    Some(Type::I32) => left.get_type().const_int(i32::MIN as u32 as u64, false),
-                    Some(Type::I64) => left.get_type().const_int(i64::MIN as u64, false),
-                    _ => return Err(BackendError::UnsupportedType(ty)),
-                };
-                let negative_one = left.get_type().const_all_ones();
-                let left_is_minimum = built(builder.build_int_compare(
-                    IntPredicate::EQ,
-                    left,
-                    minimum,
-                    &format!("v{}.minimum", result.0),
-                ))?;
-                let right_is_negative_one = built(builder.build_int_compare(
-                    IntPredicate::EQ,
-                    right,
-                    negative_one,
-                    &format!("v{}.negative_one", result.0),
-                ))?;
-                let overflow = built(builder.build_and(
-                    left_is_minimum,
-                    right_is_negative_one,
-                    &format!("v{}.overflow", result.0),
-                ))?;
-                self.branch_on_failure(
-                    result,
-                    "overflow",
-                    overflow,
-                    CoreFailureCategory::IntegerOverflow,
-                    failures,
-                    builder,
-                    blocks,
-                )?;
+                if signed {
+                    let bit_width = left.get_type().get_bit_width();
+                    let minimum = left.get_type().const_int(1_u64 << (bit_width - 1), false);
+                    let negative_one = left.get_type().const_all_ones();
+                    let left_is_minimum = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        left,
+                        minimum,
+                        &format!("v{}.minimum", result.0),
+                    ))?;
+                    let right_is_negative_one = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        right,
+                        negative_one,
+                        &format!("v{}.negative_one", result.0),
+                    ))?;
+                    let overflow = built(builder.build_and(
+                        left_is_minimum,
+                        right_is_negative_one,
+                        &format!("v{}.overflow", result.0),
+                    ))?;
+                    self.branch_on_failure(
+                        result,
+                        "overflow",
+                        overflow,
+                        CoreFailureCategory::IntegerOverflow,
+                        failures,
+                        builder,
+                        blocks,
+                    )?;
+                }
                 let name = format!("v{}", result.0);
-                match operator {
-                    ArithmeticOperator::Divide => {
+                match (operator, signed) {
+                    (ArithmeticOperator::Divide, true) => {
                         built(builder.build_int_signed_div(left, right, &name))
                     }
-                    ArithmeticOperator::Remainder => {
+                    (ArithmeticOperator::Remainder, true) => {
                         built(builder.build_int_signed_rem(left, right, &name))
                     }
-                    ArithmeticOperator::Add
-                    | ArithmeticOperator::Subtract
-                    | ArithmeticOperator::Multiply => unreachable!(),
+                    (ArithmeticOperator::Divide, false) => {
+                        built(builder.build_int_unsigned_div(left, right, &name))
+                    }
+                    (ArithmeticOperator::Remainder, false) => {
+                        built(builder.build_int_unsigned_rem(left, right, &name))
+                    }
+                    (ArithmeticOperator::Add, _)
+                    | (ArithmeticOperator::Subtract, _)
+                    | (ArithmeticOperator::Multiply, _) => unreachable!(),
                 }
             }
         }
@@ -10045,6 +10079,24 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         ty: TypeId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match (constant, self.core.types.get(ty.0 as usize)) {
+            (Constant::Integer(value), Some(Type::I8)) => {
+                let value = i8::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .context
+                    .i8_type()
+                    .const_int(value as u8 as u64, false)
+                    .into())
+            }
+            (Constant::Integer(value), Some(Type::I16)) => {
+                let value = i16::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .context
+                    .i16_type()
+                    .const_int(value as u16 as u64, false)
+                    .into())
+            }
             (Constant::Integer(value), Some(Type::U8)) => {
                 let value = u8::try_from(*value)
                     .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
@@ -10058,6 +10110,24 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let value = u64::try_from(*value)
                     .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
                 Ok(self.context.i64_type().const_int(value, false).into())
+            }
+            (Constant::Integer(value), Some(Type::U16)) => {
+                let value = u16::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .context
+                    .i16_type()
+                    .const_int(u64::from(value), false)
+                    .into())
+            }
+            (Constant::Integer(value), Some(Type::U32)) => {
+                let value = u32::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .context
+                    .i32_type()
+                    .const_int(u64::from(value), false)
+                    .into())
             }
             (Constant::Integer(value), Some(Type::I32)) => {
                 let value = i32::try_from(*value)
@@ -10081,6 +10151,14 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let value = usize::try_from(*value)
                     .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
                 Ok(self.usize_type()?.const_int(value as u64, false).into())
+            }
+            (Constant::Integer(value), Some(Type::Isize)) => {
+                let value = isize::try_from(*value)
+                    .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
+                Ok(self
+                    .usize_type()?
+                    .const_int(value as usize as u64, false)
+                    .into())
             }
             (Constant::Boolean(value), Some(Type::Bool)) => Ok(self
                 .context
@@ -10232,6 +10310,13 @@ fn integer_value<'ctx>(
     }
 }
 
+fn is_signed_integer_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
+    )
+}
+
 fn struct_value<'ctx>(
     values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
     id: ValueId,
@@ -10299,6 +10384,28 @@ mod tests {
             llvm.as_str()
                 .contains("call void @__el_runtime_fail(i32 1, i32 0, i64")
         );
+    }
+
+    #[test]
+    fn lowers_all_integer_widths_with_signed_and_unsigned_semantics() {
+        let core = concrete(
+            "defmodule Main do\n  def add_i8(a: i8, b: i8) -> i8 do\n    a + b\n  end\n  def sub_i16(a: i16, b: i16) -> i16 do\n    a - b\n  end\n  def div_i32(a: i32, b: i32) -> i32 do\n    a / b\n  end\n  def rem_i64(a: i64, b: i64) -> i64 do\n    a % b\n  end\n  def add_isize(a: isize, b: isize) -> isize do\n    a + b\n  end\n  def add_u8(a: u8, b: u8) -> u8 do\n    a + b\n  end\n  def sub_u16(a: u16, b: u16) -> u16 do\n    a - b\n  end\n  def div_u32(a: u32, b: u32) -> u32 do\n    a / b\n  end\n  def rem_u64(a: u64, b: u64) -> u64 do\n    a % b\n  end\n  def add_usize(a: usize, b: usize) -> usize do\n    a + b\n  end\n  def main() -> i32 do\n    add_i8(1, 2)\n    sub_i16(3, 1)\n    div_i32(4, 2)\n    rem_i64(5, 2)\n    add_isize(1, 2)\n    add_u8(1, 2)\n    sub_u16(3, 1)\n    div_u32(4, 2)\n    rem_u64(5, 2)\n    add_usize(1, 2)\n    42\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("integer-width lowering verifies");
+        let text = llvm.as_str();
+        for expected in [
+            "@llvm.sadd.with.overflow.i8",
+            "@llvm.ssub.with.overflow.i16",
+            "sdiv i32",
+            "srem i64",
+            "@llvm.uadd.with.overflow.i8",
+            "@llvm.usub.with.overflow.i16",
+            "udiv i32",
+            "urem i64",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
     }
 
     #[test]

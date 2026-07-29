@@ -990,6 +990,19 @@ verified managed runtime.
   regional-indicator, and emoji-ZWJ inputs plus retained eager and lazy results.
   This closes the Unicode and views deliverable groups; direct full-corpus checks
   through all three public APIs remain in the open Milestone 6 conformance test.
+- [x] Completed the remaining integer-width foundation for `i8`, `i16`, `i32`,
+  `i64`, `isize`, `u8`, `u16`, `u32`, `u64`, and `usize`. All widths now flow
+  through type formation, contextual literal and pattern range checks, protocol
+  satisfaction, Generic/Concrete Core verification and specialization, target
+  layouts, LLVM constants, comparisons, bitstring inputs, and map key equality
+  and hashing.
+- [x] Checked add/subtract/multiply now select signed or unsigned LLVM overflow
+  intrinsics for every width; division and remainder preserve signed `MIN / -1`
+  protection while using unsigned operations where required. Focused LLVM and
+  development/release native regressions cover exact layouts, unsigned high-bit
+  division, signed and unsigned arithmetic, overflow, and unsigned underflow.
+  Floats, explicit conversions, shifts, bitwise operators, unary integer
+  operators, and wrapping APIs remain open in the Numbers deliverable group.
 
 ### Milestone 7 — Protocols and iteration
 

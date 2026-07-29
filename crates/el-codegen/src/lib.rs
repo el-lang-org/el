@@ -86,6 +86,7 @@ impl std::error::Error for InvalidTypeLayout {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrimitiveAbi {
     pub u8: TypeLayout,
+    pub i16: TypeLayout,
     pub i32: TypeLayout,
     pub i64: TypeLayout,
     pub usize: TypeLayout,
@@ -99,6 +100,7 @@ impl PrimitiveAbi {
     pub fn host() -> Self {
         Self {
             u8: rust_layout::<u8>(),
+            i16: rust_layout::<i16>(),
             i32: rust_layout::<i32>(),
             i64: rust_layout::<i64>(),
             usize: rust_layout::<usize>(),
@@ -164,13 +166,14 @@ pub fn compute_primitive_layouts(module: &ConcreteModule, abi: PrimitiveAbi) -> 
         .types
         .iter()
         .map(|ty| match ty {
-            Type::U8 => Some(abi.u8),
-            Type::I32 => Some(abi.i32),
+            Type::I8 | Type::U8 => Some(abi.u8),
+            Type::I16 | Type::U16 => Some(abi.i16),
+            Type::I32 | Type::U32 => Some(abi.i32),
             Type::Rune => Some(abi.i32),
             Type::Utf8Error => Some(abi.usize),
             Type::I64 => Some(abi.i64),
             Type::U64 => Some(abi.i64),
-            Type::Usize => Some(abi.usize),
+            Type::Isize | Type::Usize => Some(abi.usize),
             Type::Function { .. } => Some(abi.usize),
             Type::Bool => Some(abi.boolean),
             Type::Unit => Some(abi.unit),
@@ -212,14 +215,34 @@ mod tests {
 
     #[test]
     fn computes_all_first_slice_primitive_layouts_by_type_id() {
-        let module = module(vec![Type::Unit, Type::Bool, Type::I64, Type::I32, Type::U8]);
+        let module = module(vec![
+            Type::Unit,
+            Type::Bool,
+            Type::I8,
+            Type::I16,
+            Type::I32,
+            Type::I64,
+            Type::Isize,
+            Type::U8,
+            Type::U16,
+            Type::U32,
+            Type::U64,
+            Type::Usize,
+        ]);
         let layouts = compute_primitive_layouts(&module, PrimitiveAbi::host());
 
         assert_eq!(layouts.get(TypeId(0)).unwrap(), rust_layout::<()>());
         assert_eq!(layouts.get(TypeId(1)).unwrap(), rust_layout::<bool>());
-        assert_eq!(layouts.get(TypeId(2)).unwrap(), rust_layout::<i64>());
-        assert_eq!(layouts.get(TypeId(3)).unwrap(), rust_layout::<i32>());
-        assert_eq!(layouts.get(TypeId(4)).unwrap(), rust_layout::<u8>());
+        assert_eq!(layouts.get(TypeId(2)).unwrap(), rust_layout::<i8>());
+        assert_eq!(layouts.get(TypeId(3)).unwrap(), rust_layout::<i16>());
+        assert_eq!(layouts.get(TypeId(4)).unwrap(), rust_layout::<i32>());
+        assert_eq!(layouts.get(TypeId(5)).unwrap(), rust_layout::<i64>());
+        assert_eq!(layouts.get(TypeId(6)).unwrap(), rust_layout::<isize>());
+        assert_eq!(layouts.get(TypeId(7)).unwrap(), rust_layout::<u8>());
+        assert_eq!(layouts.get(TypeId(8)).unwrap(), rust_layout::<u16>());
+        assert_eq!(layouts.get(TypeId(9)).unwrap(), rust_layout::<u32>());
+        assert_eq!(layouts.get(TypeId(10)).unwrap(), rust_layout::<u64>());
+        assert_eq!(layouts.get(TypeId(11)).unwrap(), rust_layout::<usize>());
         assert_eq!(layouts.get(TypeId(0)).unwrap().size(), 0);
         assert_eq!(layouts.get(TypeId(0)).unwrap().alignment(), 1);
     }
@@ -229,6 +252,7 @@ mod tests {
         let i64 = TypeLayout::new(8, 4).unwrap();
         let abi = PrimitiveAbi {
             u8: TypeLayout::new(1, 1).unwrap(),
+            i16: TypeLayout::new(2, 2).unwrap(),
             i32: TypeLayout::new(4, 4).unwrap(),
             i64,
             usize: TypeLayout::new(8, 8).unwrap(),

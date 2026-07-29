@@ -13,8 +13,11 @@ pub struct TypeId(pub u32);
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Type {
+    I8,
+    I16,
     I32,
     I64,
+    Isize,
     Usize,
     Bool,
     Unit,
@@ -27,6 +30,8 @@ pub enum Type {
     CodepointView,
     GraphemeView,
     U8,
+    U16,
+    U32,
     U64,
     Atom(String),
     List(TypeId),
@@ -757,6 +762,9 @@ impl<'a> Checker<'a> {
             TypeSyntax::Primitive { name, span } => match name.as_str() {
                 "i32" => Some(TypeId(0)),
                 "i64" => Some(TypeId(1)),
+                "i8" => Some(self.intern(Type::I8)),
+                "i16" => Some(self.intern(Type::I16)),
+                "isize" => Some(self.intern(Type::Isize)),
                 "usize" => Some(self.intern(Type::Usize)),
                 "bool" => Some(TypeId(2)),
                 "unit" => Some(TypeId(3)),
@@ -769,6 +777,8 @@ impl<'a> Checker<'a> {
                 "String.CodepointView" => Some(self.intern(Type::CodepointView)),
                 "String.GraphemeView" => Some(self.intern(Type::GraphemeView)),
                 "u8" => Some(self.intern(Type::U8)),
+                "u16" => Some(self.intern(Type::U16)),
+                "u32" => Some(self.intern(Type::U32)),
                 "u64" => Some(self.intern(Type::U64)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
@@ -1548,7 +1558,7 @@ impl<'a> Checker<'a> {
             "integer" | "additive_expr" | "multiplicative_expr" => members
                 .iter()
                 .copied()
-                .filter(|member| matches!(self.types[member.0 as usize], Type::I32 | Type::I64 | Type::U8 | Type::U64))
+                .filter(|member| is_integer_type(&self.types[member.0 as usize]))
                 .collect::<Vec<_>>(),
             "kw_true" | "kw_false" => members
                 .iter()
@@ -1991,20 +2001,11 @@ impl<'a> Checker<'a> {
                     PatternShape::Atom(name.clone()),
                 )
             }
-            "integer"
-                if matches!(
-                    self.types[subject.0 as usize],
-                    Type::I32 | Type::I64 | Type::U8 | Type::U64
-                ) =>
-            {
+            "integer" if is_integer_type(&self.types[subject.0 as usize]) => {
                 let value = integer_value(node)?;
-                let in_range = match self.types[subject.0 as usize] {
-                    Type::I32 => (i32::MIN as i128..=i32::MAX as i128).contains(&value),
-                    Type::I64 => (i64::MIN as i128..=i64::MAX as i128).contains(&value),
-                    Type::U8 => (0..=u8::MAX as i128).contains(&value),
-                    Type::U64 => (0..=u64::MAX as i128).contains(&value),
-                    _ => unreachable!("guard accepts only integer pattern types"),
-                };
+                let (minimum, maximum) = integer_bounds(&self.types[subject.0 as usize])
+                    .expect("guard accepts only integer pattern types");
+                let in_range = (minimum..=maximum).contains(&value);
                 if !in_range {
                     self.diagnostics.push(Diagnostic::error(
                         "E2106",
@@ -2384,25 +2385,15 @@ impl<'a> Checker<'a> {
 
     fn check_integer(&mut self, node: &Node, expected: Option<TypeId>) -> Option<TypedExpr> {
         let ty = expected
-            .filter(|ty| {
-                matches!(
-                    self.types[ty.0 as usize],
-                    Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64
-                )
-            })
+            .filter(|ty| is_integer_type(&self.types[ty.0 as usize]))
             .unwrap_or(TypeId(1));
         let Some(Value::Integer { radix, digits, .. }) = &node.value else {
             return None;
         };
         let value = u128::from_str_radix(digits, *radix).ok();
-        let limit = match self.types[ty.0 as usize] {
-            Type::I32 => i32::MAX as u128,
-            Type::I64 => i64::MAX as u128,
-            Type::Usize => usize::MAX as u128,
-            Type::U8 => u8::MAX as u128,
-            Type::U64 => u64::MAX as u128,
-            _ => unreachable!(),
-        };
+        let limit = integer_bounds(&self.types[ty.0 as usize])
+            .map(|(_, maximum)| maximum as u128)
+            .expect("expected type is an integer");
         if value.is_none_or(|value| value > limit) {
             self.diagnostics.push(Diagnostic::error(
                 "E2106",
@@ -2479,10 +2470,7 @@ impl<'a> Checker<'a> {
                 (value, TypedBitstringSegmentKind::Bytes { size })
             } else {
                 let value = self.check_expr(value_node, None, owner, scopes)?;
-                if !matches!(
-                    self.types[value.ty.0 as usize],
-                    Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64
-                ) {
+                if !is_integer_type(&self.types[value.ty.0 as usize]) {
                     self.diagnostics.push(Diagnostic::error(
                         "E2154",
                         value.span,
@@ -2692,7 +2680,7 @@ impl<'a> Checker<'a> {
             _ => return None,
         };
         let left = self.check_expr(&node.children[0], expected, owner, scopes)?;
-        if !matches!(self.types[left.ty.0 as usize], Type::I32 | Type::I64) {
+        if !is_integer_type(&self.types[left.ty.0 as usize]) {
             self.diagnostics.push(Diagnostic::error(
                 "E2108",
                 node.span,
@@ -2733,10 +2721,9 @@ impl<'a> Checker<'a> {
             operator,
             ComparisonOperator::Equal | ComparisonOperator::NotEqual
         );
-        let supported = matches!(
-            self.types[left.ty.0 as usize],
-            Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64 | Type::Rune
-        ) || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
+        let supported = is_integer_type(&self.types[left.ty.0 as usize])
+            || matches!(self.types[left.ty.0 as usize], Type::Rune)
+            || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
         if !supported {
             self.diagnostics.push(Diagnostic::error(
                 "E2139",
@@ -4161,8 +4148,11 @@ impl<'a> Checker<'a> {
                     .iter()
                     .any(|(parameter, required)| *parameter == ty && required == protocol)
             }),
-            Type::I32
+            Type::I8
+            | Type::I16
+            | Type::I32
             | Type::I64
+            | Type::Isize
             | Type::Usize
             | Type::Bool
             | Type::Unit
@@ -4171,6 +4161,8 @@ impl<'a> Checker<'a> {
             | Type::Bits
             | Type::Rune
             | Type::U8
+            | Type::U16
+            | Type::U32
             | Type::U64
             | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
@@ -4226,8 +4218,11 @@ impl<'a> Checker<'a> {
 
     fn type_name(&self, id: TypeId) -> String {
         match &self.types[id.0 as usize] {
+            Type::I8 => "i8".to_owned(),
+            Type::I16 => "i16".to_owned(),
             Type::I32 => "i32".to_owned(),
             Type::I64 => "i64".to_owned(),
+            Type::Isize => "isize".to_owned(),
             Type::Usize => "usize".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
@@ -4240,6 +4235,8 @@ impl<'a> Checker<'a> {
             Type::CodepointView => "String.CodepointView".to_owned(),
             Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
+            Type::U16 => "u16".to_owned(),
+            Type::U32 => "u32".to_owned(),
             Type::U64 => "u64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
@@ -4297,8 +4294,11 @@ impl<'a> Checker<'a> {
 
     fn type_key(&self, id: TypeId) -> String {
         match &self.types[id.0 as usize] {
+            Type::I8 => "00:i8".to_owned(),
+            Type::I16 => "00:i16".to_owned(),
             Type::I32 => "00:i32".to_owned(),
             Type::I64 => "00:i64".to_owned(),
+            Type::Isize => "00:isize".to_owned(),
             Type::Usize => "00:usize".to_owned(),
             Type::Bool => "00:bool".to_owned(),
             Type::Unit => "00:unit".to_owned(),
@@ -4311,6 +4311,8 @@ impl<'a> Checker<'a> {
             Type::CodepointView => "00:String.CodepointView".to_owned(),
             Type::GraphemeView => "00:String.GraphemeView".to_owned(),
             Type::U8 => "00:u8".to_owned(),
+            Type::U16 => "00:u16".to_owned(),
+            Type::U32 => "00:u32".to_owned(),
             Type::U64 => "00:u64".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
@@ -5509,10 +5511,9 @@ fn verify_expr(
     }
     match &expression.kind {
         TypedExprKind::Integer(_)
-            if !matches!(
-                types.get(expression.ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
-            ) =>
+            if !types
+                .get(expression.ty.0 as usize)
+                .is_some_and(is_integer_type) =>
         {
             errors.push("integer expression has a non-integer type".to_owned());
         }
@@ -5861,10 +5862,10 @@ fn verify_expr(
                 );
                 match &segment.kind {
                     TypedBitstringSegmentKind::Integer { width, .. } => {
-                        if !matches!(
-                            types.get(segment.value.ty.0 as usize),
-                            Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64)
-                        ) || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
+                        if !types
+                            .get(segment.value.ty.0 as usize)
+                            .is_some_and(is_integer_type)
+                            || !matches!(*width, 8 | 16 | 24 | 32 | 40 | 48 | 56 | 64)
                         {
                             errors.push("integer bitstring segment is invalid".to_owned());
                         }
@@ -6666,10 +6667,10 @@ fn verify_expr(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = matches!(
-                types.get(left.ty.0 as usize),
-                Some(Type::I32 | Type::I64 | Type::Usize | Type::U8 | Type::U64 | Type::Rune)
-            ) || (!ordered && standard_eq_type(types, left.ty));
+            let supported = types
+                .get(left.ty.0 as usize)
+                .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::Rune))
+                || (!ordered && standard_eq_type(types, left.ty));
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
             }
@@ -6804,11 +6805,34 @@ fn option_payload(types: &[Type], ty: TypeId) -> Option<TypeId> {
     has_none.then_some(payload).flatten()
 }
 
+fn integer_bounds(ty: &Type) -> Option<(i128, i128)> {
+    Some(match ty {
+        Type::I8 => (i8::MIN.into(), i8::MAX.into()),
+        Type::I16 => (i16::MIN.into(), i16::MAX.into()),
+        Type::I32 => (i32::MIN.into(), i32::MAX.into()),
+        Type::I64 => (i64::MIN.into(), i64::MAX.into()),
+        Type::Isize => (isize::MIN as i128, isize::MAX as i128),
+        Type::U8 => (0, u8::MAX.into()),
+        Type::U16 => (0, u16::MAX.into()),
+        Type::U32 => (0, u32::MAX.into()),
+        Type::U64 => (0, u64::MAX.into()),
+        Type::Usize => (0, usize::MAX as i128),
+        _ => return None,
+    })
+}
+
+fn is_integer_type(ty: &Type) -> bool {
+    integer_bounds(ty).is_some()
+}
+
 fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
     match types.get(ty.0 as usize) {
         Some(
-            Type::I32
+            Type::I8
+            | Type::I16
+            | Type::I32
             | Type::I64
+            | Type::Isize
             | Type::Usize
             | Type::Bool
             | Type::Unit
@@ -6818,6 +6842,8 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
             | Type::Rune
             | Type::Utf8Error
             | Type::U8
+            | Type::U16
+            | Type::U32
             | Type::U64
             | Type::Atom(_),
         ) => true,
@@ -7056,8 +7082,11 @@ impl TypedProgram {
 
     fn display_type(&self, id: TypeId) -> String {
         match &self.types[id.0 as usize] {
+            Type::I8 => "i8".to_owned(),
+            Type::I16 => "i16".to_owned(),
             Type::I32 => "i32".to_owned(),
             Type::I64 => "i64".to_owned(),
+            Type::Isize => "isize".to_owned(),
             Type::Usize => "usize".to_owned(),
             Type::Bool => "bool".to_owned(),
             Type::Unit => "unit".to_owned(),
@@ -7070,6 +7099,8 @@ impl TypedProgram {
             Type::CodepointView => "String.CodepointView".to_owned(),
             Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
+            Type::U16 => "u16".to_owned(),
+            Type::U32 => "u32".to_owned(),
             Type::U64 => "u64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
