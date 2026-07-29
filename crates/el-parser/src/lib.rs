@@ -432,6 +432,21 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
                     children: vec![node],
                 });
             }
+            if let Some(Value::Float {
+                spelling,
+                normalized,
+            }) = &mut node.value
+            {
+                spelling.insert(0, '-');
+                normalized.insert(0, '-');
+                node.span = span;
+                return Ok(Node {
+                    kind: SyntaxKind::new("pattern_literal"),
+                    span,
+                    value: None,
+                    children: vec![node],
+                });
+            }
         }
     }
     if is_left_associative(rule) && pair.clone().into_inner().count() > 1 {

@@ -266,7 +266,7 @@ fn enum_count_at_and_to_list_preserve_order_and_managed_items() {
 #[test]
 fn enum_each_any_and_all_short_circuit_and_root_managed_items() {
     let temp = TempDir::new();
-    let source = "defmodule Main do\n  def retain(value: string) -> unit do\n    Rune.to_string('🙂')\n    String.byte_size(value)\n    unit\n  end\n  def any_first(value: i32) -> bool do\n    if value == 1 do\n      true\n    else\n      1 / 0 == 0\n    end\n  end\n  def all_first_false(value: i32) -> bool do\n    if value == 0 do\n      false\n    else\n      1 / 0 == 0\n    end\n  end\n  def byte_a(value: u8) -> bool do\n    if value == 65 do\n      true\n    else\n      1 / 0 == 0\n    end\n  end\n  def pair_positive(value: {i32, string}) -> bool do\n    match value do\n      {key, text} -> key > 0 and String.byte_size(text) > 0\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    false_first: [i32; 2] = #[0, 1]\n    slice = Slice.from_array(false_first)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    Enum.each(list, retain)\n    if Enum.any(array, any_first) and Enum.all(slice, all_first_false) == false and Enum.any(data, byte_a) and Enum.all(map, pair_positive) and Enum.any(empty, any_first) == false and Enum.all(empty, any_first) do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let source = "defmodule Main do\n  def dynamic_divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def retain(value: string) -> unit do\n    Rune.to_string('🙂')\n    String.byte_size(value)\n    unit\n  end\n  def any_first(value: i32) -> bool do\n    if value == 1 do\n      true\n    else\n      dynamic_divide(1, 0) == 0\n    end\n  end\n  def all_first_false(value: i32) -> bool do\n    if value == 0 do\n      false\n    else\n      dynamic_divide(1, 0) == 0\n    end\n  end\n  def byte_a(value: u8) -> bool do\n    if value == 65 do\n      true\n    else\n      dynamic_divide(1, 0) == 0\n    end\n  end\n  def pair_positive(value: {i32, string}) -> bool do\n    match value do\n      {key, text} -> key > 0 and String.byte_size(text) > 0\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    false_first: [i32; 2] = #[0, 1]\n    slice = Slice.from_array(false_first)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    Enum.each(list, retain)\n    if Enum.any(array, any_first) and Enum.all(slice, all_first_false) == false and Enum.any(data, byte_a) and Enum.all(map, pair_positive) and Enum.any(empty, any_first) == false and Enum.all(empty, any_first) do\n      42\n    else\n      0\n    end\n  end\nend\n";
 
     for (label, profile) in [
         ("development", BuildProfile::Development),
@@ -284,7 +284,7 @@ fn enum_each_any_and_all_short_circuit_and_root_managed_items() {
 #[test]
 fn enum_reduce_is_strict_left_to_right_and_roots_the_accumulator() {
     let temp = TempDir::new();
-    let source = "defmodule Main do\n  def ordered(total: i32, value: i32) -> i32 do\n    if total == 0 and value == 1 do\n      1\n    else\n      if total == 1 and value == 2 do\n        42\n      else\n        1 / 0\n      end\n    end\n  end\n  def ordered_byte(total: i32, value: u8) -> i32 do\n    if total == 0 and value == 65 do\n      1\n    else\n      if total == 1 and value == 66 do\n        42\n      else\n        1 / 0\n      end\n    end\n  end\n  def ordered_pair(total: i32, value: {i32, string}) -> i32 do\n    match value do\n      {key, _} -> ordered(total, key)\n    end\n  end\n  def last(previous: string, value: string) -> string do\n    Rune.to_string('🙂')\n    value\n  end\n  def main() -> i32 do\n    strings: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    final = Enum.reduce(strings, \"initial\", last)\n    if final == \"bb\" and Enum.reduce(array, 0 :: i32, ordered) == 42 and Enum.reduce(slice, 0 :: i32, ordered) == 42 and Enum.reduce(data, 0 :: i32, ordered_byte) == 42 and Enum.reduce(map, 0 :: i32, ordered_pair) == 42 and Enum.reduce(empty, 42 :: i32, ordered) == 42 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    let source = "defmodule Main do\n  def dynamic_divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def ordered(total: i32, value: i32) -> i32 do\n    if total == 0 and value == 1 do\n      1\n    else\n      if total == 1 and value == 2 do\n        42\n      else\n        dynamic_divide(1, 0)\n      end\n    end\n  end\n  def ordered_byte(total: i32, value: u8) -> i32 do\n    if total == 0 and value == 65 do\n      1\n    else\n      if total == 1 and value == 66 do\n        42\n      else\n        dynamic_divide(1, 0)\n      end\n    end\n  end\n  def ordered_pair(total: i32, value: {i32, string}) -> i32 do\n    match value do\n      {key, _} -> ordered(total, key)\n    end\n  end\n  def last(previous: string, value: string) -> string do\n    Rune.to_string('🙂')\n    value\n  end\n  def main() -> i32 do\n    strings: [string] = [\"a\", \"bb\"]\n    array: [i32; 2] = #[1, 2]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    empty: [i32] = []\n    final = Enum.reduce(strings, \"initial\", last)\n    if final == \"bb\" and Enum.reduce(array, 0 :: i32, ordered) == 42 and Enum.reduce(slice, 0 :: i32, ordered) == 42 and Enum.reduce(data, 0 :: i32, ordered_byte) == 42 and Enum.reduce(map, 0 :: i32, ordered_pair) == 42 and Enum.reduce(empty, 42 :: i32, ordered) == 42 do\n      42\n    else\n      0\n    end\n  end\nend\n";
 
     for (label, profile) in [
         ("development", BuildProfile::Development),
@@ -903,7 +903,7 @@ fn every_standard_composite_map_key_uses_structural_hash_and_equality() {
 #[test]
 fn managed_allocation_failure_reports_origin_and_skips_cleanup() {
     let temp = TempDir::new();
-    let source = "defmodule Main do\n  def cleanup() -> unit do\n    1 / 0\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    values: [i32] = [1]\n    0\n  end\nend\n";
+    let source = "defmodule Main do\n  def dynamic_divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def cleanup() -> unit do\n    dynamic_divide(1, 0)\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    values: [i32] = [1]\n    0\n  end\nend\n";
     let mut sources = SourceMap::new();
     let file = sources.add_file("src/main.el", source);
     let generic = analyze_source(file, source).expect("source reaches Generic Core");
@@ -944,7 +944,7 @@ fn development_and_release_preserve_arithmetic_exit_semantics() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);
     let arithmetic = "defmodule Main do\n  def multiply(value: i32, factor: i32) -> i32 do\n    value * factor\n  end\n  def main() -> i32 do\n    multiply(6, 7)\n  end\nend\n";
-    let overflow = "defmodule Main do\n  def main() -> i32 do\n    2147483647 + 1\n  end\nend\n";
+    let overflow = "defmodule Main do\n  def overflow(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def main() -> i32 do\n    overflow(2147483647, 1)\n  end\nend\n";
 
     for (label, profile) in [
         ("debug", BuildProfile::Development),
@@ -984,15 +984,15 @@ fn every_integer_width_preserves_native_arithmetic_semantics() {
     let overflows = [
         (
             "i8",
-            "defmodule Main do\n  def overflow() -> i8 do\n    127 + 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+            "defmodule Main do\n  def overflow(left: i8, right: i8) -> i8 do\n    left + right\n  end\n  def main() -> i32 do\n    overflow(127, 1)\n    0\n  end\nend\n",
         ),
         (
             "u16",
-            "defmodule Main do\n  def overflow() -> u16 do\n    65535 + 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+            "defmodule Main do\n  def overflow(left: u16, right: u16) -> u16 do\n    left + right\n  end\n  def main() -> i32 do\n    overflow(65535, 1)\n    0\n  end\nend\n",
         ),
         (
             "u16-underflow",
-            "defmodule Main do\n  def overflow() -> u16 do\n    0 - 1\n  end\n  def main() -> i32 do\n    overflow()\n    0\n  end\nend\n",
+            "defmodule Main do\n  def overflow(left: u16, right: u16) -> u16 do\n    left - right\n  end\n  def main() -> i32 do\n    overflow(0, 1)\n    0\n  end\nend\n",
         ),
     ];
 
@@ -1023,6 +1023,303 @@ fn every_integer_width_preserves_native_arithmetic_semantics() {
                 .code(),
                 Some(101),
                 "{ty} overflow retains runtime category 1 in {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn integer_unary_bitwise_and_shifts_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def negate(value: i8) -> i8 do\n    -value\n  end\n  def invert(value: u8) -> u8 do\n    ~value\n  end\n  def combine(left: u8, right: u8) -> u8 do\n    left & right | left ^ right\n  end\n  def shift_left(value: i8, count: usize) -> i8 do\n    value << count\n  end\n  def signed_right(value: i8, count: usize) -> i8 do\n    value >> count\n  end\n  def unsigned_right(value: u8, count: usize) -> u8 do\n    value >> count\n  end\n  def main() -> i32 do\n    if negate(42) == -42 and invert(0) == 255 and combine(12, 10) == 14 and shift_left(21, 1) == 42 and signed_right(-8, 1) == -4 and unsigned_right(128, 1) == 64 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let failures = [
+        (
+            "left-count",
+            "defmodule Main do\n  def shift(value: i8, count: usize) -> i8 do\n    value << count\n  end\n  def main() -> i32 do\n    shift(1, 8)\n    0\n  end\nend\n",
+            103,
+        ),
+        (
+            "right-count",
+            "defmodule Main do\n  def shift(value: u8, count: usize) -> u8 do\n    value >> count\n  end\n  def main() -> i32 do\n    shift(1, 8)\n    0\n  end\nend\n",
+            103,
+        ),
+        (
+            "signed-left-overflow",
+            "defmodule Main do\n  def shift(value: i8, count: usize) -> i8 do\n    value << count\n  end\n  def main() -> i32 do\n    shift(64, 1)\n    0\n  end\nend\n",
+            101,
+        ),
+        (
+            "unsigned-left-overflow",
+            "defmodule Main do\n  def shift(value: u8, count: usize) -> u8 do\n    value << count\n  end\n  def main() -> i32 do\n    shift(128, 1)\n    0\n  end\nend\n",
+            101,
+        ),
+        (
+            "negation-overflow",
+            "defmodule Main do\n  def minimum() -> i8 do\n    -128\n  end\n  def negate(value: i8) -> i8 do\n    -value\n  end\n  def main() -> i32 do\n    negate(minimum())\n    0\n  end\nend\n",
+            101,
+        ),
+    ];
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-integer-operators"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        for (case, source, expected) in failures {
+            assert_eq!(
+                build_and_run(
+                    &temp.0,
+                    &runtime,
+                    &format!("{label}-{case}"),
+                    source,
+                    profile,
+                )
+                .code(),
+                Some(expected),
+                "{case} has the same failure category in {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_integer_conversions_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def signed(value: i8) -> i64 do\n    i64(value)\n  end\n  def unsigned(value: u8) -> u64 do\n    u64(value)\n  end\n  def narrow(value: i64) -> i8 do\n    i8(value)\n  end\n  def pointer(value: usize) -> isize do\n    isize(value)\n  end\n  def main() -> i32 do\n    if signed(-42) == -42 and unsigned(42) == 42 and narrow(42) == 42 and pointer(42) == 42 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let failures = [
+        (
+            "negative-to-unsigned",
+            "defmodule Main do\n  def convert(value: i16) -> u8 do\n    u8(value)\n  end\n  def main() -> i32 do\n    convert(-1)\n    0\n  end\nend\n",
+        ),
+        (
+            "signed-narrowing",
+            "defmodule Main do\n  def convert(value: i64) -> u8 do\n    u8(value)\n  end\n  def main() -> i32 do\n    convert(256)\n    0\n  end\nend\n",
+        ),
+        (
+            "unsigned-to-signed",
+            "defmodule Main do\n  def convert(value: u16) -> i16 do\n    i16(value)\n  end\n  def main() -> i32 do\n    convert(32768)\n    0\n  end\nend\n",
+        ),
+    ];
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-integer-conversions"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        for (case, source) in failures {
+            assert_eq!(
+                build_and_run(
+                    &temp.0,
+                    &runtime,
+                    &format!("{label}-{case}"),
+                    source,
+                    profile,
+                )
+                .code(),
+                Some(104),
+                "{case} retains invalid_conversion in {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_integer_to_rune_conversions_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def convert(value: u32) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    if convert(128578) == '🙂' and convert(65) == 'A' do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let failures = [
+        (
+            "negative-rune",
+            "defmodule Main do\n  def convert(value: i64) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    convert(-1)\n    0\n  end\nend\n",
+        ),
+        (
+            "surrogate-rune",
+            "defmodule Main do\n  def convert(value: u32) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    convert(55296)\n    0\n  end\nend\n",
+        ),
+        (
+            "above-rune",
+            "defmodule Main do\n  def convert(value: u64) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    convert(1114112)\n    0\n  end\nend\n",
+        ),
+    ];
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-integer-to-rune"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        for (case, source) in failures {
+            assert_eq!(
+                build_and_run(
+                    &temp.0,
+                    &runtime,
+                    &format!("{label}-{case}"),
+                    source,
+                    profile,
+                )
+                .code(),
+                Some(104),
+                "{case} retains invalid_conversion in {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wrapping_integer_operations_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  def main() -> i32 do\n    if U8.wrapping_add(255, 1) == 0 and U8.wrapping_sub(0, 1) == 255 and U8.wrapping_mul(16, 16) == 0 and U8.wrapping_neg(1) == 255 and U8.wrapping_shl(1, 9) == 2 and I8.wrapping_shr(-128, 9) == -64 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-wrapping-integers"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "wrapping semantics are profile-independent in {label}"
+        );
+    }
+}
+
+#[test]
+fn ieee_float_arithmetic_and_comparisons_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  def single(value: f32) -> f32 do\n    sum = value + 1.5\n    -sum * 2.0\n  end\n  def main() -> i32 do\n    nan = 0.0 / 0.0\n    if single(1.0) == -5.0 and nan != nan and 1.0 / 0.0 > 1.0 and -0.0 == 0.0 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-ieee-floats"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "IEEE float semantics are profile-independent in {label}"
+        );
+    }
+}
+
+#[test]
+fn float_literal_patterns_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let source = "defmodule Main do\n  def classify(value: f64) -> i32 do\n    match value do\n      0.0 -> 10\n      -1.5 -> 20\n      _ -> 12\n    end\n  end\n  def main() -> i32 do\n    classify(-0.0) + classify(-1.5) + classify(2.0)\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-float-patterns"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "float pattern semantics are profile-independent in {label}"
+        );
+    }
+}
+
+#[test]
+fn float_numeric_conversions_match_in_both_profiles() {
+    let temp = TempDir::new();
+    let runtime = compile_runtime_failure_stub(&temp.0);
+    let success = "defmodule Main do\n  def main() -> i32 do\n    if f64(-42) == -42.0 and i32(42.9) == 42 and i8(127.9) == 127 and i8(-128.9) == -128 and i64(-9223372036854775808.0) == -9223372036854775808 and u8(-0.9) == 0 and u8(255.9) == 255 and f64(f32(1.5)) == 1.5 and f32(1e39) > f32(1.0) do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let failures = [
+        (
+            "nan-to-integer",
+            "defmodule Main do\n  def convert(value: f64) -> i8 do\n    i8(value)\n  end\n  def main() -> i32 do\n    convert(0.0 / 0.0)\n    0\n  end\nend\n",
+        ),
+        (
+            "infinity-to-integer",
+            "defmodule Main do\n  def convert(value: f64) -> i8 do\n    i8(value)\n  end\n  def main() -> i32 do\n    convert(1.0 / 0.0)\n    0\n  end\nend\n",
+        ),
+        (
+            "high-float-to-integer",
+            "defmodule Main do\n  def convert(value: f64) -> i8 do\n    i8(value)\n  end\n  def main() -> i32 do\n    convert(128.0)\n    0\n  end\nend\n",
+        ),
+        (
+            "negative-float-to-unsigned",
+            "defmodule Main do\n  def convert(value: f64) -> u8 do\n    u8(value)\n  end\n  def main() -> i32 do\n    convert(-1.0)\n    0\n  end\nend\n",
+        ),
+    ];
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run(
+                &temp.0,
+                &runtime,
+                &format!("{label}-float-conversions"),
+                success,
+                profile,
+            )
+            .code(),
+            Some(42)
+        );
+        for (case, source) in failures {
+            assert_eq!(
+                build_and_run(
+                    &temp.0,
+                    &runtime,
+                    &format!("{label}-{case}"),
+                    source,
+                    profile,
+                )
+                .code(),
+                Some(104),
+                "{case} retains invalid_conversion in {label}"
             );
         }
     }
@@ -1095,7 +1392,7 @@ fn fixed_array_indexing_is_checked_in_development_and_release() {
 fn native_control_flow_preserves_loops_short_circuiting_and_early_returns() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);
-    let factorial = "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and 1 / 0 == 0 do\n      return 1\n    end\n    if true or 1 / 0 == 0 do\n      return result\n    end\n    0\n  end\nend\n";
+    let factorial = "defmodule Main do\n  def divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and divide(1, 0) == 0 do\n      return 1\n    end\n    if true or divide(1, 0) == 0 do\n      return result\n    end\n    0\n  end\nend\n";
 
     for (label, profile) in [
         ("debug", BuildProfile::Development),
@@ -1121,7 +1418,7 @@ fn native_pipelines_insert_and_evaluate_their_input_first() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);
     let succeeds = "defmodule Main do\n  def multiply(value: i32, factor: i32) -> i32 do\n    value * factor\n  end\n  def identity(value: a) -> a do\n    value\n  end\n  def main() -> i32 do\n    6 |> multiply(7) |> identity()\n  end\nend\n";
-    let ordered_failure = "defmodule Main do\n  def fail_input() -> i32 do\n    2147483647 + 1\n  end\n  def combine(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def main() -> i32 do\n    fail_input() |> combine(1 / 0)\n  end\nend\n";
+    let ordered_failure = "defmodule Main do\n  def add(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def fail_input() -> i32 do\n    add(2147483647, 1)\n  end\n  def combine(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def main() -> i32 do\n    fail_input() |> combine(divide(1, 0))\n  end\nend\n";
 
     for (label, profile) in [
         ("debug", BuildProfile::Development),
@@ -1157,7 +1454,7 @@ fn native_pipelines_insert_and_evaluate_their_input_first() {
 fn native_defer_registration_preserves_call_timing_and_capture_snapshots() {
     let temp = TempDir::new();
     let runtime = compile_runtime_failure_stub(&temp.0);
-    let immediate_call = "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def fail_input() -> i32 do\n    2147483647 + 1\n  end\n  def main() -> i32 do\n    defer cleanup(fail_input())\n    1 / 0\n  end\nend\n";
+    let immediate_call = "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def add(left: i32, right: i32) -> i32 do\n    left + right\n  end\n  def divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def fail_input() -> i32 do\n    add(2147483647, 1)\n  end\n  def main() -> i32 do\n    defer cleanup(fail_input())\n    divide(1, 0)\n  end\nend\n";
     let captured_block = "defmodule Main do\n  def numerator() -> i32 do\n    1\n  end\n  def denominator(value: i32) -> i32 do\n    value - 1\n  end\n  def use(value: i32) -> unit do\n    numerator() / denominator(value)\n    unit\n  end\n  def main() -> i32 do\n    mut value: i32 = 1\n    defer do\n      use(value)\n    end\n    value := 2\n    0\n  end\nend\n";
 
     for (label, profile) in [

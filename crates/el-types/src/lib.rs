@@ -33,6 +33,8 @@ pub enum Type {
     U16,
     U32,
     U64,
+    F32,
+    F64,
     Atom(String),
     List(TypeId),
     Array {
@@ -147,6 +149,7 @@ pub enum TypedPatternKind {
     },
     Boolean(bool),
     Integer(i128),
+    Float(u64),
     Atom(String),
     UnionMember {
         member: TypeId,
@@ -253,6 +256,7 @@ pub struct TypedExpr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TypedExprKind {
     Integer(i128),
+    Float(u64),
     Boolean(bool),
     Unit,
     String(String),
@@ -372,6 +376,23 @@ pub enum TypedExprKind {
         left: Box<TypedExpr>,
         right: Box<TypedExpr>,
     },
+    IntegerUnary {
+        operator: IntegerUnaryOperator,
+        operand: Box<TypedExpr>,
+    },
+    FloatNegate(Box<TypedExpr>),
+    IntegerBinary {
+        operator: IntegerBinaryOperator,
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
+    },
+    IntegerConvert(Box<TypedExpr>),
+    NumericConvert(Box<TypedExpr>),
+    WrappingInteger {
+        operator: WrappingIntegerOperator,
+        left: Box<TypedExpr>,
+        right: Option<Box<TypedExpr>>,
+    },
     Comparison {
         operator: ComparisonOperator,
         left: Box<TypedExpr>,
@@ -449,6 +470,31 @@ pub enum ArithmeticOperator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerUnaryOperator {
+    Negate,
+    BitwiseNot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerBinaryOperator {
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WrappingIntegerOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Negate,
+    ShiftLeft,
+    ShiftRight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComparisonOperator {
     Equal,
     NotEqual,
@@ -485,6 +531,7 @@ enum PatternShape {
     Wildcard,
     Bool(bool),
     Integer(i128),
+    Float(u64),
     Atom(String),
     Union(TypeId),
     Tuple(Vec<(TypeId, PatternShape)>),
@@ -780,6 +827,8 @@ impl<'a> Checker<'a> {
                 "u16" => Some(self.intern(Type::U16)),
                 "u32" => Some(self.intern(Type::U32)),
                 "u64" => Some(self.intern(Type::U64)),
+                "f32" => Some(self.intern(Type::F32)),
+                "f64" => Some(self.intern(Type::F64)),
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
                         "E2100",
@@ -1493,6 +1542,7 @@ impl<'a> Checker<'a> {
         }
         let expression = match node.kind.as_str() {
             "integer" => self.check_integer(node, expected),
+            "float" => self.check_float(node, expected),
             "kw_true" | "kw_false" => Some(TypedExpr {
                 kind: TypedExprKind::Boolean(matches!(node.value, Some(Value::Boolean(true)))),
                 ty: TypeId(2),
@@ -1518,6 +1568,10 @@ impl<'a> Checker<'a> {
             "qualified_value" | "identifier" => self.check_name(node, expected, owner, scopes),
             "additive_expr" | "multiplicative_expr" => {
                 self.check_binary(node, expected, owner, scopes)
+            }
+            "unary_expr" => self.check_integer_unary(node, expected, owner, scopes),
+            "bit_or_expr" | "bit_xor_expr" | "bit_and_expr" | "shift_expr" => {
+                self.check_integer_binary(node, expected, owner, scopes)
             }
             "equality_expr" | "comparison_expr" => self.check_comparison(node, owner, scopes),
             "logical_and_expr" | "logical_or_expr" => self.check_logical(node, owner, scopes),
@@ -1555,7 +1609,14 @@ impl<'a> Checker<'a> {
             unreachable!("caller checks the expected type")
         };
         let candidates = match node.kind.as_str() {
-            "integer" | "additive_expr" | "multiplicative_expr" => members
+            "integer"
+            | "additive_expr"
+            | "multiplicative_expr"
+            | "unary_expr"
+            | "bit_or_expr"
+            | "bit_xor_expr"
+            | "bit_and_expr"
+            | "shift_expr" => members
                 .iter()
                 .copied()
                 .filter(|member| is_integer_type(&self.types[member.0 as usize]))
@@ -2023,6 +2084,30 @@ impl<'a> Checker<'a> {
                     PatternShape::Integer(value),
                 )
             }
+            "float"
+                if matches!(
+                    self.types.get(subject.0 as usize),
+                    Some(Type::F32 | Type::F64)
+                ) =>
+            {
+                let Some(bits) = float_bits(node, &self.types[subject.0 as usize]) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2106",
+                        node.span,
+                        format!(
+                            "floating literal is out of range for `{}`",
+                            self.type_name(subject)
+                        ),
+                    ));
+                    return None;
+                };
+                let shape_bits = canonical_float_pattern_bits(bits);
+                (
+                    TypedPatternKind::Float(bits),
+                    false,
+                    PatternShape::Float(shape_bits),
+                )
+            }
             "typed_pattern" => {
                 let name_node = &node.children[0];
                 let module = self.owner_module(owner)?.to_owned();
@@ -2412,6 +2497,44 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_float(&mut self, node: &Node, expected: Option<TypeId>) -> Option<TypedExpr> {
+        let ty = expected
+            .filter(|ty| matches!(self.types.get(ty.0 as usize), Some(Type::F32 | Type::F64)))
+            .unwrap_or_else(|| self.intern(Type::F64));
+        let Some(Value::Float { normalized, .. }) = &node.value else {
+            return None;
+        };
+        let bits = match self.types.get(ty.0 as usize) {
+            Some(Type::F32) => normalized
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| u64::from(value.to_bits())),
+            Some(Type::F64) => normalized
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(f64::to_bits),
+            _ => None,
+        };
+        let Some(bits) = bits else {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                node.span,
+                format!(
+                    "floating literal is out of range for `{}`",
+                    self.type_name(ty)
+                ),
+            ));
+            return None;
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Float(bits),
+            ty,
+            span: node.span,
+        })
+    }
+
     fn check_string(&mut self, node: &Node) -> Option<TypedExpr> {
         let Some(Value::String { decoded, .. }) = &node.value else {
             return None;
@@ -2680,16 +2803,23 @@ impl<'a> Checker<'a> {
             _ => return None,
         };
         let left = self.check_expr(&node.children[0], expected, owner, scopes)?;
-        if !is_integer_type(&self.types[left.ty.0 as usize]) {
+        let numeric = is_integer_type(&self.types[left.ty.0 as usize])
+            || matches!(self.types[left.ty.0 as usize], Type::F32 | Type::F64);
+        if !numeric {
             self.diagnostics.push(Diagnostic::error(
                 "E2108",
                 node.span,
-                "arithmetic requires an integer type",
+                "arithmetic requires matching integer or floating operands",
             ));
             return None;
         }
         let right = self.check_expr(&node.children[1], Some(left.ty), owner, scopes)?;
         let ty = right.ty;
+        if is_integer_type(&self.types[ty.0 as usize])
+            && self.reject_known_arithmetic_failure(operator, &left, &right, ty, node.span)
+        {
+            return None;
+        }
         Some(TypedExpr {
             kind: TypedExprKind::Binary {
                 operator,
@@ -2699,6 +2829,378 @@ impl<'a> Checker<'a> {
             ty,
             span: node.span,
         })
+    }
+
+    fn check_integer_unary(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let operator = match node.value.as_ref() {
+            Some(Value::Text(value)) if value == "-" => IntegerUnaryOperator::Negate,
+            Some(Value::Text(value)) if value == "~" => IntegerUnaryOperator::BitwiseNot,
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2105",
+                    node.span,
+                    "this unary operator is not implemented in the current slice",
+                ));
+                return None;
+            }
+        };
+        if matches!(operator, IntegerUnaryOperator::Negate)
+            && node.children[0].kind.as_str() == "integer"
+        {
+            let ty = expected.unwrap_or(TypeId(1));
+            let signed = matches!(
+                self.types.get(ty.0 as usize),
+                Some(Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize)
+            );
+            if !signed {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2108",
+                    node.span,
+                    "unary negation requires a signed integer operand",
+                ));
+                return None;
+            }
+            let Some(Value::Integer { radix, digits, .. }) = &node.children[0].value else {
+                return None;
+            };
+            let magnitude = u128::from_str_radix(digits, *radix).ok();
+            let minimum = integer_bounds(&self.types[ty.0 as usize])
+                .map(|(minimum, _)| minimum)
+                .expect("signed integer type has bounds");
+            let limit = minimum.unsigned_abs();
+            if magnitude.is_none_or(|magnitude| magnitude > limit) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2106",
+                    node.span,
+                    format!(
+                        "integer literal is out of range for `{}`",
+                        self.type_name(ty)
+                    ),
+                ));
+                return None;
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Integer(-(magnitude.expect("range checked") as i128)),
+                ty,
+                span: node.span,
+            });
+        }
+        let operand = self.check_expr(&node.children[0], expected, owner, scopes)?;
+        let operand_ty = self.types.get(operand.ty.0 as usize)?;
+        if matches!(operator, IntegerUnaryOperator::Negate)
+            && matches!(operand_ty, Type::F32 | Type::F64)
+        {
+            let ty = operand.ty;
+            return Some(TypedExpr {
+                kind: TypedExprKind::FloatNegate(Box::new(operand)),
+                ty,
+                span: node.span,
+            });
+        }
+        if !is_integer_type(operand_ty) {
+            self.diagnostics.push(Diagnostic::error(
+                "E2108",
+                node.span,
+                "integer unary operators require an integer operand",
+            ));
+            return None;
+        }
+        if matches!(operator, IntegerUnaryOperator::Negate)
+            && !matches!(
+                operand_ty,
+                Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
+            )
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2108",
+                node.span,
+                "unary negation requires a signed integer operand",
+            ));
+            return None;
+        }
+        let ty = operand.ty;
+        if matches!(operator, IntegerUnaryOperator::Negate)
+            && self.constant_integer_value(&operand).is_some_and(|value| {
+                integer_bounds(&self.types[ty.0 as usize])
+                    .is_some_and(|(minimum, _)| value == minimum)
+            })
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                node.span,
+                format!("compile-time integer overflow for `{}`", self.type_name(ty)),
+            ));
+            return None;
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::IntegerUnary {
+                operator,
+                operand: Box::new(operand),
+            },
+            ty,
+            span: node.span,
+        })
+    }
+
+    fn check_integer_binary(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let operator = match node.value.as_ref() {
+            Some(Value::Text(value)) if value == "&" => IntegerBinaryOperator::BitwiseAnd,
+            Some(Value::Text(value)) if value == "|" => IntegerBinaryOperator::BitwiseOr,
+            Some(Value::Text(value)) if value == "^" => IntegerBinaryOperator::BitwiseXor,
+            Some(Value::Text(value)) if value == "<<" => IntegerBinaryOperator::ShiftLeft,
+            Some(Value::Text(value)) if value == ">>" => IntegerBinaryOperator::ShiftRight,
+            _ => return None,
+        };
+        let left = self.check_expr(&node.children[0], expected, owner, scopes)?;
+        if !is_integer_type(&self.types[left.ty.0 as usize]) {
+            self.diagnostics.push(Diagnostic::error(
+                "E2108",
+                node.span,
+                "bitwise and shift operators require an integer left operand",
+            ));
+            return None;
+        }
+        let right_expected = if matches!(
+            operator,
+            IntegerBinaryOperator::ShiftLeft | IntegerBinaryOperator::ShiftRight
+        ) {
+            self.intern(Type::Usize)
+        } else {
+            left.ty
+        };
+        let right = self.check_expr(&node.children[1], Some(right_expected), owner, scopes)?;
+        let ty = left.ty;
+        if self.reject_known_shift_failure(operator, &left, &right, ty, node.span) {
+            return None;
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::IntegerBinary {
+                operator,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            ty,
+            span: node.span,
+        })
+    }
+
+    fn reject_known_arithmetic_failure(
+        &mut self,
+        operator: ArithmeticOperator,
+        left: &TypedExpr,
+        right: &TypedExpr,
+        ty: TypeId,
+        span: Span,
+    ) -> bool {
+        let right = self.constant_integer_value(right);
+        if matches!(
+            operator,
+            ArithmeticOperator::Divide | ArithmeticOperator::Remainder
+        ) && right == Some(0)
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                span,
+                "compile-time division or remainder by zero",
+            ));
+            return true;
+        }
+        let (Some(left), Some(right)) = (self.constant_integer_value(left), right) else {
+            return false;
+        };
+        if matches!(
+            operator,
+            ArithmeticOperator::Divide | ArithmeticOperator::Remainder
+        ) && right == -1
+            && integer_bounds(&self.types[ty.0 as usize])
+                .is_some_and(|(minimum, _)| left == minimum)
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                span,
+                format!("compile-time integer overflow for `{}`", self.type_name(ty)),
+            ));
+            return true;
+        }
+        let result = match operator {
+            ArithmeticOperator::Add => left.checked_add(right),
+            ArithmeticOperator::Subtract => left.checked_sub(right),
+            ArithmeticOperator::Multiply => left.checked_mul(right),
+            ArithmeticOperator::Divide => left.checked_div(right),
+            ArithmeticOperator::Remainder => left.checked_rem(right),
+        };
+        let in_range = result.is_some_and(|result| {
+            integer_bounds(&self.types[ty.0 as usize])
+                .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&result))
+        });
+        if !in_range {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                span,
+                format!("compile-time integer overflow for `{}`", self.type_name(ty)),
+            ));
+        }
+        !in_range
+    }
+
+    fn reject_known_shift_failure(
+        &mut self,
+        operator: IntegerBinaryOperator,
+        left: &TypedExpr,
+        right: &TypedExpr,
+        ty: TypeId,
+        span: Span,
+    ) -> bool {
+        if !matches!(
+            operator,
+            IntegerBinaryOperator::ShiftLeft | IntegerBinaryOperator::ShiftRight
+        ) {
+            return false;
+        }
+        let width = integer_bit_width(&self.types[ty.0 as usize])
+            .expect("shift operand has an integer type");
+        let right = self.constant_integer_value(right);
+        if right.is_some_and(|right| right >= i128::from(width)) {
+            self.diagnostics.push(Diagnostic::error(
+                "E2106",
+                span,
+                format!("compile-time shift count must be less than {width}"),
+            ));
+            return true;
+        }
+        if matches!(operator, IntegerBinaryOperator::ShiftLeft)
+            && let (Some(left), Some(right)) = (self.constant_integer_value(left), right)
+        {
+            let result = left.checked_shl(right as u32);
+            let in_range = result.is_some_and(|result| {
+                integer_bounds(&self.types[ty.0 as usize])
+                    .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&result))
+            });
+            if !in_range {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2106",
+                    span,
+                    format!("compile-time integer overflow for `{}`", self.type_name(ty)),
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn constant_integer_value(&self, expression: &TypedExpr) -> Option<i128> {
+        match &expression.kind {
+            TypedExprKind::Integer(value) => Some(*value),
+            TypedExprKind::Ascription(value) => self.constant_integer_value(value),
+            TypedExprKind::IntegerConvert(value) => self.constant_integer_value(value),
+            TypedExprKind::IntegerUnary { operator, operand } => {
+                let value = self.constant_integer_value(operand)?;
+                match operator {
+                    IntegerUnaryOperator::Negate => value.checked_neg(),
+                    IntegerUnaryOperator::BitwiseNot => {
+                        if matches!(
+                            self.types.get(expression.ty.0 as usize),
+                            Some(Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::Usize)
+                        ) {
+                            let width = integer_bit_width(&self.types[expression.ty.0 as usize])?;
+                            let mask = (1_i128 << width) - 1;
+                            Some(!value & mask)
+                        } else {
+                            Some(!value)
+                        }
+                    }
+                }
+            }
+            TypedExprKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.constant_integer_value(left)?;
+                let right = self.constant_integer_value(right)?;
+                match operator {
+                    ArithmeticOperator::Add => left.checked_add(right),
+                    ArithmeticOperator::Subtract => left.checked_sub(right),
+                    ArithmeticOperator::Multiply => left.checked_mul(right),
+                    ArithmeticOperator::Divide => left.checked_div(right),
+                    ArithmeticOperator::Remainder => left.checked_rem(right),
+                }
+            }
+            TypedExprKind::IntegerBinary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.constant_integer_value(left)?;
+                let right = self.constant_integer_value(right)?;
+                match operator {
+                    IntegerBinaryOperator::BitwiseAnd => Some(left & right),
+                    IntegerBinaryOperator::BitwiseOr => Some(left | right),
+                    IntegerBinaryOperator::BitwiseXor => Some(left ^ right),
+                    IntegerBinaryOperator::ShiftLeft => left.checked_shl(right.try_into().ok()?),
+                    IntegerBinaryOperator::ShiftRight => left.checked_shr(right.try_into().ok()?),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn constant_float_value(&self, expression: &TypedExpr) -> Option<f64> {
+        let round = |value: f64, ty: TypeId| match self.types.get(ty.0 as usize) {
+            Some(Type::F32) => f64::from(value as f32),
+            Some(Type::F64) => value,
+            _ => value,
+        };
+        match &expression.kind {
+            TypedExprKind::Float(bits) => match self.types.get(expression.ty.0 as usize) {
+                Some(Type::F32) => Some(f64::from(f32::from_bits(*bits as u32))),
+                Some(Type::F64) => Some(f64::from_bits(*bits)),
+                _ => None,
+            },
+            TypedExprKind::Ascription(value) => self.constant_float_value(value),
+            TypedExprKind::FloatNegate(value) => {
+                Some(round(-self.constant_float_value(value)?, expression.ty))
+            }
+            TypedExprKind::Binary {
+                operator,
+                left,
+                right,
+            } if is_float_type(&self.types[expression.ty.0 as usize]) => {
+                let left = self.constant_float_value(left)?;
+                let right = self.constant_float_value(right)?;
+                let value = match operator {
+                    ArithmeticOperator::Add => left + right,
+                    ArithmeticOperator::Subtract => left - right,
+                    ArithmeticOperator::Multiply => left * right,
+                    ArithmeticOperator::Divide => left / right,
+                    ArithmeticOperator::Remainder => left % right,
+                };
+                Some(round(value, expression.ty))
+            }
+            TypedExprKind::NumericConvert(value)
+                if is_float_type(&self.types[expression.ty.0 as usize]) =>
+            {
+                let value = if is_integer_type(&self.types[value.ty.0 as usize]) {
+                    self.constant_integer_value(value)? as f64
+                } else {
+                    self.constant_float_value(value)?
+                };
+                Some(round(value, expression.ty))
+            }
+            _ => None,
+        }
     }
 
     fn check_comparison(
@@ -2722,6 +3224,7 @@ impl<'a> Checker<'a> {
             ComparisonOperator::Equal | ComparisonOperator::NotEqual
         );
         let supported = is_integer_type(&self.types[left.ty.0 as usize])
+            || matches!(self.types[left.ty.0 as usize], Type::F32 | Type::F64)
             || matches!(self.types[left.ty.0 as usize], Type::Rune)
             || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
         if !supported {
@@ -2729,9 +3232,9 @@ impl<'a> Checker<'a> {
                 "E2139",
                 node.span,
                 if ordered {
-                    "ordered comparison requires matching integer or rune operands"
+                    "ordered comparison requires matching numeric or rune operands"
                 } else {
-                    "equality requires matching operands that implement `Eq`"
+                    "equality requires matching comparable operands"
                 },
             ));
             return None;
@@ -3168,6 +3671,205 @@ impl<'a> Checker<'a> {
                 .collect::<Vec<_>>()
                 .join(".")
         });
+        let conversion_name = unqualified_name(callee);
+        if conversion_name.as_deref() == Some("rune") {
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let arguments = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            if arguments.len() != 1 {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2114",
+                    span,
+                    "rune conversion expects exactly one argument",
+                ));
+                return None;
+            }
+            let value = self.check_expr(arguments[0], None, owner, scopes)?;
+            if !is_integer_type(&self.types[value.ty.0 as usize]) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2108",
+                    value.span,
+                    "rune conversion requires an integer operand",
+                ));
+                return None;
+            }
+            if self
+                .constant_integer_value(&value)
+                .is_some_and(|value| !is_unicode_scalar(value))
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2106",
+                    span,
+                    "compile-time invalid conversion to `rune`",
+                ));
+                return None;
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::IntegerConvert(Box::new(value)),
+                ty: self.intern(Type::Rune),
+                span,
+            });
+        }
+        if let Some(target_type) = conversion_name.as_deref().and_then(integer_type_from_name) {
+            let target_name = conversion_name.as_deref().expect("conversion name exists");
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let arguments = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            if arguments.len() != 1 {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2114",
+                    span,
+                    format!("integer conversion `{target_name}` expects exactly one argument"),
+                ));
+                return None;
+            }
+            let target = self.intern(target_type);
+            let value = self.check_expr(arguments[0], None, owner, scopes)?;
+            let source_is_integer = is_integer_type(&self.types[value.ty.0 as usize]);
+            let source_is_float = is_float_type(&self.types[value.ty.0 as usize]);
+            if !source_is_integer && !source_is_float {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2108",
+                    value.span,
+                    "integer conversion requires an integer or floating operand",
+                ));
+                return None;
+            }
+            let statically_invalid = if source_is_integer {
+                self.constant_integer_value(&value).is_some_and(|value| {
+                    integer_bounds(&self.types[target.0 as usize])
+                        .is_some_and(|(minimum, maximum)| !(minimum..=maximum).contains(&value))
+                })
+            } else {
+                self.constant_float_value(&value)
+                    .is_some_and(|value| !float_fits_integer(value, &self.types[target.0 as usize]))
+            };
+            if statically_invalid {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2106",
+                    span,
+                    format!(
+                        "compile-time invalid conversion to `{}`",
+                        self.type_name(target)
+                    ),
+                ));
+                return None;
+            }
+            return Some(TypedExpr {
+                kind: if source_is_integer {
+                    TypedExprKind::IntegerConvert(Box::new(value))
+                } else {
+                    TypedExprKind::NumericConvert(Box::new(value))
+                },
+                ty: target,
+                span,
+            });
+        }
+        if let Some(target_type) = conversion_name.as_deref().and_then(float_type_from_name) {
+            let target_name = conversion_name.as_deref().expect("conversion name exists");
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let arguments = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            if arguments.len() != 1 {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2114",
+                    span,
+                    format!("float conversion `{target_name}` expects exactly one argument"),
+                ));
+                return None;
+            }
+            let value = self.check_expr(arguments[0], None, owner, scopes)?;
+            if !is_integer_type(&self.types[value.ty.0 as usize])
+                && !is_float_type(&self.types[value.ty.0 as usize])
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2108",
+                    value.span,
+                    "float conversion requires an integer or floating operand",
+                ));
+                return None;
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::NumericConvert(Box::new(value)),
+                ty: self.intern(target_type),
+                span,
+            });
+        }
+        if let Some((target_type, operator)) = written.as_deref().and_then(wrapping_intrinsic) {
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let argument_nodes = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            let required = if matches!(operator, WrappingIntegerOperator::Negate) {
+                1
+            } else {
+                2
+            };
+            if argument_nodes.len() != required {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2111",
+                    span,
+                    format!(
+                        "function `{}` expects {required} arguments but received {}",
+                        written.as_deref().expect("wrapping intrinsic is qualified"),
+                        argument_nodes.len()
+                    ),
+                ));
+                return None;
+            }
+            let target = self.intern(target_type);
+            let left = self.check_expr(argument_nodes[0], Some(target), owner, scopes)?;
+            if left.ty != target {
+                self.type_mismatch(left.span, target, left.ty);
+                return None;
+            }
+            let right = if required == 2 {
+                let expected = if matches!(
+                    operator,
+                    WrappingIntegerOperator::ShiftLeft | WrappingIntegerOperator::ShiftRight
+                ) {
+                    self.intern(Type::Usize)
+                } else {
+                    target
+                };
+                let value = self.check_expr(argument_nodes[1], Some(expected), owner, scopes)?;
+                if value.ty != expected {
+                    self.type_mismatch(value.span, expected, value.ty);
+                    return None;
+                }
+                Some(Box::new(value))
+            } else {
+                None
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::WrappingInteger {
+                    operator,
+                    left: Box::new(left),
+                    right,
+                },
+                ty: target,
+                span,
+            });
+        }
         if written.as_deref().is_some_and(|name| {
             matches!(
                 name,
@@ -4168,6 +4870,7 @@ impl<'a> Checker<'a> {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
             }
             Type::Buffer => false,
+            Type::F32 | Type::F64 => false,
             Type::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
             Type::CodepointView | Type::GraphemeView => protocol == "Iterable",
             Type::List(item) => match protocol {
@@ -4238,6 +4941,8 @@ impl<'a> Checker<'a> {
             Type::U16 => "u16".to_owned(),
             Type::U32 => "u32".to_owned(),
             Type::U64 => "u64".to_owned(),
+            Type::F32 => "f32".to_owned(),
+            Type::F64 => "f64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.type_name(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.type_name(*item)),
@@ -4314,6 +5019,8 @@ impl<'a> Checker<'a> {
             Type::U16 => "00:u16".to_owned(),
             Type::U32 => "00:u32".to_owned(),
             Type::U64 => "00:u64".to_owned(),
+            Type::F32 => "00:f32".to_owned(),
+            Type::F64 => "00:f64".to_owned(),
             Type::Atom(name) => format!("01:{name}"),
             Type::List(item) => format!("02:[{}]", self.type_key(*item)),
             Type::Array { item, length } => format!("02a:[{};{length}]", self.type_key(*item)),
@@ -4500,6 +5207,33 @@ fn integer_value(node: &Node) -> Option<i128> {
     i128::from_str_radix(digits, *radix).ok()
 }
 
+fn float_bits(node: &Node, ty: &Type) -> Option<u64> {
+    let Some(Value::Float { normalized, .. }) = &node.value else {
+        return None;
+    };
+    match ty {
+        Type::F32 => normalized
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| u64::from(value.to_bits())),
+        Type::F64 => normalized
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(f64::to_bits),
+        _ => None,
+    }
+}
+
+fn canonical_float_pattern_bits(bits: u64) -> u64 {
+    if matches!(bits, 0x8000_0000 | 0x8000_0000_0000_0000) {
+        0
+    } else {
+        bits
+    }
+}
+
 fn collect_type_variables(ty: &TypeSyntax, output: &mut Vec<String>) {
     match ty {
         TypeSyntax::Variable { name, .. } => {
@@ -4634,6 +5368,7 @@ fn lookup<'a>(scopes: &'a [BTreeMap<String, Local>], name: &str) -> Option<&'a L
 enum PatternConstructor {
     Bool(bool),
     Integer(i128),
+    Float(u64),
     Atom(String),
     Union(TypeId),
     Tuple(usize),
@@ -4805,6 +5540,7 @@ fn shape_constructor(shape: &PatternShape) -> Option<PatternConstructor> {
         PatternShape::Wildcard => None,
         PatternShape::Bool(value) => Some(PatternConstructor::Bool(*value)),
         PatternShape::Integer(value) => Some(PatternConstructor::Integer(*value)),
+        PatternShape::Float(value) => Some(PatternConstructor::Float(*value)),
         PatternShape::Atom(value) => Some(PatternConstructor::Atom(value.clone())),
         PatternShape::Union(member) => Some(PatternConstructor::Union(*member)),
         PatternShape::Tuple(elements) => Some(PatternConstructor::Tuple(elements.len())),
@@ -4863,6 +5599,10 @@ fn verified_pattern_shape(pattern: &TypedPattern) -> (PatternShape, bool) {
         }
         TypedPatternKind::Boolean(value) => (PatternShape::Bool(*value), false),
         TypedPatternKind::Integer(value) => (PatternShape::Integer(*value), false),
+        TypedPatternKind::Float(bits) => (
+            PatternShape::Float(canonical_float_pattern_bits(*bits)),
+            false,
+        ),
         TypedPatternKind::Atom(value) => (PatternShape::Atom(value.clone()), true),
         TypedPatternKind::UnionMember { member, .. } => (PatternShape::Union(*member), false),
         TypedPatternKind::Tuple(elements) => {
@@ -5431,7 +6171,18 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         TypedExprKind::Ascription(value) | TypedExprKind::UnionInject { value, .. } => {
             collect_expr_locals(value, output);
         }
+        TypedExprKind::IntegerUnary { operand, .. } => collect_expr_locals(operand, output),
+        TypedExprKind::FloatNegate(operand) => collect_expr_locals(operand, output),
+        TypedExprKind::IntegerConvert(value) => collect_expr_locals(value, output),
+        TypedExprKind::NumericConvert(value) => collect_expr_locals(value, output),
+        TypedExprKind::WrappingInteger { left, right, .. } => {
+            collect_expr_locals(left, output);
+            if let Some(right) = right {
+                collect_expr_locals(right, output);
+            }
+        }
         TypedExprKind::Binary { left, right, .. }
+        | TypedExprKind::IntegerBinary { left, right, .. }
         | TypedExprKind::Comparison { left, right, .. }
         | TypedExprKind::Logical { left, right, .. } => {
             collect_expr_locals(left, output);
@@ -5449,6 +6200,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
             }
         }
         TypedExprKind::Integer(_)
+        | TypedExprKind::Float(_)
         | TypedExprKind::Boolean(_)
         | TypedExprKind::Unit
         | TypedExprKind::String(_)
@@ -5488,6 +6240,7 @@ fn collect_pattern_expr_locals(pattern: &TypedPattern, output: &mut BTreeSet<Sym
         | TypedPatternKind::Binding { .. }
         | TypedPatternKind::Boolean(_)
         | TypedPatternKind::Integer(_)
+        | TypedPatternKind::Float(_)
         | TypedPatternKind::Atom(_)
         | TypedPatternKind::UnionMember { .. }
         | TypedPatternKind::ListEmpty => {}
@@ -6636,8 +7389,177 @@ fn verify_expr(
                 mutable_symbols,
                 errors,
             );
-            if left.ty != right.ty || left.ty != expression.ty {
-                errors.push("binary operand types differ".to_owned());
+            if left.ty != right.ty
+                || left.ty != expression.ty
+                || !types
+                    .get(left.ty.0 as usize)
+                    .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::F32 | Type::F64))
+            {
+                errors.push("binary expression has invalid numeric types".to_owned());
+            }
+        }
+        TypedExprKind::FloatNegate(operand) => {
+            verify_expr(
+                operand,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if operand.ty != expression.ty
+                || !matches!(
+                    types.get(operand.ty.0 as usize),
+                    Some(Type::F32 | Type::F64)
+                )
+            {
+                errors.push("float negation has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::IntegerUnary { operator, operand } => {
+            verify_expr(
+                operand,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let signed = matches!(
+                types.get(operand.ty.0 as usize),
+                Some(Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize)
+            );
+            if operand.ty != expression.ty
+                || !types
+                    .get(operand.ty.0 as usize)
+                    .is_some_and(is_integer_type)
+                || (matches!(operator, IntegerUnaryOperator::Negate) && !signed)
+            {
+                errors.push("integer unary expression has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::IntegerBinary {
+            operator,
+            left,
+            right,
+        } => {
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                right,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let shift = matches!(
+                operator,
+                IntegerBinaryOperator::ShiftLeft | IntegerBinaryOperator::ShiftRight
+            );
+            if left.ty != expression.ty
+                || !types.get(left.ty.0 as usize).is_some_and(is_integer_type)
+                || if shift {
+                    !matches!(types.get(right.ty.0 as usize), Some(Type::Usize))
+                } else {
+                    right.ty != left.ty
+                }
+            {
+                errors.push("integer binary expression has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::IntegerConvert(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !types.get(value.ty.0 as usize).is_some_and(is_integer_type)
+                || !types
+                    .get(expression.ty.0 as usize)
+                    .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::Rune))
+            {
+                errors.push("integer conversion has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::NumericConvert(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let source = types.get(value.ty.0 as usize);
+            let target = types.get(expression.ty.0 as usize);
+            let source_numeric = source.is_some_and(|ty| is_integer_type(ty) || is_float_type(ty));
+            let target_numeric = target.is_some_and(|ty| is_integer_type(ty) || is_float_type(ty));
+            if !source_numeric
+                || !target_numeric
+                || !source.is_some_and(is_float_type) && !target.is_some_and(is_float_type)
+            {
+                errors.push("numeric conversion has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::WrappingInteger {
+            operator,
+            left,
+            right,
+        } => {
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if let Some(right) = right {
+                verify_expr(
+                    right,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+            }
+            let unary = matches!(operator, WrappingIntegerOperator::Negate);
+            let shift = matches!(
+                operator,
+                WrappingIntegerOperator::ShiftLeft | WrappingIntegerOperator::ShiftRight
+            );
+            let valid_right = match (unary, right) {
+                (true, None) => true,
+                (false, Some(right)) if shift => {
+                    matches!(types.get(right.ty.0 as usize), Some(Type::Usize))
+                }
+                (false, Some(right)) => right.ty == left.ty,
+                _ => false,
+            };
+            if left.ty != expression.ty
+                || !types.get(left.ty.0 as usize).is_some_and(is_integer_type)
+                || !valid_right
+            {
+                errors.push("wrapping integer expression has invalid types".to_owned());
             }
         }
         TypedExprKind::Comparison {
@@ -6667,10 +7589,9 @@ fn verify_expr(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = types
-                .get(left.ty.0 as usize)
-                .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::Rune))
-                || (!ordered && standard_eq_type(types, left.ty));
+            let supported = types.get(left.ty.0 as usize).is_some_and(|ty| {
+                is_integer_type(ty) || matches!(ty, Type::Rune | Type::F32 | Type::F64)
+            }) || (!ordered && standard_eq_type(types, left.ty));
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
             }
@@ -6817,6 +7738,98 @@ fn integer_bounds(ty: &Type) -> Option<(i128, i128)> {
         Type::U32 => (0, u32::MAX.into()),
         Type::U64 => (0, u64::MAX.into()),
         Type::Usize => (0, usize::MAX as i128),
+        _ => return None,
+    })
+}
+
+fn integer_type_from_name(name: &str) -> Option<Type> {
+    Some(match name {
+        "i8" => Type::I8,
+        "i16" => Type::I16,
+        "i32" => Type::I32,
+        "i64" => Type::I64,
+        "isize" => Type::Isize,
+        "u8" => Type::U8,
+        "u16" => Type::U16,
+        "u32" => Type::U32,
+        "u64" => Type::U64,
+        "usize" => Type::Usize,
+        _ => return None,
+    })
+}
+
+fn float_type_from_name(name: &str) -> Option<Type> {
+    match name {
+        "f32" => Some(Type::F32),
+        "f64" => Some(Type::F64),
+        _ => None,
+    }
+}
+
+fn is_float_type(ty: &Type) -> bool {
+    matches!(ty, Type::F32 | Type::F64)
+}
+
+fn float_fits_integer(value: f64, target: &Type) -> bool {
+    let Some((minimum, maximum)) = integer_bounds(target) else {
+        return false;
+    };
+    if !value.is_finite() {
+        return false;
+    }
+    let minimum_float = minimum as f64;
+    let lower_exclusive = if minimum == 0 {
+        -1.0
+    } else {
+        minimum_float - 1.0
+    };
+    let upper_exclusive = maximum as f64 + 1.0;
+    let above_lower = if lower_exclusive == minimum_float {
+        value >= minimum_float
+    } else {
+        value > lower_exclusive
+    };
+    above_lower && value < upper_exclusive
+}
+
+fn wrapping_intrinsic(name: &str) -> Option<(Type, WrappingIntegerOperator)> {
+    let (module, function) = name.split_once('.')?;
+    let ty = match module {
+        "I8" => Type::I8,
+        "I16" => Type::I16,
+        "I32" => Type::I32,
+        "I64" => Type::I64,
+        "Isize" => Type::Isize,
+        "U8" => Type::U8,
+        "U16" => Type::U16,
+        "U32" => Type::U32,
+        "U64" => Type::U64,
+        "Usize" => Type::Usize,
+        _ => return None,
+    };
+    let operator = match function {
+        "wrapping_add" => WrappingIntegerOperator::Add,
+        "wrapping_sub" => WrappingIntegerOperator::Subtract,
+        "wrapping_mul" => WrappingIntegerOperator::Multiply,
+        "wrapping_neg" => WrappingIntegerOperator::Negate,
+        "wrapping_shl" => WrappingIntegerOperator::ShiftLeft,
+        "wrapping_shr" => WrappingIntegerOperator::ShiftRight,
+        _ => return None,
+    };
+    Some((ty, operator))
+}
+
+fn is_unicode_scalar(value: i128) -> bool {
+    (0..=0x10_ffff).contains(&value) && !(0xd800..=0xdfff).contains(&value)
+}
+
+fn integer_bit_width(ty: &Type) -> Option<u32> {
+    Some(match ty {
+        Type::I8 | Type::U8 => 8,
+        Type::I16 | Type::U16 => 16,
+        Type::I32 | Type::U32 => 32,
+        Type::I64 | Type::U64 => 64,
+        Type::Isize | Type::Usize => usize::BITS,
         _ => return None,
     })
 }
@@ -7049,6 +8062,16 @@ fn verify_pattern(
                 );
             }
         }
+        TypedPatternKind::Float(bits) => {
+            let valid = match types.get(pattern.ty.0 as usize) {
+                Some(Type::F32) => *bits <= u64::from(u32::MAX),
+                Some(Type::F64) => true,
+                _ => false,
+            };
+            if !valid {
+                errors.push("float pattern has an invalid type or bit pattern".to_owned());
+            }
+        }
         TypedPatternKind::Wildcard
         | TypedPatternKind::Boolean(_)
         | TypedPatternKind::Integer(_)
@@ -7102,6 +8125,8 @@ impl TypedProgram {
             Type::U16 => "u16".to_owned(),
             Type::U32 => "u32".to_owned(),
             Type::U64 => "u64".to_owned(),
+            Type::F32 => "f32".to_owned(),
+            Type::F64 => "f64".to_owned(),
             Type::Atom(name) => format!(":{name}"),
             Type::List(item) => format!("[{}]", self.display_type(*item)),
             Type::Array { item, length } => format!("[{}; {length}]", self.display_type(*item)),
@@ -7236,6 +8261,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
     let indent = "  ".repeat(depth);
     let label = match &expression.kind {
         TypedExprKind::Integer(value) => format!("integer {value}"),
+        TypedExprKind::Float(bits) => format!("float 0x{bits:016x}"),
         TypedExprKind::Boolean(value) => format!("boolean {value}"),
         TypedExprKind::Unit => "unit".to_owned(),
         TypedExprKind::String(value) => format!("string {value:?}"),
@@ -7302,6 +8328,14 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
                 .join(", ")
         ),
         TypedExprKind::Binary { operator, .. } => format!("binary {operator:?}"),
+        TypedExprKind::IntegerUnary { operator, .. } => format!("integer unary {operator:?}"),
+        TypedExprKind::FloatNegate(_) => "float negate".to_owned(),
+        TypedExprKind::IntegerBinary { operator, .. } => format!("integer binary {operator:?}"),
+        TypedExprKind::IntegerConvert(_) => "integer convert".to_owned(),
+        TypedExprKind::NumericConvert(_) => "numeric convert".to_owned(),
+        TypedExprKind::WrappingInteger { operator, .. } => {
+            format!("wrapping integer {operator:?}")
+        }
         TypedExprKind::Comparison { operator, .. } => format!("comparison {operator:?}"),
         TypedExprKind::Logical { operator, .. } => format!("logical {operator:?}"),
         TypedExprKind::Call {
@@ -7331,7 +8365,20 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         program.display_type(expression.ty)
     ));
     match &expression.kind {
+        TypedExprKind::IntegerUnary { operand, .. } => {
+            write_expr(program, output, operand, depth + 1);
+        }
+        TypedExprKind::FloatNegate(operand) => write_expr(program, output, operand, depth + 1),
+        TypedExprKind::IntegerConvert(value) => write_expr(program, output, value, depth + 1),
+        TypedExprKind::NumericConvert(value) => write_expr(program, output, value, depth + 1),
+        TypedExprKind::WrappingInteger { left, right, .. } => {
+            write_expr(program, output, left, depth + 1);
+            if let Some(right) = right {
+                write_expr(program, output, right, depth + 1);
+            }
+        }
         TypedExprKind::Binary { left, right, .. }
+        | TypedExprKind::IntegerBinary { left, right, .. }
         | TypedExprKind::Comparison { left, right, .. }
         | TypedExprKind::Logical { left, right, .. } => {
             write_expr(program, output, left, depth + 1);

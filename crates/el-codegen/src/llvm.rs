@@ -4,8 +4,9 @@ use crate::integer_checks::FailureOrigin;
 use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
     ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant,
-    CoreFailureCategory, CoreFunction, FunctionId, Operation, SlotId, SwitchValue, Terminator,
-    Type, TypeId, ValueId, collection_point_roots, verify_concrete,
+    CoreFailureCategory, CoreFunction, FunctionId, IntegerBinaryOperator, IntegerUnaryOperator,
+    Operation, SlotId, SwitchValue, Terminator, Type, TypeId, ValueId, WrappingIntegerOperator,
+    collection_point_roots, verify_concrete,
 };
 #[cfg(feature = "managed-runtime")]
 use el_ir::{
@@ -18,6 +19,7 @@ use el_runtime::{
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory, GRAPHEME_COUNT_SYMBOL, GRAPHEME_NEXT_SYMBOL};
 use inkwell::AddressSpace;
+use inkwell::FloatPredicate;
 use inkwell::IntPredicate;
 use inkwell::OptimizationLevel;
 use inkwell::basic_block::BasicBlock as LlvmBlock;
@@ -31,8 +33,8 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, StructType};
 use inkwell::values::{
-    AggregateValueEnum, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue,
-    InstructionValue, IntValue, PhiValue, PointerValue, StructValue,
+    AggregateValueEnum, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue,
+    FunctionValue, InstructionValue, IntValue, PhiValue, PointerValue, StructValue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -882,6 +884,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             Some(Type::I32) => Ok(self.context.i32_type().into()),
             Some(Type::I64) => Ok(self.context.i64_type().into()),
             Some(Type::Isize | Type::Usize) => Ok(self.usize_type()?.into()),
+            Some(Type::F32) => Ok(self.context.f32_type().into()),
+            Some(Type::F64) => Ok(self.context.f64_type().into()),
             Some(Type::Bool) => Ok(self.context.bool_type().into()),
             Some(Type::Unit) => Ok(self.context.struct_type(&[], false).into()),
             Some(Type::String) => Ok(self
@@ -9456,6 +9460,178 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 )?;
                 values.insert(*result, value.into());
             }
+            Operation::FloatArithmetic {
+                result,
+                operator,
+                left,
+                right,
+                ..
+            } => {
+                let left = float_value(values, *left)?;
+                let right = float_value(values, *right)?;
+                let name = format!("v{}", result.0);
+                let value = match operator {
+                    ArithmeticOperator::Add => built(builder.build_float_add(left, right, &name))?,
+                    ArithmeticOperator::Subtract => {
+                        built(builder.build_float_sub(left, right, &name))?
+                    }
+                    ArithmeticOperator::Multiply => {
+                        built(builder.build_float_mul(left, right, &name))?
+                    }
+                    ArithmeticOperator::Divide => {
+                        built(builder.build_float_div(left, right, &name))?
+                    }
+                    ArithmeticOperator::Remainder => {
+                        built(builder.build_float_rem(left, right, &name))?
+                    }
+                };
+                values.insert(*result, value.into());
+            }
+            Operation::FloatNegate {
+                result, operand, ..
+            } => {
+                let value = built(
+                    builder
+                        .build_float_neg(float_value(values, *operand)?, &format!("v{}", result.0)),
+                )?;
+                values.insert(*result, value.into());
+            }
+            Operation::IntegerUnary {
+                result,
+                operator,
+                operand,
+                failures,
+                ty,
+                ..
+            } => {
+                let operand = integer_value(values, *operand)?;
+                let value = match operator {
+                    IntegerUnaryOperator::Negate => self.lower_checked_arithmetic(
+                        *result,
+                        ArithmeticOperator::Subtract,
+                        operand.get_type().const_zero(),
+                        operand,
+                        failures,
+                        *ty,
+                        builder,
+                        blocks,
+                    )?,
+                    IntegerUnaryOperator::BitwiseNot => {
+                        built(builder.build_not(operand, &format!("v{}", result.0)))?
+                    }
+                };
+                values.insert(*result, value.into());
+            }
+            Operation::IntegerBinary {
+                result,
+                operator,
+                left,
+                right,
+                failures,
+                ty,
+                ..
+            } => {
+                let value = self.lower_integer_binary(
+                    *result,
+                    *operator,
+                    integer_value(values, *left)?,
+                    integer_value(values, *right)?,
+                    failures,
+                    *ty,
+                    builder,
+                    blocks,
+                )?;
+                values.insert(*result, value.into());
+            }
+            Operation::IntegerConvert {
+                result,
+                value: input,
+                source_ty,
+                failure,
+                ty,
+                ..
+            } => {
+                let converted = self.lower_integer_conversion(
+                    *result,
+                    value(values, *input)?,
+                    *source_ty,
+                    *failure,
+                    *ty,
+                    builder,
+                    blocks,
+                )?;
+                values.insert(*result, converted);
+            }
+            Operation::WrappingInteger {
+                result,
+                operator,
+                left,
+                right,
+                ty,
+                ..
+            } => {
+                let left = integer_value(values, *left)?;
+                let right = right
+                    .map(|right| integer_value(values, right))
+                    .transpose()?;
+                let name = format!("v{}", result.0);
+                let value = match operator {
+                    WrappingIntegerOperator::Add => {
+                        built(builder.build_int_add(left, right.expect("verified right"), &name))?
+                    }
+                    WrappingIntegerOperator::Subtract => {
+                        built(builder.build_int_sub(left, right.expect("verified right"), &name))?
+                    }
+                    WrappingIntegerOperator::Multiply => {
+                        built(builder.build_int_mul(left, right.expect("verified right"), &name))?
+                    }
+                    WrappingIntegerOperator::Negate => built(builder.build_int_neg(left, &name))?,
+                    WrappingIntegerOperator::ShiftLeft | WrappingIntegerOperator::ShiftRight => {
+                        let count = right.expect("verified right");
+                        let reduced = built(
+                            builder.build_int_unsigned_rem(
+                                count,
+                                count
+                                    .get_type()
+                                    .const_int(left.get_type().get_bit_width().into(), false),
+                                &format!("{name}.count"),
+                            ),
+                        )?;
+                        let count = match count
+                            .get_type()
+                            .get_bit_width()
+                            .cmp(&left.get_type().get_bit_width())
+                        {
+                            std::cmp::Ordering::Greater => built(builder.build_int_truncate(
+                                reduced,
+                                left.get_type(),
+                                &format!("{name}.narrow_count"),
+                            ))?,
+                            std::cmp::Ordering::Less => built(builder.build_int_z_extend(
+                                reduced,
+                                left.get_type(),
+                                &format!("{name}.wide_count"),
+                            ))?,
+                            std::cmp::Ordering::Equal => reduced,
+                        };
+                        match operator {
+                            WrappingIntegerOperator::ShiftLeft => {
+                                built(builder.build_left_shift(left, count, &name))?
+                            }
+                            WrappingIntegerOperator::ShiftRight => {
+                                let signed = self
+                                    .core
+                                    .types
+                                    .get(ty.0 as usize)
+                                    .is_some_and(is_signed_integer_type);
+                                built(builder.build_right_shift(left, count, signed, &name))?
+                            }
+                            _ => unreachable!("wrapping shift was matched above"),
+                        }
+                    }
+                };
+                values.insert(*result, value.into());
+            }
             Operation::Compare {
                 result,
                 operator,
@@ -9464,6 +9640,27 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 operand_ty,
                 ..
             } => {
+                if matches!(
+                    self.core.types.get(operand_ty.0 as usize),
+                    Some(Type::F32 | Type::F64)
+                ) {
+                    let predicate = match operator {
+                        ComparisonOperator::Equal => FloatPredicate::OEQ,
+                        ComparisonOperator::NotEqual => FloatPredicate::UNE,
+                        ComparisonOperator::Less => FloatPredicate::OLT,
+                        ComparisonOperator::LessEqual => FloatPredicate::OLE,
+                        ComparisonOperator::Greater => FloatPredicate::OGT,
+                        ComparisonOperator::GreaterEqual => FloatPredicate::OGE,
+                    };
+                    let compared = built(builder.build_float_compare(
+                        predicate,
+                        float_value(values, *left)?,
+                        float_value(values, *right)?,
+                        &format!("v{}", result.0),
+                    ))?;
+                    values.insert(*result, compared.into());
+                    return Ok(());
+                }
                 if matches!(
                     operator,
                     ComparisonOperator::Equal | ComparisonOperator::NotEqual
@@ -9775,6 +9972,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 let category = match category {
                     CoreFailureCategory::IntegerOverflow => FailureCategory::IntegerOverflow,
                     CoreFailureCategory::DivisionByZero => FailureCategory::DivisionByZero,
+                    CoreFailureCategory::InvalidShift => FailureCategory::InvalidShift,
+                    CoreFailureCategory::InvalidConversion => FailureCategory::InvalidConversion,
                     CoreFailureCategory::IndexOutOfBounds => FailureCategory::IndexOutOfBounds,
                     CoreFailureCategory::BitstringSizeMismatch => {
                         FailureCategory::BitstringSizeMismatch
@@ -9895,6 +10094,323 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             phi.add_incoming(&[(&incoming, source)]);
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_integer_conversion(
+        &self,
+        result: ValueId,
+        value: BasicValueEnum<'ctx>,
+        source_ty: TypeId,
+        failure: BlockId,
+        ty: TypeId,
+        builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let source = self
+            .core
+            .types
+            .get(source_ty.0 as usize)
+            .ok_or(BackendError::UnsupportedType(source_ty))?;
+        let target = self
+            .core
+            .types
+            .get(ty.0 as usize)
+            .ok_or(BackendError::UnsupportedType(ty))?;
+        let source_float = matches!(source, Type::F32 | Type::F64);
+        let target_float = matches!(target, Type::F32 | Type::F64);
+        if source_float && target_float {
+            let value = value.into_float_value();
+            let BasicTypeEnum::FloatType(target_type) = self.basic_type(ty)? else {
+                return Err(BackendError::UnsupportedType(ty));
+            };
+            return match (source, target) {
+                (Type::F32, Type::F64) => {
+                    built(builder.build_float_ext(value, target_type, &format!("v{}", result.0)))
+                        .map(Into::into)
+                }
+                (Type::F64, Type::F32) => {
+                    built(builder.build_float_trunc(value, target_type, &format!("v{}", result.0)))
+                        .map(Into::into)
+                }
+                (Type::F32, Type::F32) | (Type::F64, Type::F64) => Ok(value.into()),
+                _ => Err(BackendError::UnsupportedType(ty)),
+            };
+        }
+        if !source_float && target_float {
+            let value = value.into_int_value();
+            let BasicTypeEnum::FloatType(target_type) = self.basic_type(ty)? else {
+                return Err(BackendError::UnsupportedType(ty));
+            };
+            let converted = if is_signed_integer_type(source) {
+                built(builder.build_signed_int_to_float(
+                    value,
+                    target_type,
+                    &format!("v{}", result.0),
+                ))?
+            } else {
+                built(builder.build_unsigned_int_to_float(
+                    value,
+                    target_type,
+                    &format!("v{}", result.0),
+                ))?
+            };
+            return Ok(converted.into());
+        }
+        if source_float && !target_float {
+            let value = value.into_float_value();
+            let (minimum, maximum) =
+                integer_bounds(target).ok_or(BackendError::UnsupportedType(ty))?;
+            let unordered = built(builder.build_float_compare(
+                FloatPredicate::UNO,
+                value,
+                value,
+                &format!("v{}.not_number", result.0),
+            ))?;
+            self.branch_to_failure(result, "not_number", unordered, failure, builder, blocks)?;
+            let minimum_float = minimum as f64;
+            let lower_exclusive = if minimum == 0 {
+                -1.0
+            } else {
+                minimum_float - 1.0
+            };
+            let upper_exclusive = maximum as f64 + 1.0;
+            let below = built(builder.build_float_compare(
+                if lower_exclusive == minimum_float {
+                    FloatPredicate::OLT
+                } else {
+                    FloatPredicate::OLE
+                },
+                value,
+                value.get_type().const_float(lower_exclusive),
+                &format!("v{}.below_range", result.0),
+            ))?;
+            self.branch_to_failure(result, "below_range", below, failure, builder, blocks)?;
+            let above = built(builder.build_float_compare(
+                FloatPredicate::OGE,
+                value,
+                value.get_type().const_float(upper_exclusive),
+                &format!("v{}.above_range", result.0),
+            ))?;
+            self.branch_to_failure(result, "above_range", above, failure, builder, blocks)?;
+            let BasicTypeEnum::IntType(target_type) = self.basic_type(ty)? else {
+                return Err(BackendError::UnsupportedType(ty));
+            };
+            let converted = if is_signed_integer_type(target) {
+                built(builder.build_float_to_signed_int(
+                    value,
+                    target_type,
+                    &format!("v{}", result.0),
+                ))?
+            } else {
+                built(builder.build_float_to_unsigned_int(
+                    value,
+                    target_type,
+                    &format!("v{}", result.0),
+                ))?
+            };
+            return Ok(converted.into());
+        }
+        let value = value.into_int_value();
+        let (source_minimum, source_maximum) =
+            integer_bounds(source).ok_or(BackendError::UnsupportedType(source_ty))?;
+        if matches!(target, Type::Rune) {
+            if source_minimum < 0 {
+                let negative = built(builder.build_int_compare(
+                    IntPredicate::SLT,
+                    value,
+                    value.get_type().const_zero(),
+                    &format!("v{}.negative", result.0),
+                ))?;
+                self.branch_to_failure(result, "negative", negative, failure, builder, blocks)?;
+            }
+            if source_maximum > 0x10_ffff {
+                let above = built(builder.build_int_compare(
+                    if is_signed_integer_type(source) {
+                        IntPredicate::SGT
+                    } else {
+                        IntPredicate::UGT
+                    },
+                    value,
+                    value.get_type().const_int(0x10_ffff, false),
+                    &format!("v{}.above_scalar", result.0),
+                ))?;
+                self.branch_to_failure(result, "above_scalar", above, failure, builder, blocks)?;
+            }
+            if source_maximum >= 0xd800 {
+                let at_least_surrogate = built(builder.build_int_compare(
+                    IntPredicate::UGE,
+                    value,
+                    value.get_type().const_int(0xd800, false),
+                    &format!("v{}.surrogate_start", result.0),
+                ))?;
+                let at_most_surrogate = built(builder.build_int_compare(
+                    IntPredicate::ULE,
+                    value,
+                    value.get_type().const_int(0xdfff, false),
+                    &format!("v{}.surrogate_end", result.0),
+                ))?;
+                let surrogate = built(builder.build_and(
+                    at_least_surrogate,
+                    at_most_surrogate,
+                    &format!("v{}.surrogate", result.0),
+                ))?;
+                self.branch_to_failure(result, "surrogate", surrogate, failure, builder, blocks)?;
+            }
+
+            let BasicTypeEnum::IntType(target_type) = self.basic_type(ty)? else {
+                return Err(BackendError::UnsupportedType(ty));
+            };
+            let converted = match value
+                .get_type()
+                .get_bit_width()
+                .cmp(&target_type.get_bit_width())
+            {
+                std::cmp::Ordering::Greater => {
+                    built(builder.build_int_truncate(value, target_type, &format!("v{}", result.0)))
+                }
+                std::cmp::Ordering::Less => {
+                    built(builder.build_int_z_extend(value, target_type, &format!("v{}", result.0)))
+                }
+                std::cmp::Ordering::Equal => Ok(value),
+            };
+            return converted.map(Into::into);
+        }
+        let (target_minimum, target_maximum) =
+            integer_bounds(target).ok_or(BackendError::UnsupportedType(ty))?;
+        let source_signed = is_signed_integer_type(source);
+
+        if source_minimum < target_minimum {
+            let below = built(builder.build_int_compare(
+                IntPredicate::SLT,
+                value,
+                value.get_type().const_int(target_minimum as u64, false),
+                &format!("v{}.below_range", result.0),
+            ))?;
+            self.branch_to_failure(result, "below_range", below, failure, builder, blocks)?;
+        }
+        if source_maximum > target_maximum {
+            let above = built(builder.build_int_compare(
+                if source_signed {
+                    IntPredicate::SGT
+                } else {
+                    IntPredicate::UGT
+                },
+                value,
+                value.get_type().const_int(target_maximum as u64, false),
+                &format!("v{}.above_range", result.0),
+            ))?;
+            self.branch_to_failure(result, "above_range", above, failure, builder, blocks)?;
+        }
+
+        let BasicTypeEnum::IntType(target_type) = self.basic_type(ty)? else {
+            return Err(BackendError::UnsupportedType(ty));
+        };
+        let source_width = value.get_type().get_bit_width();
+        let target_width = target_type.get_bit_width();
+        let converted = if source_width > target_width {
+            built(builder.build_int_truncate(value, target_type, &format!("v{}", result.0)))
+        } else if source_width < target_width {
+            if source_signed {
+                built(builder.build_int_s_extend(value, target_type, &format!("v{}", result.0)))
+            } else {
+                built(builder.build_int_z_extend(value, target_type, &format!("v{}", result.0)))
+            }
+        } else {
+            Ok(value)
+        };
+        converted.map(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_integer_binary(
+        &self,
+        result: ValueId,
+        operator: IntegerBinaryOperator,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+        failures: &[(CoreFailureCategory, BlockId)],
+        ty: TypeId,
+        builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let name = format!("v{}", result.0);
+        match operator {
+            IntegerBinaryOperator::BitwiseAnd => built(builder.build_and(left, right, &name)),
+            IntegerBinaryOperator::BitwiseOr => built(builder.build_or(left, right, &name)),
+            IntegerBinaryOperator::BitwiseXor => built(builder.build_xor(left, right, &name)),
+            IntegerBinaryOperator::ShiftLeft | IntegerBinaryOperator::ShiftRight => {
+                let width = left.get_type().get_bit_width();
+                let invalid = built(builder.build_int_compare(
+                    IntPredicate::UGE,
+                    right,
+                    right.get_type().const_int(u64::from(width), false),
+                    &format!("v{}.invalid_shift", result.0),
+                ))?;
+                self.branch_on_failure(
+                    result,
+                    "invalid_shift",
+                    invalid,
+                    CoreFailureCategory::InvalidShift,
+                    failures,
+                    builder,
+                    blocks,
+                )?;
+                let count = if right.get_type().get_bit_width() > width {
+                    built(builder.build_int_truncate(
+                        right,
+                        left.get_type(),
+                        &format!("v{}.shift_count", result.0),
+                    ))?
+                } else if right.get_type().get_bit_width() < width {
+                    built(builder.build_int_z_extend(
+                        right,
+                        left.get_type(),
+                        &format!("v{}.shift_count", result.0),
+                    ))?
+                } else {
+                    right
+                };
+                let signed = self
+                    .core
+                    .types
+                    .get(ty.0 as usize)
+                    .is_some_and(is_signed_integer_type);
+                match operator {
+                    IntegerBinaryOperator::ShiftRight => {
+                        built(builder.build_right_shift(left, count, signed, &name))
+                    }
+                    IntegerBinaryOperator::ShiftLeft => {
+                        let shifted = built(builder.build_left_shift(left, count, &name))?;
+                        let restored = built(builder.build_right_shift(
+                            shifted,
+                            count,
+                            signed,
+                            &format!("v{}.restored", result.0),
+                        ))?;
+                        let overflow = built(builder.build_int_compare(
+                            IntPredicate::NE,
+                            restored,
+                            left,
+                            &format!("v{}.overflow", result.0),
+                        ))?;
+                        self.branch_on_failure(
+                            result,
+                            "overflow",
+                            overflow,
+                            CoreFailureCategory::IntegerOverflow,
+                            failures,
+                            builder,
+                            blocks,
+                        )?;
+                        Ok(shifted)
+                    }
+                    IntegerBinaryOperator::BitwiseAnd
+                    | IntegerBinaryOperator::BitwiseOr
+                    | IntegerBinaryOperator::BitwiseXor => unreachable!(),
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10055,6 +10571,19 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             .iter()
             .find_map(|(candidate, block)| (*candidate == category).then_some(*block))
             .ok_or(BackendError::InvalidIntegerCheckPlan)?;
+        self.branch_to_failure(result, label, failed, failure, builder, blocks)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn branch_to_failure(
+        &self,
+        result: ValueId,
+        label: &str,
+        failed: IntValue<'ctx>,
+        failure: BlockId,
+        builder: &Builder<'ctx>,
+        blocks: &BTreeMap<BlockId, LlvmBlock<'ctx>>,
+    ) -> Result<(), BackendError> {
         let continuation = self.context.append_basic_block(
             builder
                 .get_insert_block()
@@ -10079,6 +10608,16 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         ty: TypeId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match (constant, self.core.types.get(ty.0 as usize)) {
+            (Constant::Float(bits), Some(Type::F32)) => Ok(self
+                .context
+                .f32_type()
+                .const_float(f64::from(f32::from_bits(*bits as u32)))
+                .into()),
+            (Constant::Float(bits), Some(Type::F64)) => Ok(self
+                .context
+                .f64_type()
+                .const_float(f64::from_bits(*bits))
+                .into()),
             (Constant::Integer(value), Some(Type::I8)) => {
                 let value = i8::try_from(*value)
                     .map_err(|_| BackendError::IntegerOutOfRange { value: *value, ty })?;
@@ -10267,6 +10806,12 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::ListHead { result, ty, .. }
                     | Operation::ListTail { result, ty, .. }
                     | Operation::CheckedArithmetic { result, ty, .. }
+                    | Operation::FloatArithmetic { result, ty, .. }
+                    | Operation::FloatNegate { result, ty, .. }
+                    | Operation::IntegerUnary { result, ty, .. }
+                    | Operation::IntegerBinary { result, ty, .. }
+                    | Operation::IntegerConvert { result, ty, .. }
+                    | Operation::WrappingInteger { result, ty, .. }
                     | Operation::FunctionRef { result, ty, .. }
                     | Operation::Call { result, ty, .. }
                     | Operation::IndirectCall { result, ty, .. }
@@ -10310,11 +10855,37 @@ fn integer_value<'ctx>(
     }
 }
 
+fn float_value<'ctx>(
+    values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+    id: ValueId,
+) -> Result<FloatValue<'ctx>, BackendError> {
+    match value(values, id)? {
+        BasicValueEnum::FloatValue(value) => Ok(value),
+        _ => Err(BackendError::MissingValue(id)),
+    }
+}
+
 fn is_signed_integer_type(ty: &Type) -> bool {
     matches!(
         ty,
         Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
     )
+}
+
+fn integer_bounds(ty: &Type) -> Option<(i128, i128)> {
+    Some(match ty {
+        Type::I8 => (i8::MIN.into(), i8::MAX.into()),
+        Type::I16 => (i16::MIN.into(), i16::MAX.into()),
+        Type::I32 => (i32::MIN.into(), i32::MAX.into()),
+        Type::I64 => (i64::MIN.into(), i64::MAX.into()),
+        Type::Isize => (isize::MIN as i128, isize::MAX as i128),
+        Type::U8 => (0, u8::MAX.into()),
+        Type::U16 => (0, u16::MAX.into()),
+        Type::U32 => (0, u32::MAX.into()),
+        Type::U64 => (0, u64::MAX.into()),
+        Type::Usize => (0, usize::MAX as i128),
+        _ => return None,
+    })
 }
 
 fn struct_value<'ctx>(
@@ -10403,6 +10974,149 @@ mod tests {
             "@llvm.usub.with.overflow.i16",
             "udiv i32",
             "urem i64",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn lowers_checked_integer_unary_bitwise_and_shift_operations() {
+        let core = concrete(
+            "defmodule Main do\n  def negate(value: i8) -> i8 do\n    -value\n  end\n  def invert(value: u16) -> u16 do\n    ~value\n  end\n  def combine(left: u32, right: u32) -> u32 do\n    left & right | left ^ right\n  end\n  def shift_left(value: i16, count: usize) -> i16 do\n    value << count\n  end\n  def shift_right(value: i16, count: usize) -> i16 do\n    value >> count\n  end\n  def logical_shift(value: u64, count: usize) -> u64 do\n    value >> count\n  end\n  def main() -> i32 do\n    negate(1)\n    invert(1)\n    combine(1, 2)\n    shift_left(1, 2)\n    shift_right(4, 1)\n    logical_shift(4, 1)\n    42\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("integer operator lowering verifies");
+        let text = llvm.as_str();
+        for expected in [
+            "@llvm.ssub.with.overflow.i8",
+            "xor i16",
+            "and i32",
+            "or i32",
+            "xor i32",
+            "shl i16",
+            "ashr i16",
+            "lshr i64",
+            "icmp uge i64",
+            "call void @__el_runtime_fail(i32 3",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn lowers_checked_integer_conversions_with_signed_ranges() {
+        let core = concrete(
+            "defmodule Main do\n  def narrow_signed(value: i64) -> i8 do\n    i8(value)\n  end\n  def signed_to_unsigned(value: i16) -> u16 do\n    u16(value)\n  end\n  def unsigned_to_signed(value: u16) -> i16 do\n    i16(value)\n  end\n  def widen_signed(value: i8) -> i64 do\n    i64(value)\n  end\n  def widen_unsigned(value: u8) -> u64 do\n    u64(value)\n  end\n  def main() -> i32 do\n    narrow_signed(1)\n    signed_to_unsigned(2)\n    unsigned_to_signed(3)\n    widen_signed(4)\n    widen_unsigned(5)\n    42\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("integer conversions lower and verify");
+        let text = llvm.as_str();
+        for expected in [
+            "icmp slt i64",
+            "icmp sgt i64",
+            "trunc i64",
+            "icmp slt i16",
+            "icmp ugt i16",
+            "sext i8",
+            "zext i8",
+            "call void @__el_runtime_fail(i32 4",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn lowers_checked_integer_to_rune_conversions() {
+        let core = concrete(
+            "defmodule Main do\n  def signed(value: i64) -> rune do\n    rune(value)\n  end\n  def unsigned(value: u64) -> rune do\n    rune(value)\n  end\n  def narrow(value: u8) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    signed(65)\n    unsigned(128578)\n    narrow(66)\n    42\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("integer-to-rune conversions lower and verify");
+        let text = llvm.as_str();
+        for expected in [
+            "icmp slt i64",
+            "icmp sgt i64",
+            "icmp ugt i64",
+            "icmp uge i64",
+            "icmp ule i64",
+            "trunc i64",
+            "zext i8",
+            "call void @__el_runtime_fail(i32 4",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn lowers_wrapping_integer_operations_without_failure_edges() {
+        let core = concrete(
+            "defmodule Main do\n  def signed(value: i8, count: usize) -> i8 do\n    I8.wrapping_add(I8.wrapping_neg(value), I8.wrapping_shl(value, count))\n  end\n  def unsigned(value: u64, count: usize) -> u64 do\n    U64.wrapping_sub(U64.wrapping_mul(value, value), U64.wrapping_shr(value, count))\n  end\n  def main() -> i32 do\n    signed(1, 9)\n    unsigned(2, 65)\n    42\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("wrapping operations lower and verify");
+        let text = llvm.as_str();
+        for expected in [
+            "sub i8 0", "add i8", "shl i8", "mul i64", "sub i64", "lshr i64", "urem i64",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        assert!(!text.contains("llvm.sadd.with.overflow"), "{text}");
+        assert!(!text.contains("llvm.ssub.with.overflow"), "{text}");
+        assert!(!text.contains("invalid_shift"), "{text}");
+    }
+
+    #[test]
+    fn lowers_ieee_float_operations_without_fast_math() {
+        let core = concrete(
+            "defmodule Main do\n  def single(value: f32) -> f32 do\n    sum = value + 1.5\n    -sum * 2.0\n  end\n  def ieee(value: f64, zero: f64) -> bool do\n    nan = zero / zero\n    value / zero > value and nan != nan and -zero == zero\n  end\n  def main() -> i32 do\n    if single(1.0) < 0.0 and ieee(1.0, 0.0) do\n      42\n    else\n      1\n    end\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("float operations lower and verify");
+        let text = llvm.as_str();
+        for expected in [
+            "fadd float",
+            "fneg float",
+            "fmul float",
+            "fdiv double",
+            "fcmp olt float",
+            "fcmp une double",
+            "fcmp oeq double",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        for forbidden in [" fast ", " nnan ", " ninf ", " nsz ", " reassoc "] {
+            assert!(!text.contains(forbidden), "unexpected {forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn lowers_float_literal_patterns_with_ordered_equality() {
+        let core = concrete(
+            "defmodule Main do\n  def classify(value: f64) -> i32 do\n    match value do\n      0.0 -> 0\n      -1.5 -> 1\n      _ -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(-1.5)\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("float patterns lower and verify");
+        let text = llvm.as_str();
+        assert!(text.matches("fcmp oeq double").count() >= 2, "{text}");
+        assert!(!text.contains("switch double"), "{text}");
+    }
+
+    #[test]
+    fn lowers_all_explicit_float_numeric_conversion_directions() {
+        let core = concrete(
+            "defmodule Main do\n  def signed(value: i64) -> f32 do\n    f32(value)\n  end\n  def unsigned(value: u64) -> f64 do\n    f64(value)\n  end\n  def to_signed(value: f64) -> i32 do\n    i32(value)\n  end\n  def to_unsigned(value: f32) -> u16 do\n    u16(value)\n  end\n  def resize(value: f64) -> f64 do\n    f64(f32(value))\n  end\n  def main() -> i32 do\n    signed(1)\n    unsigned(2)\n    to_signed(3.5)\n    to_unsigned(4.5)\n    resize(5.5)\n    42\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("numeric conversions lower and verify");
+        let text = llvm.as_str();
+        for expected in [
+            "sitofp i64",
+            "uitofp i64",
+            "fptosi double",
+            "fptoui float",
+            "fptrunc double",
+            "fpext float",
+            "fcmp uno",
+            "fcmp ole",
+            "fcmp oge",
+            "call void @__el_runtime_fail(i32 4",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }

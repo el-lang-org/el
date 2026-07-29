@@ -1320,6 +1320,195 @@ fn checks_every_integer_width_and_rejects_out_of_range_literals() {
 }
 
 #[test]
+fn checks_integer_unary_bitwise_and_shift_operators() {
+    let source = "defmodule Main do\n  def signed(value: i16, count: usize) -> i16 do\n    ~ -value & 255 | value << count ^ value >> count\n  end\n  def unsigned(value: u32, count: usize) -> u32 do\n    ~value & 255 | value << count ^ value >> count\n  end\n  def main() -> i32 do\n    signed(4, 1)\n    unsigned(4, 1)\n    0\n  end\nend\n";
+    let typed = checked(source).expect("integer unary, bitwise, and shift operators type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("integer unary Negate"), "{debug}");
+    assert!(debug.contains("integer unary BitwiseNot"), "{debug}");
+    assert!(debug.contains("integer binary ShiftLeft"), "{debug}");
+    assert!(debug.contains("integer binary ShiftRight"), "{debug}");
+    verify(&typed).expect("integer operator Typed AST verifies");
+
+    checked("defmodule Main do\n  def minimum() -> i8 do\n    -128\n  end\nend\n")
+        .expect("the signed minimum literal is representable through unary minus");
+
+    for invalid in [
+        "defmodule Main do\n  def bad(value: u8) -> u8 do\n    -value\n  end\nend\n",
+        "defmodule Main do\n  def bad(value: u8, count: i32) -> u8 do\n    value << count\n  end\nend\n",
+        "defmodule Main do\n  def bad(left: u8, right: u16) -> u8 do\n    left & right\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> i8 do\n    -129\n  end\nend\n",
+    ] {
+        checked(invalid).expect_err("invalid integer operator types are rejected");
+    }
+}
+
+#[test]
+fn rejects_compile_time_known_integer_failures_but_keeps_dynamic_checks() {
+    for expression in [
+        "127 + 1",
+        "0 - 1",
+        "64 * 2",
+        "1 / 0",
+        "-128 / -1",
+        "-128 % -1",
+        "- -128",
+        "1 << 8",
+        "64 << 1",
+    ] {
+        let ty = if expression == "0 - 1" { "u8" } else { "i8" };
+        let source = format!(
+            "defmodule Main do\n  def invalid() -> {ty} do\n    {expression}\n  end\nend\n"
+        );
+        assert!(
+            checked(&source)
+                .expect_err("compile-time-known integer failure is rejected")
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E2106"),
+            "missing compile-time diagnostic for {expression}"
+        );
+    }
+
+    let dynamic = "defmodule Main do\n  def add(left: i8, right: i8) -> i8 do\n    left + right\n  end\n  def divide(left: i8, right: i8) -> i8 do\n    left / right\n  end\n  def negate(value: i8) -> i8 do\n    -value\n  end\n  def shift(value: i8, count: usize) -> i8 do\n    value << count\n  end\nend\n";
+    checked(dynamic).expect("dynamic integer failures remain runtime checks");
+}
+
+#[test]
+fn checks_explicit_integer_conversions_and_static_ranges() {
+    let source = "defmodule Main do\n  def narrow(value: i64) -> i8 do\n    i8(value)\n  end\n  def pipeline(value: i64) -> u16 do\n    value |> u16()\n  end\n  def main() -> i32 do\n    i8(1)\n    i16(2)\n    i32(3)\n    i64(4)\n    isize(5)\n    u8(6)\n    u16(7)\n    u32(8)\n    u64(9)\n    usize(10)\n    narrow(11)\n    pipeline(12)\n    0\n  end\nend\n";
+    let typed = checked(source).expect("all integer conversion targets type check");
+    assert!(
+        typed.debug_tree().matches("integer convert").count() >= 12,
+        "{}",
+        typed.debug_tree()
+    );
+    verify(&typed).expect("integer conversion Typed AST verifies");
+
+    for invalid in [
+        "defmodule Main do\n  def bad() -> u8 do\n    u8(-1)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> u8 do\n    u8(256)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> i8 do\n    i8(true)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> i8 do\n    i8(1, 2)\n  end\nend\n",
+    ] {
+        checked(invalid).expect_err("invalid integer conversion is rejected");
+    }
+}
+
+#[test]
+fn checks_integer_to_rune_conversions_and_unicode_scalar_ranges() {
+    let source = "defmodule Main do\n  def convert(value: i64) -> rune do\n    rune(value)\n  end\n  def pipeline(value: u32) -> rune do\n    value |> rune()\n  end\n  def main() -> i32 do\n    rune(65)\n    rune(1114111)\n    convert(128578)\n    pipeline(66)\n    0\n  end\nend\n";
+    let typed = checked(source).expect("valid Unicode scalar conversions type check");
+    assert!(
+        typed.debug_tree().matches("integer convert").count() >= 4,
+        "{}",
+        typed.debug_tree()
+    );
+    verify(&typed).expect("integer-to-rune conversion Typed AST verifies");
+
+    for invalid in [
+        "defmodule Main do\n  def bad() -> rune do\n    rune(-1)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> rune do\n    rune(55296)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> rune do\n    rune(1114112)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> rune do\n    rune(true)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> rune do\n    rune(1, 2)\n  end\nend\n",
+    ] {
+        checked(invalid).expect_err("invalid integer-to-rune conversion is rejected");
+    }
+}
+
+#[test]
+fn checks_all_integer_wrapping_intrinsics() {
+    let source = "defmodule Main do\n  def signed(value: i8, count: usize) -> i8 do\n    I8.wrapping_add(I8.wrapping_neg(value), I8.wrapping_shl(value, count))\n  end\n  def unsigned(value: u64, count: usize) -> u64 do\n    U64.wrapping_sub(U64.wrapping_mul(value, value), U64.wrapping_shr(value, count))\n  end\n  def main() -> i32 do\n    I16.wrapping_add(1, 2)\n    I32.wrapping_sub(1, 2)\n    I64.wrapping_mul(1, 2)\n    Isize.wrapping_neg(1)\n    U8.wrapping_shl(1, 9)\n    U16.wrapping_shr(1, 17)\n    U32.wrapping_neg(1)\n    Usize.wrapping_add(1, 2)\n    signed(1, 2)\n    unsigned(2, 1)\n    0\n  end\nend\n";
+    let typed = checked(source).expect("all per-width wrapping intrinsics type check");
+    assert!(
+        typed.debug_tree().matches("wrapping integer").count() >= 14,
+        "{}",
+        typed.debug_tree()
+    );
+    verify(&typed).expect("wrapping integer Typed AST verifies");
+
+    for invalid in [
+        source.replace("I16.wrapping_add(1, 2)", "I16.wrapping_add(1, true)"),
+        source.replace("U8.wrapping_shl(1, 9)", "U8.wrapping_shl(1, 9 :: u8)"),
+        source.replace("U32.wrapping_neg(1)", "U32.wrapping_neg(1, 2)"),
+        source.replace("Usize.wrapping_add(1, 2)", "Usize.wrapping_add(1)"),
+    ] {
+        checked(&invalid).expect_err("invalid wrapping intrinsic input is rejected");
+    }
+}
+
+#[test]
+fn checks_float_literals_arithmetic_negation_and_comparisons() {
+    let source = "defmodule Main do\n  def single(value: f32) -> f32 do\n    positive = value * 2.0 + 0.5\n    -positive\n  end\n  def double(value: f64) -> f64 do\n    value / 2.0 - value % 1.5\n  end\n  def main() -> i32 do\n    if single(1.25) < 0.0 and double(4.0) >= 1.0 and 0.0 == -0.0 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("f32 and f64 expressions type check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("float negate: f32"), "{debug}");
+    assert!(debug.contains("binary Divide: f64"), "{debug}");
+    assert!(debug.contains("comparison Less: bool"), "{debug}");
+    verify(&typed).expect("float Typed AST verifies");
+
+    for invalid in [
+        source.replace("single(1.25)", "single(true)"),
+        source.replace("value * 2.0", "value * 2"),
+        source.replace("single(1.25)", "single(1e100)"),
+    ] {
+        checked(&invalid).expect_err("invalid float expression is rejected");
+    }
+}
+
+#[test]
+fn checks_float_literal_patterns_and_signed_zero_usefulness() {
+    let source = "defmodule Main do\n  def classify(value: f64) -> i32 do\n    match value do\n      0.0 -> 0\n      -1.5 -> 1\n      _ -> 2\n    end\n  end\n  def single(value: f32) -> i32 do\n    match value do\n      1.25 -> 1\n      _ -> 0\n    end\n  end\nend\n";
+    let typed = checked(source).expect("positive and negative float patterns type check");
+    verify(&typed).expect("float pattern Typed AST verifies");
+
+    let duplicate_zero = source.replace("      -1.5 -> 1", "      -0.0 -> 1");
+    assert!(
+        checked(&duplicate_zero)
+            .expect_err("positive and negative zero are duplicate float patterns")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2125")
+    );
+    let non_exhaustive = source.replace("      _ -> 2\n", "");
+    assert!(
+        checked(&non_exhaustive)
+            .expect_err("finite float literal patterns do not exhaust the float domain")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2126")
+    );
+    let out_of_range = source.replace("      1.25 -> 1", "      1e100 -> 1");
+    assert!(
+        checked(&out_of_range)
+            .expect_err("out-of-range f32 pattern is rejected")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2106")
+    );
+}
+
+#[test]
+fn checks_explicit_float_numeric_conversions_and_static_failures() {
+    let source = "defmodule Main do\n  def to_single(value: i64) -> f32 do\n    f32(value)\n  end\n  def to_double(value: u64) -> f64 do\n    value |> f64()\n  end\n  def truncate(value: f64) -> i32 do\n    i32(value)\n  end\n  def narrow(value: f64) -> f32 do\n    f32(value)\n  end\n  def widen(value: f32) -> f64 do\n    f64(value)\n  end\n  def main() -> i32 do\n    to_single(-42)\n    to_double(42)\n    truncate(42.9)\n    narrow(1.5)\n    widen(1.5)\n    u8(-0.9)\n    0\n  end\nend\n";
+    let typed = checked(source).expect("all explicit float conversion directions type check");
+    assert!(
+        typed.debug_tree().matches("numeric convert").count() >= 6,
+        "{}",
+        typed.debug_tree()
+    );
+    verify(&typed).expect("numeric conversion Typed AST verifies");
+
+    for invalid in [
+        "defmodule Main do\n  def bad() -> i8 do\n    i8(0.0 / 0.0)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> i8 do\n    i8(1.0 / 0.0)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> u8 do\n    u8(-1.0)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> i8 do\n    i8(128.0)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> f32 do\n    f32(true)\n  end\nend\n",
+        "defmodule Main do\n  def bad() -> f64 do\n    f64(1, 2)\n  end\nend\n",
+    ] {
+        checked(invalid).expect_err("invalid explicit numeric conversion is rejected");
+    }
+}
+
+#[test]
 fn checks_map_size_and_rejects_non_map_inputs() {
     let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map(i32, string) = %{1 => \"one\", 2 => \"two\"}\n    if Map.size(values) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("Map.size accepts an immutable map");

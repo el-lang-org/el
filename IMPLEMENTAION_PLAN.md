@@ -659,7 +659,7 @@ verified managed runtime.
    conversion snapshots.
 8. [x] **Function values:** exact monomorphic direct code targets, indirect calls,
    visibility behavior, and generic specialization from expected types.
-9. [ ] **Numbers:** remaining integer widths, pointer-sized integers, floats,
+9. [x] **Numbers:** remaining integer widths, pointer-sized integers, floats,
    explicit checked conversions, shifts, bitwise operations, and wrapping APIs.
 10. [x] **Collection helpers:** `Enum` traversal machinery needed by the data layer
     plus the fixed List/Array/Slice/Bytes operations. Protocol surface integration
@@ -1001,8 +1001,73 @@ verified managed runtime.
   protection while using unsigned operations where required. Focused LLVM and
   development/release native regressions cover exact layouts, unsigned high-bit
   division, signed and unsigned arithmetic, overflow, and unsigned underflow.
-  Floats, explicit conversions, shifts, bitwise operators, unary integer
-  operators, and wrapping APIs remain open in the Numbers deliverable group.
+  Floats and float conversion edges remain open in the Numbers deliverable
+  group.
+- [x] Added ordinary integer unary negation and complement, matching-type bitwise
+  `&`/`|`/`^`, and `usize`-counted `<<`/`>>` across every integer width. Signed
+  minimum literals are accepted without widening, dynamic negation and left-shift
+  overflow report `integer_overflow`, out-of-width counts report `invalid_shift`
+  before LLVM can observe poison, and right shifts select arithmetic or logical
+  behavior from the operand signedness. Typed AST and Core verifiers preserve the
+  exact operator and failure plan; LLVM plus development/release native tests cover
+  results and failure parity. Float conversions and floats remain open.
+- [x] Added compile-time evaluation of side-effect-free integer expressions for
+  mandatory failure diagnostics. Known add/subtract/multiply/negation overflow,
+  signed `MIN / -1` and `MIN % -1`, zero divisors, invalid shift counts, and
+  overflowing left shifts are rejected with the complete operation span before
+  Core lowering; dynamic equivalents retain their verified runtime failure edges.
+  Regression fixtures explicitly separate static rejection from
+  development/release runtime checks so neither path can silently replace the other.
+- [x] Added explicit primitive conversion calls between every integer type,
+  including pipeline input. Constant out-of-range conversions are diagnosed before
+  Core lowering; dynamic narrowing and signedness changes carry a verified
+  `invalid_conversion` edge. LLVM emits only the required signed/unsigned bounds
+  comparisons followed by truncation, sign extension, zero extension, or an
+  identity-width value. Development/release native tests cover successful widening,
+  narrowing, pointer-sized conversion, and failures in both signedness directions.
+- [x] Added explicit integer-to-`rune` conversion with Unicode scalar validation.
+  Known negative, surrogate, and above-`0x10FFFF` values are diagnosed during
+  checking; dynamic conversions carry the verified `invalid_conversion` edge.
+  LLVM performs only width-relevant signed, upper-bound, and surrogate checks
+  before producing the canonical 32-bit rune value. Typed AST, Generic Core,
+  LLVM, and development/release native regressions cover direct and pipeline
+  conversions, supplementary scalars, all three invalid ranges, and narrow
+  integer sources.
+- [x] Added the per-width `wrapping_add`, `wrapping_sub`, `wrapping_mul`,
+  `wrapping_neg`, `wrapping_shl`, and `wrapping_shr` APIs on `I8` through
+  `Usize`. Typed AST and Generic/Concrete Core retain a distinct failure-free
+  wrapping operation and verify matching operands plus `usize` shift counts.
+  LLVM uses modular integer instructions, reduces wrapping shift counts modulo
+  the operand width, and selects arithmetic or logical right shift by signedness.
+  Focused LLVM and development/release native regressions cover overflow,
+  underflow, unsigned negation, discarded high bits, and reduced shift counts.
+- [x] Added the `f32`/`f64` expression foundation through type formation,
+  expected-type-directed and default-`f64` literals, canonical IEEE-bit Typed
+  AST/Core constants, arithmetic and unary negation, primitive comparisons,
+  target layouts, LLVM lowering, and native calling conventions. Literal range
+  checks reject decimal spellings that round to infinity; float types remain
+  excluded from `Eq`, `Ord`, and `Hash`. LLVM uses ordered predicates except
+  unordered `!=` and enables no semantics-weakening fast-math flags.
+  Development/release regressions cover NaN inequality, division-by-zero
+  infinity, signed-zero equality, and `f32` arithmetic.
+- [x] Added positive and negative `f32`/`f64` literal patterns with contextual
+  range checks. Usefulness analysis treats positive and negative zero as the
+  same constructor, rejects duplicate zero arms, and still requires a catch-all
+  for the infinite floating domain. Core lowers each literal test to IEEE
+  ordered equality instead of an integer switch. Typed AST, Generic/Concrete
+  Core, LLVM, and development/release native regressions cover negative
+  patterns, signed-zero matching, duplicate detection, and exhaustiveness.
+- [x] Completed explicit numeric conversions: signed and unsigned integers to
+  either float width, checked float-to-integer truncation for every integer
+  width, and `f32`/`f64` widening, narrowing, and identity conversions.
+  Compile-time-known NaN, infinity, and out-of-range integer results are
+  diagnosed before Core; dynamic float-to-integer conversions carry
+  `invalid_conversion`. LLVM checks unordered and exclusive pre-truncation
+  bounds before `fptosi`/`fptoui`, while integer-to-float permits precision loss
+  and `f64` to `f32` may produce infinity. Development/release regressions cover
+  fractional boundaries, exact signed minimum, NaN, infinity, both range
+  directions, signedness, precision loss, and float-width changes. This closes
+  the Numbers deliverable group.
 
 ### Milestone 7 — Protocols and iteration
 

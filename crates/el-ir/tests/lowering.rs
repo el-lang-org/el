@@ -34,6 +34,159 @@ fn lowered_package(sources: &[&str]) -> el_ir::GenericModule {
 }
 
 #[test]
+fn lowers_and_verifies_integer_unary_bitwise_and_shift_operations() {
+    let source = "defmodule Main do\n  def transform(value: i16, count: usize) -> i16 do\n    ~ -value & 255 | value << count ^ value >> count\n  end\n  def main() -> i32 do\n    transform(4, 1)\n    0\n  end\nend\n";
+    let mut generic = lowered(source);
+    let debug = generic.debug_text();
+    assert!(debug.contains("integer_unary.Negate"), "{debug}");
+    assert!(debug.contains("integer_unary.BitwiseNot"), "{debug}");
+    assert!(debug.contains("integer_binary.BitwiseAnd"), "{debug}");
+    assert!(debug.contains("integer_binary.ShiftLeft"), "{debug}");
+    assert!(debug.contains("InvalidShift"), "{debug}");
+    verify(&generic).expect("integer operator Core verifies");
+
+    let shift = generic.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::IntegerBinary {
+                failures,
+                operator: el_ir::IntegerBinaryOperator::ShiftLeft,
+                ..
+            } => Some(failures),
+            _ => None,
+        })
+        .expect("left shift operation");
+    shift[0].0 = CoreFailureCategory::DivisionByZero;
+    assert!(
+        verify(&generic)
+            .expect_err("malformed shift failure plan is rejected")
+            .iter()
+            .any(|error| error.contains("invalid failure plan"))
+    );
+}
+
+#[test]
+fn lowers_and_verifies_checked_integer_conversions() {
+    let source = "defmodule Main do\n  def narrow(value: i64) -> i8 do\n    i8(value)\n  end\n  def widen(value: u8) -> u64 do\n    u64(value)\n  end\n  def scalar(value: u32) -> rune do\n    rune(value)\n  end\n  def main() -> i32 do\n    narrow(42)\n    widen(42)\n    scalar(128578)\n    0\n  end\nend\n";
+    let mut generic = lowered(source);
+    let debug = generic.debug_text();
+    assert!(debug.contains("integer_convert"), "{debug}");
+    assert!(debug.contains("InvalidConversion"), "{debug}");
+    verify(&generic).expect("integer conversion Core verifies");
+
+    let failure = generic.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::IntegerConvert { failure, .. } => Some(*failure),
+            _ => None,
+        })
+        .expect("integer conversion operation");
+    let function_span = generic.functions[0].span;
+    generic.functions[0]
+        .blocks
+        .iter_mut()
+        .find(|block| block.id == failure)
+        .expect("conversion failure block")
+        .terminator = Terminator::Failure {
+        category: CoreFailureCategory::DivisionByZero,
+        origin: function_span,
+    };
+    assert!(
+        verify(&generic)
+            .expect_err("malformed conversion failure target is rejected")
+            .iter()
+            .any(|error| error.contains("invalid failure target"))
+    );
+}
+
+#[test]
+fn lowers_and_verifies_wrapping_integer_operations_without_failures() {
+    let mut module = lowered(
+        "defmodule Main do\n  def wrap(value: i8, count: usize) -> i8 do\n    I8.wrapping_add(I8.wrapping_neg(value), I8.wrapping_shl(value, count))\n  end\n  def main() -> i32 do\n    wrap(127, 9)\n    0\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("wrapping.Negate"), "{debug}");
+    assert!(debug.contains("wrapping.ShiftLeft"), "{debug}");
+    assert!(debug.contains("wrapping.Add"), "{debug}");
+    assert!(!debug.contains("IntegerOverflow =>"), "{debug}");
+    verify(&module).expect("wrapping integer Core verifies");
+
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("wrapping operations specialize");
+    verify_concrete(&concrete).expect("concrete wrapping integer Core verifies");
+
+    let shift = module
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.operations)
+        .find_map(|operation| match operation {
+            Operation::WrappingInteger {
+                operator: el_ir::WrappingIntegerOperator::ShiftLeft,
+                left,
+                right,
+                ..
+            } => Some((*left, right)),
+            _ => None,
+        })
+        .expect("wrapping shift operation");
+    *shift.1 = Some(shift.0);
+    assert!(
+        verify(&module)
+            .expect_err("malformed wrapping shift operands are rejected")
+            .iter()
+            .any(|error| error.contains("wrapping integer result"))
+    );
+}
+
+#[test]
+fn lowers_and_verifies_ieee_float_operations() {
+    let module = lowered(
+        "defmodule Main do\n  def calculate(value: f32) -> f32 do\n    sum = value + 1.5\n    -sum / 2.0\n  end\n  def main() -> i32 do\n    if calculate(1.5) < 0.0 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("float.Add"), "{debug}");
+    assert!(debug.contains("float.Negate"), "{debug}");
+    assert!(debug.contains("float.Divide"), "{debug}");
+    assert!(!debug.contains("IntegerOverflow =>"), "{debug}");
+    verify(&module).expect("float Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("float operations specialize");
+    verify_concrete(&concrete).expect("concrete float Core verifies");
+}
+
+#[test]
+fn lowers_float_patterns_to_ieee_equality_branches() {
+    let module = lowered(
+        "defmodule Main do\n  def classify(value: f64) -> i32 do\n    match value do\n      0.0 -> 0\n      -1.5 -> 1\n      _ -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(-1.5)\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.matches("compare.Equal").count() >= 2, "{debug}");
+    verify(&module).expect("float pattern Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("float patterns specialize");
+    verify_concrete(&concrete).expect("concrete float pattern Core verifies");
+}
+
+#[test]
+fn lowers_and_verifies_float_numeric_conversions() {
+    let module = lowered(
+        "defmodule Main do\n  def to_float(value: i64) -> f32 do\n    f32(value)\n  end\n  def to_integer(value: f64) -> i32 do\n    i32(value)\n  end\n  def resize(value: f64) -> f64 do\n    f64(f32(value))\n  end\n  def main() -> i32 do\n    to_float(1)\n    to_integer(2.5)\n    resize(3.5)\n    0\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.matches("integer_convert").count() >= 4, "{debug}");
+    assert!(debug.contains("InvalidConversion"), "{debug}");
+    verify(&module).expect("numeric conversion Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("numeric conversions specialize");
+    verify_concrete(&concrete).expect("concrete numeric conversion Core verifies");
+}
+
+#[test]
 fn concrete_types_carry_collector_independent_managed_classification() {
     let generic = lowered("defmodule Main do\n  def main() -> i32 do\n    0\n  end\nend\n");
     let roots = executable_reachability_roots(&generic).expect("entry point");
@@ -1091,7 +1244,7 @@ fn lowers_nested_scopes_to_typed_cfg_edges() {
 #[test]
 fn lowers_loops_short_circuit_logic_comparisons_and_nested_returns() {
     let module = lowered(
-        "defmodule Main do\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and 1 / 0 == 0 do\n      return 1\n    end\n    if true or 1 / 0 == 0 do\n      return result\n    end\n    0\n  end\nend\n",
+        "defmodule Main do\n  def divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def main() -> i32 do\n    mut n: i32 = 5\n    mut result: i32 = 1\n    while n > 1 do\n      result := result * n\n      n := n - 1\n    end\n    if false and divide(1, 0) == 0 do\n      return 1\n    end\n    if true or divide(1, 0) == 0 do\n      return result\n    end\n    0\n  end\nend\n",
     );
     let debug = module.debug_text();
 

@@ -4,7 +4,7 @@ use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
 pub use el_types::{
     ArithmeticOperator, BitstringByteOrder, BufferAppendKind, ComparisonOperator, EnumVisitKind,
-    Type, TypeId,
+    IntegerBinaryOperator, IntegerUnaryOperator, Type, TypeId, WrappingIntegerOperator,
 };
 use el_types::{
     LogicalOperator, TypedBitstringPatternSegmentKind, TypedBitstringSegmentKind, TypedExpr,
@@ -28,6 +28,8 @@ pub struct SlotId(pub u32);
 pub enum CoreFailureCategory {
     IntegerOverflow,
     DivisionByZero,
+    InvalidShift,
+    InvalidConversion,
     IndexOutOfBounds,
     BitstringSizeMismatch,
 }
@@ -449,6 +451,53 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    FloatArithmetic {
+        result: ValueId,
+        operator: ArithmeticOperator,
+        left: ValueId,
+        right: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    FloatNegate {
+        result: ValueId,
+        operand: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    IntegerUnary {
+        result: ValueId,
+        operator: IntegerUnaryOperator,
+        operand: ValueId,
+        failures: Vec<(CoreFailureCategory, BlockId)>,
+        ty: TypeId,
+        origin: Span,
+    },
+    IntegerBinary {
+        result: ValueId,
+        operator: IntegerBinaryOperator,
+        left: ValueId,
+        right: ValueId,
+        failures: Vec<(CoreFailureCategory, BlockId)>,
+        ty: TypeId,
+        origin: Span,
+    },
+    IntegerConvert {
+        result: ValueId,
+        value: ValueId,
+        source_ty: TypeId,
+        failure: BlockId,
+        ty: TypeId,
+        origin: Span,
+    },
+    WrappingInteger {
+        result: ValueId,
+        operator: WrappingIntegerOperator,
+        left: ValueId,
+        right: Option<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
     Compare {
         result: ValueId,
         operator: ComparisonOperator,
@@ -511,6 +560,7 @@ pub enum Operation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Constant {
     Integer(i128),
+    Float(u64),
     Boolean(bool),
     Unit,
     String(String),
@@ -594,6 +644,30 @@ fn arithmetic_failure_categories(operator: ArithmeticOperator) -> &'static [Core
             CoreFailureCategory::DivisionByZero,
             CoreFailureCategory::IntegerOverflow,
         ],
+    }
+}
+
+fn integer_unary_failure_categories(
+    operator: IntegerUnaryOperator,
+) -> &'static [CoreFailureCategory] {
+    match operator {
+        IntegerUnaryOperator::Negate => &[CoreFailureCategory::IntegerOverflow],
+        IntegerUnaryOperator::BitwiseNot => &[],
+    }
+}
+
+fn integer_binary_failure_categories(
+    operator: IntegerBinaryOperator,
+) -> &'static [CoreFailureCategory] {
+    match operator {
+        IntegerBinaryOperator::ShiftLeft => &[
+            CoreFailureCategory::InvalidShift,
+            CoreFailureCategory::IntegerOverflow,
+        ],
+        IntegerBinaryOperator::ShiftRight => &[CoreFailureCategory::InvalidShift],
+        IntegerBinaryOperator::BitwiseAnd
+        | IntegerBinaryOperator::BitwiseOr
+        | IntegerBinaryOperator::BitwiseXor => &[],
     }
 }
 
@@ -928,6 +1002,9 @@ impl<'a> Lowerer<'a> {
         Some(match &expression.kind {
             TypedExprKind::Integer(value) => {
                 self.constant(Constant::Integer(*value), expression.ty, expression.span)
+            }
+            TypedExprKind::Float(bits) => {
+                self.constant(Constant::Float(*bits), expression.ty, expression.span)
             }
             TypedExprKind::Boolean(value) => {
                 self.constant(Constant::Boolean(*value), expression.ty, expression.span)
@@ -1541,14 +1618,130 @@ impl<'a> Lowerer<'a> {
             } => {
                 let left = self.lower_expr(left)?;
                 let right = self.lower_expr(right)?;
-                let failures = self.checked_failure_targets(*operator, expression.span);
                 let result = self.value();
-                self.operations.push(Operation::CheckedArithmetic {
+                if matches!(
+                    self.types.get(expression.ty.0 as usize),
+                    Some(Type::F32 | Type::F64)
+                ) {
+                    self.operations.push(Operation::FloatArithmetic {
+                        result,
+                        operator: *operator,
+                        left,
+                        right,
+                        ty: expression.ty,
+                        origin: expression.span,
+                    });
+                } else {
+                    let failures = self.checked_failure_targets(*operator, expression.span);
+                    self.operations.push(Operation::CheckedArithmetic {
+                        result,
+                        operator: *operator,
+                        left,
+                        right,
+                        failures,
+                        ty: expression.ty,
+                        origin: expression.span,
+                    });
+                }
+                result
+            }
+            TypedExprKind::FloatNegate(operand) => {
+                let operand = self.lower_expr(operand)?;
+                let result = self.value();
+                self.operations.push(Operation::FloatNegate {
+                    result,
+                    operand,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::IntegerUnary { operator, operand } => {
+                let operand = self.lower_expr(operand)?;
+                let failures = self
+                    .failure_targets(integer_unary_failure_categories(*operator), expression.span);
+                let result = self.value();
+                self.operations.push(Operation::IntegerUnary {
+                    result,
+                    operator: *operator,
+                    operand,
+                    failures,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::IntegerBinary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.lower_expr(left)?;
+                let right = self.lower_expr(right)?;
+                let failures = self.failure_targets(
+                    integer_binary_failure_categories(*operator),
+                    expression.span,
+                );
+                let result = self.value();
+                self.operations.push(Operation::IntegerBinary {
                     result,
                     operator: *operator,
                     left,
                     right,
                     failures,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::IntegerConvert(value) => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::InvalidConversion, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::IntegerConvert {
+                    result,
+                    value,
+                    source_ty,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::NumericConvert(value) => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let failure =
+                    self.failure_target(CoreFailureCategory::InvalidConversion, expression.span);
+                let result = self.value();
+                self.operations.push(Operation::IntegerConvert {
+                    result,
+                    value,
+                    source_ty,
+                    failure,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::WrappingInteger {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.lower_expr(left)?;
+                let right = match right.as_deref() {
+                    Some(right) => Some(self.lower_expr(right)?),
+                    None => None,
+                };
+                let result = self.value();
+                self.operations.push(Operation::WrappingInteger {
+                    result,
+                    operator: *operator,
+                    left,
+                    right,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -1901,7 +2094,15 @@ impl<'a> Lowerer<'a> {
         operator: ArithmeticOperator,
         origin: Span,
     ) -> Vec<(CoreFailureCategory, BlockId)> {
-        arithmetic_failure_categories(operator)
+        self.failure_targets(arithmetic_failure_categories(operator), origin)
+    }
+
+    fn failure_targets(
+        &mut self,
+        categories: &[CoreFailureCategory],
+        origin: Span,
+    ) -> Vec<(CoreFailureCategory, BlockId)> {
+        categories
             .iter()
             .copied()
             .map(|category| {
@@ -2227,6 +2428,32 @@ impl<'a> Lowerer<'a> {
                 pattern.span,
                 pattern_arguments(bindings),
             ),
+            TypedPatternKind::Float(bits) => {
+                let expected = self.constant(Constant::Float(*bits), pattern.ty, pattern.span);
+                let compared = self.value();
+                self.operations.push(Operation::Compare {
+                    result: compared,
+                    operator: ComparisonOperator::Equal,
+                    left: subject,
+                    right: expected,
+                    operand_ty: pattern.ty,
+                    origin: pattern.span,
+                });
+                let matched = self.new_block();
+                self.finish_current(Terminator::CondBranch {
+                    condition: compared,
+                    then_target: matched,
+                    else_target: failure,
+                    origin: pattern.span,
+                });
+                self.current_block = matched;
+                self.current_parameters.clear();
+                self.finish_current(Terminator::Branch {
+                    target: success,
+                    arguments: pattern_arguments(bindings),
+                    origin: pattern.span,
+                });
+            }
             TypedPatternKind::Atom(value) => self.pattern_switch(
                 (subject, pattern.ty),
                 SwitchValue::Atom(value.clone()),
@@ -2981,7 +3208,22 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::ListHead { list, .. } | Operation::ListTail { list, .. } => {
             live.values.insert(*list);
         }
+        Operation::IntegerUnary { operand, .. } => {
+            live.values.insert(*operand);
+        }
+        Operation::FloatNegate { operand, .. } => {
+            live.values.insert(*operand);
+        }
+        Operation::IntegerConvert { value, .. } => {
+            live.values.insert(*value);
+        }
+        Operation::WrappingInteger { left, right, .. } => {
+            live.values.insert(*left);
+            live.values.extend(right);
+        }
         Operation::CheckedArithmetic { left, right, .. }
+        | Operation::FloatArithmetic { left, right, .. }
+        | Operation::IntegerBinary { left, right, .. }
         | Operation::Compare { left, right, .. } => {
             live.values.insert(*left);
             live.values.insert(*right);
@@ -3055,6 +3297,12 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::ListHead { result, .. }
         | Operation::ListTail { result, .. }
         | Operation::CheckedArithmetic { result, .. }
+        | Operation::FloatArithmetic { result, .. }
+        | Operation::FloatNegate { result, .. }
+        | Operation::IntegerUnary { result, .. }
+        | Operation::IntegerBinary { result, .. }
+        | Operation::IntegerConvert { result, .. }
+        | Operation::WrappingInteger { result, .. }
         | Operation::Compare { result, .. }
         | Operation::FunctionRef { result, .. }
         | Operation::Call { result, .. }
@@ -3095,6 +3343,8 @@ fn classify_managed_type(
         | Type::U16
         | Type::U32
         | Type::U64
+        | Type::F32
+        | Type::F64
         | Type::Bool
         | Type::Unit
         | Type::Atom(_)
@@ -3178,6 +3428,8 @@ enum NormalizedType {
     U16,
     U32,
     U64,
+    F32,
+    F64,
     Atom(String),
     List(Box<Self>),
     Array {
@@ -3518,6 +3770,8 @@ impl<'a> Monomorphizer<'a> {
             Type::U16 => NormalizedType::U16,
             Type::U32 => NormalizedType::U32,
             Type::U64 => NormalizedType::U64,
+            Type::F32 => NormalizedType::F32,
+            Type::F64 => NormalizedType::F64,
             Type::Atom(name) => NormalizedType::Atom(name.clone()),
             Type::List(item) => {
                 NormalizedType::List(Box::new(self.normalize(*item, substitution)?))
@@ -3688,6 +3942,11 @@ impl<'a> Monomorphizer<'a> {
             | Operation::ListHead { ty, .. }
             | Operation::ListTail { ty, .. }
             | Operation::CheckedArithmetic { ty, .. }
+            | Operation::FloatArithmetic { ty, .. }
+            | Operation::FloatNegate { ty, .. }
+            | Operation::IntegerUnary { ty, .. }
+            | Operation::IntegerBinary { ty, .. }
+            | Operation::WrappingInteger { ty, .. }
             | Operation::Load { ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
             }
@@ -3761,6 +4020,10 @@ impl<'a> Monomorphizer<'a> {
                 *function_ty = self.materialize_type(*function_ty, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
             }
+            Operation::IntegerConvert { source_ty, ty, .. } => {
+                *source_ty = self.materialize_type(*source_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+            }
             Operation::UnionInject { member, ty, .. } => {
                 *member = self.materialize_type(*member, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
@@ -3811,6 +4074,8 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::U16 => Type::U16,
             NormalizedType::U32 => Type::U32,
             NormalizedType::U64 => Type::U64,
+            NormalizedType::F32 => Type::F32,
+            NormalizedType::F64 => Type::F64,
             NormalizedType::Atom(name) => Type::Atom(name.clone()),
             NormalizedType::List(item) => Type::List(self.intern_normalized(item)),
             NormalizedType::Array { item, length } => Type::Array {
@@ -3953,6 +4218,8 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::U16
         | NormalizedType::U32
         | NormalizedType::U64
+        | NormalizedType::F32
+        | NormalizedType::F64
         | NormalizedType::Atom(_) => {}
     }
 }
@@ -3997,6 +4264,11 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::ListHead { ty, .. }
         | Operation::ListTail { ty, .. }
         | Operation::CheckedArithmetic { ty, .. }
+        | Operation::FloatArithmetic { ty, .. }
+        | Operation::FloatNegate { ty, .. }
+        | Operation::IntegerUnary { ty, .. }
+        | Operation::IntegerBinary { ty, .. }
+        | Operation::WrappingInteger { ty, .. }
         | Operation::FunctionRef { ty, .. }
         | Operation::Call { ty, .. }
         | Operation::Load { ty, .. } => output.push(*ty),
@@ -4032,6 +4304,10 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
             function_ty, ty, ..
         } => {
             output.push(*function_ty);
+            output.push(*ty);
+        }
+        Operation::IntegerConvert { source_ty, ty, .. } => {
+            output.push(*source_ty);
             output.push(*ty);
         }
         Operation::UnionInject { member, ty, .. } => {
@@ -4421,6 +4697,12 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::ListHead { result, ty, .. }
                     | Operation::ListTail { result, ty, .. }
                     | Operation::CheckedArithmetic { result, ty, .. }
+                    | Operation::FloatArithmetic { result, ty, .. }
+                    | Operation::FloatNegate { result, ty, .. }
+                    | Operation::IntegerUnary { result, ty, .. }
+                    | Operation::IntegerBinary { result, ty, .. }
+                    | Operation::IntegerConvert { result, ty, .. }
+                    | Operation::WrappingInteger { result, ty, .. }
                     | Operation::FunctionRef { result, ty, .. }
                     | Operation::Call { result, ty, .. }
                     | Operation::IndirectCall { result, ty, .. }
@@ -4578,7 +4860,10 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
         let mut failure_predecessors = BTreeSet::new();
         for block in &function.blocks {
             for operation in &block.operations {
-                if let Operation::CheckedArithmetic { failures, .. } = operation {
+                if let Operation::CheckedArithmetic { failures, .. }
+                | Operation::IntegerUnary { failures, .. }
+                | Operation::IntegerBinary { failures, .. } = operation
+                {
                     predecessors.extend(failures.iter().map(|(_, target)| *target));
                     failure_predecessors.extend(failures.iter().map(|(_, target)| *target));
                 }
@@ -4589,7 +4874,8 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                 | Operation::Bitstring { failure, .. }
                 | Operation::BitstringPatternInteger { failure, .. }
                 | Operation::BitstringPatternBytes { failure, .. }
-                | Operation::BitstringPatternCheck { failure, .. } = operation
+                | Operation::BitstringPatternCheck { failure, .. }
+                | Operation::IntegerConvert { failure, .. } = operation
                 {
                     predecessors.insert(*failure);
                     failure_predecessors.insert(*failure);
@@ -4648,30 +4934,58 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                     &mut values,
                     &mut errors,
                 );
-                if let Operation::CheckedArithmetic {
-                    operator,
-                    failures,
-                    origin,
-                    ..
-                } = operation
-                {
+                let failure_plan = match operation {
+                    Operation::CheckedArithmetic {
+                        operator,
+                        failures,
+                        origin,
+                        ..
+                    } => Some((
+                        "checked arithmetic",
+                        arithmetic_failure_categories(*operator),
+                        failures,
+                        origin,
+                    )),
+                    Operation::IntegerUnary {
+                        operator,
+                        failures,
+                        origin,
+                        ..
+                    } => Some((
+                        "integer unary operation",
+                        integer_unary_failure_categories(*operator),
+                        failures,
+                        origin,
+                    )),
+                    Operation::IntegerBinary {
+                        operator,
+                        failures,
+                        origin,
+                        ..
+                    } => Some((
+                        "integer binary operation",
+                        integer_binary_failure_categories(*operator),
+                        failures,
+                        origin,
+                    )),
+                    _ => None,
+                };
+                if let Some((label, expected, failures, origin)) = failure_plan {
                     let actual = failures
                         .iter()
                         .map(|(category, _)| *category)
                         .collect::<Vec<_>>();
-                    if actual != arithmetic_failure_categories(*operator) {
+                    if actual != expected {
                         errors.push(format!(
-                            "checked arithmetic in {:?} has an invalid failure plan",
+                            "{label} in {:?} has an invalid failure plan",
                             block.id
                         ));
                     }
                     let mut targets = BTreeSet::new();
                     for (category, target) in failures {
                         if !targets.insert(*target) {
-                            errors.push(format!(
-                                "checked arithmetic in {:?} reuses a failure block",
-                                block.id
-                            ));
+                            errors
+                                .push(format!("{label} in {:?} reuses a failure block", block.id));
                         }
                         match blocks.get(target) {
                             Some(target_block)
@@ -4685,7 +4999,7 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                                         } if found == *category && found_origin == *origin
                                     ) => {}
                             _ => errors.push(format!(
-                                "checked arithmetic in {:?} has an invalid failure target",
+                                "{label} in {:?} has an invalid failure target",
                                 block.id
                             )),
                         }
@@ -4717,6 +5031,27 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
                                 ) => {}
                         _ => errors.push(format!(
                             "bounds-checked operation in {:?} has an invalid failure target",
+                            block.id
+                        )),
+                    }
+                }
+                if let Operation::IntegerConvert {
+                    failure, origin, ..
+                } = operation
+                {
+                    match blocks.get(failure) {
+                        Some(target_block)
+                            if target_block.parameters.is_empty()
+                                && target_block.operations.is_empty()
+                                && matches!(
+                                    target_block.terminator,
+                                    Terminator::Failure {
+                                        category: CoreFailureCategory::InvalidConversion,
+                                        origin: found_origin,
+                                    } if found_origin == *origin
+                                ) => {}
+                        _ => errors.push(format!(
+                            "integer conversion in {:?} has an invalid failure target",
                             block.id
                         )),
                     }
@@ -4922,6 +5257,8 @@ fn verify_operation(
         } => {
             let valid = match (constant, types.get(ty.0 as usize)) {
                 (Constant::Integer(_), Some(ty)) if is_integer_type(ty) => true,
+                (Constant::Float(bits), Some(Type::F32)) => *bits <= u64::from(u32::MAX),
+                (Constant::Float(_), Some(Type::F64)) => true,
                 (Constant::Boolean(_), Some(Type::Bool))
                 | (Constant::Unit, Some(Type::Unit))
                 | (Constant::String(_), Some(Type::String)) => true,
@@ -5830,6 +6167,142 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::FloatArithmetic {
+            result,
+            left,
+            right,
+            ty,
+            ..
+        } => {
+            if values.get(left) != Some(ty)
+                || values.get(right) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::F32 | Type::F64))
+            {
+                errors.push(format!(
+                    "float arithmetic result {result:?} has invalid operands"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::FloatNegate {
+            result,
+            operand,
+            ty,
+            ..
+        } => {
+            if values.get(operand) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::F32 | Type::F64))
+            {
+                errors.push(format!(
+                    "float negation result {result:?} has invalid operand"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::IntegerUnary {
+            result,
+            operator,
+            operand,
+            ty,
+            ..
+        } => {
+            let signed = matches!(
+                types.get(ty.0 as usize),
+                Some(Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize)
+            );
+            if values.get(operand) != Some(ty)
+                || !types.get(ty.0 as usize).is_some_and(is_integer_type)
+                || (matches!(operator, IntegerUnaryOperator::Negate) && !signed)
+            {
+                errors.push(format!(
+                    "integer unary result {result:?} has invalid operands"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::IntegerBinary {
+            result,
+            operator,
+            left,
+            right,
+            ty,
+            ..
+        } => {
+            let right_ty = values.get(right);
+            let shift = matches!(
+                operator,
+                IntegerBinaryOperator::ShiftLeft | IntegerBinaryOperator::ShiftRight
+            );
+            if values.get(left) != Some(ty)
+                || !types.get(ty.0 as usize).is_some_and(is_integer_type)
+                || if shift {
+                    !right_ty.is_some_and(|right_ty| {
+                        matches!(types.get(right_ty.0 as usize), Some(Type::Usize))
+                    })
+                } else {
+                    right_ty != Some(ty)
+                }
+            {
+                errors.push(format!(
+                    "integer binary result {result:?} has invalid operands"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::IntegerConvert {
+            result,
+            value,
+            source_ty,
+            ty,
+            ..
+        } => {
+            let source = types.get(source_ty.0 as usize);
+            let target = types.get(ty.0 as usize);
+            let valid_numeric = source.is_some_and(|ty| is_integer_type(ty) || is_float_type(ty))
+                && target.is_some_and(|ty| is_integer_type(ty) || is_float_type(ty))
+                && (source.is_some_and(is_float_type) || target.is_some_and(is_float_type));
+            let valid_rune =
+                source.is_some_and(is_integer_type) && matches!(target, Some(Type::Rune));
+            let valid_integer =
+                source.is_some_and(is_integer_type) && target.is_some_and(is_integer_type);
+            if values.get(value) != Some(source_ty)
+                || !(valid_numeric || valid_rune || valid_integer)
+            {
+                errors.push(format!("integer conversion {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::WrappingInteger {
+            result,
+            operator,
+            left,
+            right,
+            ty,
+            ..
+        } => {
+            let unary = matches!(operator, WrappingIntegerOperator::Negate);
+            let shift = matches!(
+                operator,
+                WrappingIntegerOperator::ShiftLeft | WrappingIntegerOperator::ShiftRight
+            );
+            let valid_right = match (unary, right) {
+                (true, None) => true,
+                (false, Some(right)) if shift => values.get(right).is_some_and(|right_ty| {
+                    matches!(types.get(right_ty.0 as usize), Some(Type::Usize))
+                }),
+                (false, Some(right)) => values.get(right) == Some(ty),
+                _ => false,
+            };
+            if values.get(left) != Some(ty)
+                || !types.get(ty.0 as usize).is_some_and(is_integer_type)
+                || !valid_right
+            {
+                errors.push(format!(
+                    "wrapping integer result {result:?} has invalid operands"
+                ));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Compare {
             result,
             operator,
@@ -5842,10 +6315,9 @@ fn verify_operation(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = types
-                .get(operand_ty.0 as usize)
-                .is_some_and(|ty| is_integer_type(ty) || matches!(ty, Type::Rune))
-                || (!ordered && standard_eq_type(types, *operand_ty));
+            let supported = types.get(operand_ty.0 as usize).is_some_and(|ty| {
+                is_integer_type(ty) || matches!(ty, Type::Rune | Type::F32 | Type::F64)
+            }) || (!ordered && standard_eq_type(types, *operand_ty));
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
                 || !supported
@@ -6206,6 +6678,10 @@ fn is_integer_type(ty: &Type) -> bool {
             | Type::U64
             | Type::Usize
     )
+}
+
+fn is_float_type(ty: &Type) -> bool {
+    matches!(ty, Type::F32 | Type::F64)
 }
 
 fn is_utf8_result_type(types: &[Type], ty: TypeId) -> bool {
@@ -6721,6 +7197,86 @@ fn display_operation(operation: &Operation) -> String {
                 .map(|(category, target)| format!("{category:?} => b{}", target.0))
                 .collect::<Vec<_>>()
                 .join(", ")
+        ),
+        Operation::FloatArithmetic {
+            result,
+            operator,
+            left,
+            right,
+            ty,
+            ..
+        } => format!(
+            "v{} = float.{operator:?} v{}, v{}: t{}",
+            result.0, left.0, right.0, ty.0
+        ),
+        Operation::FloatNegate {
+            result,
+            operand,
+            ty,
+            ..
+        } => format!("v{} = float.Negate v{}: t{}", result.0, operand.0, ty.0),
+        Operation::IntegerUnary {
+            result,
+            operator,
+            operand,
+            failures,
+            ty,
+            ..
+        } => format!(
+            "v{} = integer_unary.{operator:?} v{}: t{} [{}]",
+            result.0,
+            operand.0,
+            ty.0,
+            failures
+                .iter()
+                .map(|(category, target)| format!("{category:?} => b{}", target.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Operation::IntegerBinary {
+            result,
+            operator,
+            left,
+            right,
+            failures,
+            ty,
+            ..
+        } => format!(
+            "v{} = integer_binary.{operator:?} v{}, v{}: t{} [{}]",
+            result.0,
+            left.0,
+            right.0,
+            ty.0,
+            failures
+                .iter()
+                .map(|(category, target)| format!("{category:?} => b{}", target.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Operation::IntegerConvert {
+            result,
+            value,
+            source_ty,
+            failure,
+            ty,
+            ..
+        } => format!(
+            "v{} = integer_convert v{}: t{} -> t{} [InvalidConversion => b{}]",
+            result.0, value.0, source_ty.0, ty.0, failure.0
+        ),
+        Operation::WrappingInteger {
+            result,
+            operator,
+            left,
+            right,
+            ty,
+            ..
+        } => format!(
+            "v{} = wrapping.{operator:?} v{}{}: t{}",
+            result.0,
+            left.0,
+            right.map_or_else(String::new, |right| format!(", v{}", right.0)),
+            ty.0
         ),
         Operation::Compare {
             result,
