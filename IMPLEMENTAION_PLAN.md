@@ -667,22 +667,22 @@ verified managed runtime.
 
 **Tests**
 
-- [ ] Construction, inference, layout, access, and immutable-copy semantics for
+- [x] Construction, inference, layout, access, and immutable-copy semantics for
   every data category.
 - [x] Fixed-array length inference and rejection of symbolic/derived lengths.
 - [x] Map insertion order across seeds and all update/remove/reinsert cases.
-- [ ] Bounds and numeric failure categories in debug and release.
+- [x] Bounds and numeric failure categories in debug and release.
 - [x] Valid/invalid UTF-8 offsets and parity between string and buffer validation.
 - [x] Full Unicode 17.0.0 `GraphemeBreakTest.txt` conformance for eager, lazy, and
   length APIs.
-- [ ] GC stress for nested composite graphs, views, base retention, immutable
+- [x] GC stress for nested composite graphs, views, base retention, immutable
   sharing, and function values.
 - [x] Compile-time rejection of `string[index]`.
 
-- [ ] **Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
+- [x] **Exit gate:** process valid UTF-8, reject invalid UTF-8, retain composite heap
   graphs under GC stress, and diagnose integer indexing on `string`.
 
-**Implementation progress (2026-07-29)**
+**Implementation progress (through 2026-07-30)**
 
 - [x] Completed the struct value slice end to end: nominal and generic all-fields
   construction, direct field projection, source-order initializer evaluation,
@@ -1077,6 +1077,18 @@ verified managed runtime.
   fractional boundaries, exact signed minimum, NaN, infinity, both range
   directions, signedness, precision loss, and float-width changes. This closes
   the Numbers deliverable group.
+- [x] Closed the remaining Milestone 6 test matrix after auditing every delivered
+  value category across checking, verified Generic/Concrete Core, target layout,
+  LLVM, and native development/release coverage. Managed slice and bits bounds now
+  assert the stable `index_out_of_bounds` category, while every dynamic bitstring
+  construction mismatch asserts `bitstring_size_mismatch`, in both profiles rather
+  than merely checking for nonzero termination.
+- [x] Added the combined Milestone 6 native exit gate. An allocated valid UTF-8
+  string and its grapheme, byte, and bit views remain reachable through a struct,
+  an immutable map, and a shared pre-update map under collection at every
+  allocation; the same program checks invalid UTF-8 offsets. It passes in
+  development and release, while the existing frontend regression diagnoses
+  integer indexing on `string`. This completes Milestone 6.
 
 ### Milestone 7 — Protocols and iteration
 
@@ -1465,8 +1477,10 @@ unchecked and add `(in progress)` after the item when useful.
   deterministic allocation-failure build proves category 6, the list literal's
   exact source span, nonzero termination, and skipped deferred cleanup. The
   optimized native EL graph-retention exit gate is closed.
-- [ ] **6 — Data types and text:** UTF-8, composites, views, GC, string-index
-  rejection.
+- [x] **6 — Data types and text:** all v1 value categories, numeric operations,
+  UTF-8 validation, Unicode 17 grapheme APIs, composites, immutable sharing,
+  retained views, collection helpers, GC stress, stable bounds/failure categories,
+  and string-index rejection pass the Milestone 6 exit gate.
 - [ ] **7 — Protocols and iteration:** derive, constrained generics, iteration,
   concat.
 - [ ] **8 — Packages, I/O, stdlib:** multi-module recoverable I/O program.

@@ -200,6 +200,26 @@ fn build_and_run_managed(
 }
 
 #[cfg(feature = "gc-stress-test")]
+fn assert_managed_failure_category(
+    directory: &Path,
+    name: &str,
+    source: &str,
+    profile: BuildProfile,
+    category: u32,
+) {
+    let executable = build_managed_executable(directory, name, source, profile);
+    let output = Command::new(executable)
+        .output()
+        .expect("run failing managed native executable");
+    assert!(!output.status.success(), "{name} must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with(&format!("EL runtime failure {category} at file 0:")),
+        "{name} must report failure category {category}, got {stderr:?}"
+    );
+}
+
+#[cfg(feature = "gc-stress-test")]
 fn build_managed_executable(
     directory: &Path,
     name: &str,
@@ -638,6 +658,30 @@ fn string_from_bytes_validates_utf8_and_reports_first_invalid_offsets() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn milestone_six_exit_gate_retains_composite_text_graphs() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  defstruct Payload do\n    text: string\n    pieces: [string]\n    data: bytes\n    bit_view: bits\n  end\n  def valid_payload(value: {:ok, string}) -> string do\n    match value do\n      {:ok, text} -> text\n    end\n  end\n  def error_payload(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def decode(data: bytes) -> string do\n    match String.from_bytes(data) do\n      value: {:ok, string} -> valid_payload(value)\n      _ -> \"\"\n    end\n  end\n  def error_offset(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def payload(value: {:some, Payload}) -> Payload do\n    match value do\n      {:some, item} -> item\n    end\n  end\n  def fetched(values: Map(i32, Payload), key: i32) -> i32 do\n    match Map.fetch(values, key) do\n      value: {:some, Payload} ->\n        item = payload(value)\n        if item.text == \"Aé🙂\" and item.pieces == [\"A\", \"é\", \"🙂\"] and Bytes.byte_size(item.data) == 3 and item.data[0] == 101 and Bits.bit_size(item.bit_view) == 24 do\n          42\n        else\n          1\n        end\n      _ -> 0\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.graphemes(Rune.to_string('🙂'))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    text = decode(Bytes.from_list([65, 101, 204, 129, 240, 159, 153, 130]))\n    data = Bytes.slice(String.bytes(text), 1, 3)\n    item = %Payload{text: text, pieces: Enum.to_list(String.grapheme_view(text)), data: data, bit_view: Bytes.to_bits(data)}\n    original: Map(i32, Payload) = Map.put(Map.new(), 1, item)\n    shared = original\n    updated = Map.put(original, 2, item)\n    pressure(256)\n    if fetched(shared, 1) == 42 and fetched(updated, 2) == 42 and Map.size(shared) == 1 and Map.size(updated) == 2 and error_offset(Bytes.from_list([65, 128])) == 1 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-milestone-six-exit-gate"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "Milestone 6 composite text graph must survive GC stress in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn buffers_preserve_value_snapshots_and_match_string_utf8_validation() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def valid_payload(value: {:ok, string}) -> string do\n    match value do\n      {:ok, text} -> text\n    end\n  end\n  def error_payload(value: {:error, String.Utf8Error}) -> usize do\n    match value do\n      {:error, reason} -> String.utf8_error_offset(reason)\n    end\n  end\n  def buffer_text(buffer: Buffer) -> string do\n    match Buffer.to_string(buffer) do\n      value: {:ok, string} -> valid_payload(value)\n      _ -> \"\"\n    end\n  end\n  def buffer_error(buffer: Buffer) -> usize do\n    match Buffer.to_string(buffer) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def bytes_error(data: bytes) -> usize do\n    match String.from_bytes(data) do\n      value: {:error, String.Utf8Error} -> error_payload(value)\n      _ -> 999\n    end\n  end\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      Buffer.to_bytes(Buffer.append_string(Buffer.new(), \"temporary🙂\"))\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    empty = Buffer.new()\n    original = Buffer.append_string(empty, \"hello\")\n    spaced = Buffer.append_byte(original, 32)\n    complete = Buffer.append_bytes(spaced, String.bytes(\"world\"))\n    snapshot = Buffer.to_bytes(complete)\n    later = Buffer.append_byte(complete, 33)\n    invalid_bytes = Bytes.from_list([97, 128])\n    invalid = Buffer.append_bytes(Buffer.new(), invalid_bytes)\n    text = buffer_text(complete)\n    pressure(256)\n    if Buffer.byte_size(empty) == 0 and Bytes.byte_size(Buffer.to_bytes(empty)) == 0 and String.byte_size(buffer_text(empty)) == 0 and Buffer.byte_size(original) == 5 and Buffer.byte_size(complete) == 11 and Buffer.byte_size(later) == 12 and Bytes.byte_size(snapshot) == 11 and snapshot[0] == 104 and snapshot[10] == 100 and String.byte_size(text) == 11 and String.bytes(text)[5] == 32 and buffer_error(invalid) == 1 and buffer_error(invalid) == bytes_error(invalid_bytes) do\n      42\n    else\n      0\n    end\n  end\nend\n";
@@ -674,7 +718,16 @@ fn arbitrary_bit_views_pack_msb_first_and_preserve_backing() {
             "none: :none -> true\n      _ -> false",
             "some: {:some, bytes} -> false\n      _ -> true",
         );
-    let out_of_bounds = "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(Bytes.from_list([128]))\n    bits[8]\n    0\n  end\nend\n";
+    let out_of_bounds = [
+        (
+            "index",
+            "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(Bytes.from_list([128]))\n    bits[8]\n    0\n  end\nend\n",
+        ),
+        (
+            "slice",
+            "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(Bytes.from_list([128]))\n    Bits.slice(bits, 7, 2)\n    0\n  end\nend\n",
+        ),
+    ];
 
     for (label, profile) in [
         ("development", BuildProfile::Development),
@@ -691,17 +744,15 @@ fn arbitrary_bit_views_pack_msb_first_and_preserve_backing() {
             Some(42),
             "bit views must index and repack MSB-first in {label}"
         );
-        assert_ne!(
-            build_and_run_managed(
+        for (case, failing_source) in out_of_bounds {
+            assert_managed_failure_category(
                 &temp.0,
-                &format!("{label}-bits-out-of-bounds"),
-                out_of_bounds,
+                &format!("{label}-bits-{case}-out-of-bounds"),
+                failing_source,
                 profile,
-            )
-            .code(),
-            Some(0),
-            "bit indexing must fail out of bounds in {label}"
-        );
+                5,
+            );
+        }
     }
 }
 
@@ -754,16 +805,12 @@ fn byte_aligned_bitstring_construction_preserves_order_and_checks_sizes() {
             ("integer", integer_mismatch),
             ("signed-integer", signed_integer_mismatch),
         ] {
-            assert_eq!(
-                build_and_run_managed(
-                    &temp.0,
-                    &format!("{label}-bitstring-{case}-mismatch"),
-                    failing_source,
-                    profile,
-                )
-                .code(),
-                Some(1),
-                "bitstring {case} mismatch must fail in {label}"
+            assert_managed_failure_category(
+                &temp.0,
+                &format!("{label}-bitstring-{case}-mismatch"),
+                failing_source,
+                profile,
+                8,
             );
         }
     }
@@ -839,16 +886,12 @@ fn managed_slices_retain_nested_backing_and_copy_in_both_profiles() {
             Some(42),
             "slice views and copies must retain nested managed elements in {label}"
         );
-        assert_eq!(
-            build_and_run_managed(
-                &temp.0,
-                &format!("{label}-managed-slice-bounds"),
-                out_of_bounds,
-                profile,
-            )
-            .code(),
-            Some(1),
-            "managed runtime must terminate nonzero on subslice bounds failure in {label}"
+        assert_managed_failure_category(
+            &temp.0,
+            &format!("{label}-managed-slice-bounds"),
+            out_of_bounds,
+            profile,
+            5,
         );
     }
 }
