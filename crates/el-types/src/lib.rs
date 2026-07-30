@@ -59,6 +59,11 @@ pub enum Type {
         owner: DeclId,
         name: String,
     },
+    Projection {
+        protocol: String,
+        associated: String,
+        argument: TypeId,
+    },
     Union(Vec<TypeId>),
 }
 
@@ -78,6 +83,7 @@ pub struct TypedImplementation {
     pub target: TypeId,
     pub associated_types: Vec<(String, TypeId)>,
     pub methods: Vec<String>,
+    pub constraints: Vec<(TypeId, String)>,
     pub span: Span,
 }
 
@@ -87,6 +93,7 @@ pub struct TypedStruct {
     pub name: String,
     pub span: Span,
     pub parameters: Vec<TypeId>,
+    pub derives: Vec<String>,
     pub fields: Vec<TypedField>,
 }
 
@@ -230,6 +237,15 @@ pub enum TypedItem {
     Return(TypedExpr),
     While {
         condition: TypedExpr,
+        body: TypedBlock,
+        span: Span,
+    },
+    For {
+        pattern: TypedPattern,
+        iterable: TypedExpr,
+        index_ty: TypeId,
+        option_ty: TypeId,
+        some_ty: TypeId,
         body: TypedBlock,
         span: Span,
     },
@@ -388,6 +404,10 @@ pub enum TypedExprKind {
     },
     IntegerConvert(Box<TypedExpr>),
     NumericConvert(Box<TypedExpr>),
+    Concat {
+        left: Box<TypedExpr>,
+        right: Box<TypedExpr>,
+    },
     WrappingInteger {
         operator: WrappingIntegerOperator,
         left: Box<TypedExpr>,
@@ -682,12 +702,22 @@ impl<'a> Checker<'a> {
                             .map(|ty| (name.clone(), ty))
                     })
                     .collect();
+                let constraints = implementation
+                    .constraints
+                    .iter()
+                    .filter_map(|constraint| {
+                        parameters
+                            .get(&constraint.parameter)
+                            .map(|parameter| (*parameter, constraint.protocol.clone()))
+                    })
+                    .collect();
                 Some(TypedImplementation {
                     id: implementation.id,
                     protocol: implementation.protocol.clone(),
                     target,
                     associated_types,
                     methods: implementation.methods.clone(),
+                    constraints,
                     span: implementation.span,
                 })
             })
@@ -758,6 +788,7 @@ impl<'a> Checker<'a> {
             name: structure.name.clone(),
             span: structure.span,
             parameters: parameters.values().copied().collect(),
+            derives: structure.derives.clone(),
             fields,
         })
     }
@@ -846,6 +877,30 @@ impl<'a> Checker<'a> {
                 ));
                 None
             }),
+            TypeSyntax::SelfType { span } => {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2163",
+                    *span,
+                    "`Self` is only valid in a protocol or implementation signature",
+                ));
+                None
+            }
+            TypeSyntax::Projection {
+                protocol,
+                associated,
+                argument,
+                ..
+            } => {
+                let argument = self.resolve_type(argument, parameters)?;
+                self.normalize_standard_projection(protocol, associated, argument)
+                    .or_else(|| {
+                        Some(self.intern(Type::Projection {
+                            protocol: protocol.clone(),
+                            associated: associated.clone(),
+                            argument,
+                        }))
+                    })
+            }
             TypeSyntax::Named {
                 declaration,
                 arguments,
@@ -1085,6 +1140,63 @@ impl<'a> Checker<'a> {
                     if let (Some(condition), Some(body)) = (condition, body) {
                         items.push(TypedItem::While {
                             condition,
+                            body,
+                            span: item.span,
+                        });
+                    }
+                }
+                "for_expr" => {
+                    let Some(iterable) = self.check_expr(&item.children[1], None, owner, scopes)
+                    else {
+                        continue;
+                    };
+                    let Some(item_ty) = self.iterable_item_type(iterable.ty, owner) else {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2161",
+                            item.children[1].span,
+                            format!(
+                                "type `{}` does not implement `Iterable`",
+                                self.type_name(iterable.ty)
+                            ),
+                        ));
+                        continue;
+                    };
+                    let mut bindings = BTreeMap::new();
+                    let Some((pattern, _)) = self.check_pattern(
+                        &item.children[0],
+                        item_ty,
+                        owner,
+                        scopes,
+                        &mut bindings,
+                    ) else {
+                        continue;
+                    };
+                    if !pattern.facts.irrefutable {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2162",
+                            pattern.span,
+                            "a `for` pattern must be irrefutable for the iterable item type",
+                        ));
+                        continue;
+                    }
+                    let some_atom = self.intern(Type::Atom("some".to_owned()));
+                    let none_atom = self.intern(Type::Atom("none".to_owned()));
+                    let index_ty = self.intern(Type::Usize);
+                    let some_ty = self.intern(Type::Tuple(vec![some_atom, item_ty]));
+                    let Some(option_ty) = self.normalize_union(vec![some_ty, none_atom], item.span)
+                    else {
+                        continue;
+                    };
+                    scopes.push(bindings);
+                    let body = self.check_block(&item.children[2], Some(TypeId(3)), owner, scopes);
+                    scopes.pop();
+                    if let Some(body) = body {
+                        items.push(TypedItem::For {
+                            pattern,
+                            iterable,
+                            index_ty,
+                            option_ty,
+                            some_ty,
                             body,
                             span: item.span,
                         });
@@ -1371,6 +1483,30 @@ impl<'a> Checker<'a> {
                         span: node.span,
                     });
                 }
+                if let Some((protocol, associated)) = written.rsplit_once('.') {
+                    let protocol_known = matches!(
+                        protocol,
+                        "Eq" | "Ord"
+                            | "Show"
+                            | "Hash"
+                            | "Iterable"
+                            | "Reader"
+                            | "Writer"
+                            | "Concat"
+                    ) || self
+                        .program
+                        .protocols
+                        .iter()
+                        .any(|candidate| candidate.name == protocol);
+                    if node.children.len() == 2 && protocol_known {
+                        return Some(TypeSyntax::Projection {
+                            protocol: protocol.to_owned(),
+                            associated: associated.to_owned(),
+                            argument: Box::new(self.annotation_syntax(&node.children[1], module)?),
+                            span: node.span,
+                        });
+                    }
+                }
                 let declaration = self
                     .aliases
                     .values()
@@ -1574,6 +1710,7 @@ impl<'a> Checker<'a> {
                 self.check_integer_binary(node, expected, owner, scopes)
             }
             "equality_expr" | "comparison_expr" => self.check_comparison(node, owner, scopes),
+            "concat_expr" => self.check_concat(node, expected, owner, scopes),
             "logical_and_expr" | "logical_or_expr" => self.check_logical(node, owner, scopes),
             "pipeline_expr" => self.check_pipeline(node, expected, owner, scopes),
             "postfix_expr" => self.check_postfix(node, expected, owner, scopes),
@@ -2831,6 +2968,72 @@ impl<'a> Checker<'a> {
         })
     }
 
+    fn check_concat(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let left = self.check_expr(&node.children[0], expected, owner, scopes)?;
+        if !self.type_satisfies(left.ty, "Concat", owner) {
+            self.diagnostics.push(Diagnostic::error(
+                "E2160",
+                node.span,
+                format!(
+                    "type `{}` does not implement `Concat`",
+                    self.type_name(left.ty)
+                ),
+            ));
+            return None;
+        }
+        let right = self.check_expr(&node.children[1], Some(left.ty), owner, scopes)?;
+        let concat_ty = left.ty;
+        let buffer_kind = match self.types[concat_ty.0 as usize] {
+            Type::Bytes => Some(BufferAppendKind::Bytes),
+            _ => None,
+        };
+        if let Some(kind) = buffer_kind {
+            let buffer_ty = self.intern(Type::Buffer);
+            let buffer = TypedExpr {
+                kind: TypedExprKind::BufferNew,
+                ty: buffer_ty,
+                span: node.span,
+            };
+            let buffer = TypedExpr {
+                kind: TypedExprKind::BufferAppend {
+                    buffer: Box::new(buffer),
+                    value: Box::new(left),
+                    kind,
+                },
+                ty: buffer_ty,
+                span: node.span,
+            };
+            let buffer = TypedExpr {
+                kind: TypedExprKind::BufferAppend {
+                    buffer: Box::new(buffer),
+                    value: Box::new(right),
+                    kind,
+                },
+                ty: buffer_ty,
+                span: node.span,
+            };
+            return Some(TypedExpr {
+                kind: TypedExprKind::BufferToBytes(Box::new(buffer)),
+                ty: concat_ty,
+                span: node.span,
+            });
+        }
+        Some(TypedExpr {
+            ty: concat_ty,
+            span: node.span,
+            kind: TypedExprKind::Concat {
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        })
+    }
+
     fn check_integer_unary(
         &mut self,
         node: &Node,
@@ -3226,7 +3429,11 @@ impl<'a> Checker<'a> {
         let supported = is_integer_type(&self.types[left.ty.0 as usize])
             || matches!(self.types[left.ty.0 as usize], Type::F32 | Type::F64)
             || matches!(self.types[left.ty.0 as usize], Type::Rune)
-            || (!ordered && self.type_satisfies(left.ty, "Eq", owner));
+            || if ordered {
+                self.type_satisfies(left.ty, "Ord", owner)
+            } else {
+                self.type_satisfies(left.ty, "Eq", owner)
+            };
         if !supported {
             self.diagnostics.push(Diagnostic::error(
                 "E2139",
@@ -4015,7 +4222,9 @@ impl<'a> Checker<'a> {
                 owner,
                 scopes,
             )?;
-            if !unify_types(&self.types, *parameter, argument.ty, &mut substitutions) {
+            if parameter_expected != argument.ty
+                && !unify_types(&self.types, *parameter, argument.ty, &mut substitutions)
+            {
                 let expected = self.apply_substitutions(*parameter, &substitutions);
                 self.type_mismatch(argument.span, expected, argument.ty);
                 return None;
@@ -4838,11 +5047,67 @@ impl<'a> Checker<'a> {
                     arguments,
                 })
             }
+            Type::Projection {
+                protocol,
+                associated,
+                argument,
+            } => {
+                let argument = self.apply_substitutions(argument, substitutions);
+                self.normalize_standard_projection(&protocol, &associated, argument)
+                    .or_else(|| {
+                        self.normalize_implementation_projection(&protocol, &associated, argument)
+                    })
+                    .unwrap_or_else(|| {
+                        self.intern(Type::Projection {
+                            protocol,
+                            associated,
+                            argument,
+                        })
+                    })
+            }
             _ => ty,
         }
     }
 
+    fn normalize_implementation_projection(
+        &self,
+        protocol: &str,
+        associated: &str,
+        argument: TypeId,
+    ) -> Option<TypeId> {
+        self.program
+            .implementations
+            .iter()
+            .find_map(|implementation| {
+                if implementation.protocol != protocol {
+                    return None;
+                }
+                let mut substitutions = BTreeMap::new();
+                if !implementation_target_matches(
+                    &self.types,
+                    argument,
+                    &implementation.target,
+                    &mut substitutions,
+                ) {
+                    return None;
+                }
+                let (_, projected) = implementation
+                    .associated_types
+                    .iter()
+                    .find(|(name, _)| name == associated)?;
+                resolved_type_id_for_conformance(
+                    &self.types,
+                    projected,
+                    &substitutions,
+                    &self.aliases,
+                )
+            })
+    }
+
     fn type_satisfies(&self, ty: TypeId, protocol: &str, owner: DeclId) -> bool {
+        if self.explicit_implementation_satisfies(ty, protocol, owner) {
+            return true;
+        }
         match &self.types[ty.0 as usize] {
             Type::Parameter { .. } => self.signatures.get(&owner).is_some_and(|signature| {
                 signature
@@ -4868,6 +5133,11 @@ impl<'a> Checker<'a> {
             | Type::U64
             | Type::Atom(_) => {
                 matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
+                    || protocol == "Concat"
+                        && matches!(
+                            self.types[ty.0 as usize],
+                            Type::String | Type::Bytes | Type::Bits
+                        )
             }
             Type::Buffer => false,
             Type::F32 | Type::F64 => false,
@@ -4903,8 +5173,133 @@ impl<'a> Checker<'a> {
                         .iter()
                         .all(|element| self.type_satisfies(*element, protocol, owner))
             }
-            Type::Struct { .. } | Type::Function { .. } | Type::Union(_) => false,
+            Type::Struct {
+                declaration,
+                arguments,
+            } => self.structs.get(declaration).is_some_and(|structure| {
+                structure.derives.contains(&protocol.to_owned())
+                    && matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
+                    && structure.fields.iter().all(|field| {
+                        let substitutions = structure
+                            .parameters
+                            .iter()
+                            .cloned()
+                            .zip(arguments.iter().copied())
+                            .collect::<BTreeMap<_, _>>();
+                        resolved_type_id_for_conformance(
+                            &self.types,
+                            &field.ty,
+                            &substitutions,
+                            &self.aliases,
+                        )
+                        .is_some_and(|field| self.type_satisfies(field, protocol, owner))
+                    })
+            }),
+            Type::Projection { .. } | Type::Function { .. } | Type::Union(_) => false,
         }
+    }
+
+    fn iterable_item_type(&mut self, ty: TypeId, owner: DeclId) -> Option<TypeId> {
+        match self.types[ty.0 as usize].clone() {
+            Type::List(item) | Type::Array { item, .. } | Type::Slice(item) => Some(item),
+            Type::Bytes => Some(self.intern(Type::U8)),
+            Type::Map { key, value } => Some(self.intern(Type::Tuple(vec![key, value]))),
+            Type::CodepointView => Some(self.intern(Type::Rune)),
+            Type::GraphemeView => Some(self.intern(Type::String)),
+            Type::Parameter { .. } if self.type_satisfies(ty, "Iterable", owner) => {
+                Some(self.intern(Type::Projection {
+                    protocol: "Iterable".to_owned(),
+                    associated: "Item".to_owned(),
+                    argument: ty,
+                }))
+            }
+            _ => {
+                let implementations = self.program.implementations.clone();
+                implementations.into_iter().find_map(|implementation| {
+                    if implementation.protocol != "Iterable" {
+                        return None;
+                    }
+                    let mut substitutions = BTreeMap::new();
+                    if !implementation_target_matches(
+                        &self.types,
+                        ty,
+                        &implementation.target,
+                        &mut substitutions,
+                    ) {
+                        return None;
+                    }
+                    let (_, item) = implementation
+                        .associated_types
+                        .iter()
+                        .find(|(name, _)| name == "Item")?;
+                    resolved_type_id_for_conformance(
+                        &self.types,
+                        item,
+                        &substitutions,
+                        &self.aliases,
+                    )
+                })
+            }
+        }
+    }
+
+    fn normalize_standard_projection(
+        &mut self,
+        protocol: &str,
+        associated: &str,
+        argument: TypeId,
+    ) -> Option<TypeId> {
+        if protocol != "Iterable" {
+            return None;
+        }
+        match associated {
+            "Item" => match self.types[argument.0 as usize].clone() {
+                Type::List(item) | Type::Slice(item) | Type::Array { item, .. } => Some(item),
+                Type::Bytes => Some(self.intern(Type::U8)),
+                Type::Map { key, value } => Some(self.intern(Type::Tuple(vec![key, value]))),
+                Type::CodepointView => Some(self.intern(Type::Rune)),
+                Type::GraphemeView => Some(self.intern(Type::String)),
+                _ => None,
+            },
+            "Cursor" => match self.types[argument.0 as usize].clone() {
+                Type::List(_) => Some(argument),
+                Type::Array { .. }
+                | Type::Slice(_)
+                | Type::Bytes
+                | Type::Map { .. }
+                | Type::CodepointView
+                | Type::GraphemeView => {
+                    let usize_ty = self.intern(Type::Usize);
+                    Some(self.intern(Type::Tuple(vec![argument, usize_ty])))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn explicit_implementation_satisfies(&self, ty: TypeId, protocol: &str, owner: DeclId) -> bool {
+        self.program.implementations.iter().any(|implementation| {
+            if implementation.protocol != protocol {
+                return false;
+            }
+            let mut substitutions = BTreeMap::new();
+            if !implementation_target_matches(
+                &self.types,
+                ty,
+                &implementation.target,
+                &mut substitutions,
+            ) {
+                return false;
+            }
+            implementation.constraints.iter().all(|constraint| {
+                substitutions
+                    .get(&constraint.parameter)
+                    .is_some_and(|argument| {
+                        self.type_satisfies(*argument, &constraint.protocol, owner)
+                    })
+            })
+        })
     }
 
     fn type_mismatch(&mut self, span: Span, expected: TypeId, actual: TypeId) {
@@ -4989,6 +5384,11 @@ impl<'a> Checker<'a> {
                 }
             }
             Type::Parameter { name, .. } => name.clone(),
+            Type::Projection {
+                protocol,
+                associated,
+                argument,
+            } => format!("{protocol}.{associated}({})", self.type_name(*argument)),
             Type::Union(members) => members
                 .iter()
                 .map(|member| self.type_name(*member))
@@ -5058,6 +5458,11 @@ impl<'a> Checker<'a> {
                     .join(",")
             ),
             Type::Parameter { owner, name } => format!("10:{}:{name}", owner.0),
+            Type::Projection {
+                protocol,
+                associated,
+                argument,
+            } => format!("11:{protocol}.{associated}({})", self.type_key(*argument)),
             Type::Union(members) => format!(
                 "20:{}",
                 members
@@ -5066,6 +5471,220 @@ impl<'a> Checker<'a> {
                     .collect::<Vec<_>>()
                     .join("|")
             ),
+        }
+    }
+}
+
+fn resolved_type_id_for_conformance(
+    types: &[Type],
+    syntax: &TypeSyntax,
+    substitutions: &BTreeMap<String, TypeId>,
+    aliases: &BTreeMap<DeclId, TypeAlias>,
+) -> Option<TypeId> {
+    let find = |expected: Type| {
+        types
+            .iter()
+            .position(|candidate| *candidate == expected)
+            .map(|index| TypeId(index as u32))
+    };
+    match syntax {
+        TypeSyntax::Primitive { name, .. } => types
+            .iter()
+            .position(|candidate| primitive_type_name(candidate) == Some(name.as_str()))
+            .map(|index| TypeId(index as u32)),
+        TypeSyntax::Variable { name, .. } => substitutions.get(name).copied(),
+        TypeSyntax::SelfType { .. } => None,
+        TypeSyntax::Projection {
+            protocol,
+            associated,
+            argument,
+            ..
+        } => find(Type::Projection {
+            protocol: protocol.clone(),
+            associated: associated.clone(),
+            argument: resolved_type_id_for_conformance(types, argument, substitutions, aliases)?,
+        }),
+        TypeSyntax::Named {
+            declaration,
+            arguments,
+            ..
+        } => {
+            if let Some(alias) = aliases.get(declaration) {
+                let resolved_arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        resolved_type_id_for_conformance(types, argument, substitutions, aliases)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let alias_substitutions = alias
+                    .parameters
+                    .iter()
+                    .cloned()
+                    .zip(resolved_arguments)
+                    .collect::<BTreeMap<_, _>>();
+                return resolved_type_id_for_conformance(
+                    types,
+                    &alias.value,
+                    &alias_substitutions,
+                    aliases,
+                );
+            }
+            let arguments = arguments
+                .iter()
+                .map(|argument| {
+                    resolved_type_id_for_conformance(types, argument, substitutions, aliases)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            find(Type::Struct {
+                declaration: *declaration,
+                arguments,
+            })
+        }
+        TypeSyntax::Atom { name, .. } => find(Type::Atom(name.clone())),
+        TypeSyntax::List { item, .. } => find(Type::List(resolved_type_id_for_conformance(
+            types,
+            item,
+            substitutions,
+            aliases,
+        )?)),
+        TypeSyntax::Array { item, length, .. } => find(Type::Array {
+            item: resolved_type_id_for_conformance(types, item, substitutions, aliases)?,
+            length: *length,
+        }),
+        TypeSyntax::Slice { item, .. } => find(Type::Slice(resolved_type_id_for_conformance(
+            types,
+            item,
+            substitutions,
+            aliases,
+        )?)),
+        TypeSyntax::Map { key, value, .. } => find(Type::Map {
+            key: resolved_type_id_for_conformance(types, key, substitutions, aliases)?,
+            value: resolved_type_id_for_conformance(types, value, substitutions, aliases)?,
+        }),
+        TypeSyntax::Tuple { elements, .. } => find(Type::Tuple(
+            elements
+                .iter()
+                .map(|element| {
+                    resolved_type_id_for_conformance(types, element, substitutions, aliases)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        TypeSyntax::Function {
+            parameters, result, ..
+        } => find(Type::Function {
+            parameters: parameters
+                .iter()
+                .map(|parameter| {
+                    resolved_type_id_for_conformance(types, parameter, substitutions, aliases)
+                })
+                .collect::<Option<Vec<_>>>()?,
+            result: resolved_type_id_for_conformance(types, result, substitutions, aliases)?,
+        }),
+        TypeSyntax::Union { members, .. } => {
+            let mut members = members
+                .iter()
+                .map(|member| {
+                    resolved_type_id_for_conformance(types, member, substitutions, aliases)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            members.sort_unstable();
+            members.dedup();
+            find(Type::Union(members))
+        }
+    }
+}
+
+fn primitive_type_name(ty: &Type) -> Option<&'static str> {
+    Some(match ty {
+        Type::I8 => "i8",
+        Type::I16 => "i16",
+        Type::I32 => "i32",
+        Type::I64 => "i64",
+        Type::Isize => "isize",
+        Type::Usize => "usize",
+        Type::Bool => "bool",
+        Type::Unit => "unit",
+        Type::String => "string",
+        Type::Bytes => "bytes",
+        Type::Bits => "bits",
+        Type::Buffer => "Buffer",
+        Type::Rune => "rune",
+        Type::Utf8Error => "String.Utf8Error",
+        Type::CodepointView => "String.CodepointView",
+        Type::GraphemeView => "String.GraphemeView",
+        Type::U8 => "u8",
+        Type::U16 => "u16",
+        Type::U32 => "u32",
+        Type::U64 => "u64",
+        Type::F32 => "f32",
+        Type::F64 => "f64",
+        Type::Atom(_)
+        | Type::List(_)
+        | Type::Array { .. }
+        | Type::Slice(_)
+        | Type::Map { .. }
+        | Type::Tuple(_)
+        | Type::Function { .. }
+        | Type::Struct { .. }
+        | Type::Parameter { .. }
+        | Type::Projection { .. }
+        | Type::Union(_) => return None,
+    })
+}
+
+fn implementation_target_matches(
+    types: &[Type],
+    ty: TypeId,
+    target: &TypeSyntax,
+    substitutions: &mut BTreeMap<String, TypeId>,
+) -> bool {
+    match target {
+        TypeSyntax::Variable { name, .. } => {
+            if let Some(existing) = substitutions.get(name) {
+                *existing == ty
+            } else {
+                substitutions.insert(name.clone(), ty);
+                true
+            }
+        }
+        TypeSyntax::Primitive { name, .. } => {
+            primitive_type_name(&types[ty.0 as usize]) == Some(name.as_str())
+        }
+        TypeSyntax::Named {
+            declaration,
+            arguments,
+            ..
+        } => {
+            matches!(&types[ty.0 as usize], Type::Struct { declaration: actual, arguments: actual_arguments }
+            if actual == declaration
+                && actual_arguments.len() == arguments.len()
+                && arguments.iter().zip(actual_arguments).all(|(target, actual)| implementation_target_matches(types, *actual, target, substitutions)))
+        }
+        TypeSyntax::Atom { name, .. } => {
+            matches!(&types[ty.0 as usize], Type::Atom(actual) if actual == name)
+        }
+        TypeSyntax::List { item, .. } => {
+            matches!(types[ty.0 as usize], Type::List(actual) if implementation_target_matches(types, actual, item, substitutions))
+        }
+        TypeSyntax::Array { item, length, .. } => {
+            matches!(types[ty.0 as usize], Type::Array { item: actual, length: actual_length } if actual_length == *length && implementation_target_matches(types, actual, item, substitutions))
+        }
+        TypeSyntax::Slice { item, .. } => {
+            matches!(types[ty.0 as usize], Type::Slice(actual) if implementation_target_matches(types, actual, item, substitutions))
+        }
+        TypeSyntax::Map { key, value, .. } => {
+            matches!(types[ty.0 as usize], Type::Map { key: actual_key, value: actual_value } if implementation_target_matches(types, actual_key, key, substitutions) && implementation_target_matches(types, actual_value, value, substitutions))
+        }
+        TypeSyntax::Tuple { elements, .. } => {
+            matches!(&types[ty.0 as usize], Type::Tuple(actual) if actual.len() == elements.len() && elements.iter().zip(actual).all(|(target, actual)| implementation_target_matches(types, *actual, target, substitutions)))
+        }
+        TypeSyntax::Function {
+            parameters, result, ..
+        } => {
+            matches!(&types[ty.0 as usize], Type::Function { parameters: actual, result: actual_result } if actual.len() == parameters.len() && parameters.iter().zip(actual).all(|(target, actual)| implementation_target_matches(types, *actual, target, substitutions)) && implementation_target_matches(types, *actual_result, result, substitutions))
+        }
+        TypeSyntax::SelfType { .. } | TypeSyntax::Projection { .. } | TypeSyntax::Union { .. } => {
+            false
         }
     }
 }
@@ -5271,7 +5890,8 @@ fn collect_type_variables(ty: &TypeSyntax, output: &mut Vec<String>) {
             }
             collect_type_variables(result, output);
         }
-        TypeSyntax::Primitive { .. } | TypeSyntax::Atom { .. } => {}
+        TypeSyntax::Projection { argument, .. } => collect_type_variables(argument, output),
+        TypeSyntax::SelfType { .. } | TypeSyntax::Primitive { .. } | TypeSyntax::Atom { .. } => {}
     }
 }
 
@@ -5904,6 +6524,50 @@ fn verify_item(
                 errors.push("while body has a non-unit type".to_owned());
             }
         }
+        TypedItem::For {
+            pattern,
+            iterable,
+            body,
+            ..
+        } => {
+            verify_expr(
+                iterable,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            let mut nested_symbols = symbols.clone();
+            verify_pattern(
+                pattern,
+                types,
+                type_count,
+                declarations,
+                &mut nested_symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !pattern.facts.irrefutable {
+                errors.push("for pattern is refutable".to_owned());
+            }
+            let mut nested_mutable = mutable_symbols.clone();
+            for item in &body.items {
+                verify_item(
+                    item,
+                    types,
+                    type_count,
+                    declarations,
+                    &mut nested_symbols,
+                    &mut nested_mutable,
+                    errors,
+                );
+            }
+            if body.ty != TypeId(3) {
+                errors.push("for body has a non-unit type".to_owned());
+            }
+        }
         TypedItem::DeferCall {
             function,
             arguments,
@@ -5990,6 +6654,7 @@ fn deferred_block_has_forbidden_item(block: &TypedBlock) -> bool {
         }) => arms
             .iter()
             .any(|arm| deferred_block_has_forbidden_item(&arm.body)),
+        TypedItem::For { body, .. } => deferred_block_has_forbidden_item(body),
         _ => false,
     })
 }
@@ -6013,6 +6678,10 @@ fn collect_block_locals(block: &TypedBlock, output: &mut BTreeSet<SymbolId>) {
                 condition, body, ..
             } => {
                 collect_expr_locals(condition, output);
+                collect_block_locals(body, output);
+            }
+            TypedItem::For { iterable, body, .. } => {
+                collect_expr_locals(iterable, output);
                 collect_block_locals(body, output);
             }
             TypedItem::DeferCall { arguments, .. } => {
@@ -6183,6 +6852,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         }
         TypedExprKind::Binary { left, right, .. }
         | TypedExprKind::IntegerBinary { left, right, .. }
+        | TypedExprKind::Concat { left, right }
         | TypedExprKind::Comparison { left, right, .. }
         | TypedExprKind::Logical { left, right, .. } => {
             collect_expr_locals(left, output);
@@ -7517,6 +8187,35 @@ fn verify_expr(
                 errors.push("numeric conversion has invalid types".to_owned());
             }
         }
+        TypedExprKind::Concat { left, right } => {
+            verify_expr(
+                left,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            verify_expr(
+                right,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if left.ty != right.ty
+                || left.ty != expression.ty
+                || !matches!(
+                    types.get(expression.ty.0 as usize),
+                    Some(Type::String | Type::Bytes | Type::Bits | Type::List(_))
+                )
+            {
+                errors.push("concat expression has invalid types".to_owned());
+            }
+        }
         TypedExprKind::WrappingInteger {
             operator,
             left,
@@ -7591,7 +8290,15 @@ fn verify_expr(
             );
             let supported = types.get(left.ty.0 as usize).is_some_and(|ty| {
                 is_integer_type(ty) || matches!(ty, Type::Rune | Type::F32 | Type::F64)
-            }) || (!ordered && standard_eq_type(types, left.ty));
+            }) || if ordered {
+                standard_ord_type(types, left.ty)
+            } else {
+                standard_eq_type(types, left.ty)
+                    || matches!(
+                        types.get(left.ty.0 as usize),
+                        Some(Type::Struct { .. } | Type::Parameter { .. })
+                    )
+            };
             if left.ty != right.ty || expression.ty != TypeId(2) || !supported {
                 errors.push("comparison has invalid operand or result types".to_owned());
             }
@@ -7867,6 +8574,35 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
         Some(Type::Map { key, value }) => {
             standard_hash_type(types, *key) && standard_eq_type(types, *value)
         }
+        _ => false,
+    }
+}
+
+fn standard_ord_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::Usize
+            | Type::Bool
+            | Type::Unit
+            | Type::String
+            | Type::Bytes
+            | Type::Bits
+            | Type::Rune
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Atom(_)
+            | Type::Struct { .. },
+        ) => true,
+        Some(Type::List(item) | Type::Slice(item)) => standard_ord_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_ord_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_ord_type(types, *item)),
         _ => false,
     }
 }
@@ -8176,6 +8912,11 @@ impl TypedProgram {
                 }
             }
             Type::Parameter { name, .. } => name.clone(),
+            Type::Projection {
+                protocol,
+                associated,
+                argument,
+            } => format!("{protocol}.{associated}({})", self.display_type(*argument)),
             Type::Union(members) => members
                 .iter()
                 .map(|member| self.display_type(*member))
@@ -8228,6 +8969,16 @@ fn write_items(program: &TypedProgram, output: &mut String, items: &[TypedItem],
             } => {
                 output.push_str(&format!("{indent}while\n"));
                 write_expr(program, output, condition, depth + 1);
+                write_items(program, output, &body.items, depth + 1);
+            }
+            TypedItem::For {
+                pattern,
+                iterable,
+                body,
+                ..
+            } => {
+                output.push_str(&format!("{indent}for {:?}\n", pattern.kind));
+                write_expr(program, output, iterable, depth + 1);
                 write_items(program, output, &body.items, depth + 1);
             }
             TypedItem::DeferCall {
@@ -8333,6 +9084,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::IntegerBinary { operator, .. } => format!("integer binary {operator:?}"),
         TypedExprKind::IntegerConvert(_) => "integer convert".to_owned(),
         TypedExprKind::NumericConvert(_) => "numeric convert".to_owned(),
+        TypedExprKind::Concat { .. } => "concat".to_owned(),
         TypedExprKind::WrappingInteger { operator, .. } => {
             format!("wrapping integer {operator:?}")
         }
@@ -8379,6 +9131,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         }
         TypedExprKind::Binary { left, right, .. }
         | TypedExprKind::IntegerBinary { left, right, .. }
+        | TypedExprKind::Concat { left, right }
         | TypedExprKind::Comparison { left, right, .. }
         | TypedExprKind::Logical { left, right, .. } => {
             write_expr(program, output, left, depth + 1);

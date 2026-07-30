@@ -132,6 +132,58 @@ fn collects_and_validates_complete_user_implementation_metadata() {
 }
 
 #[test]
+fn validates_derives_orphans_constraints_and_overlapping_generic_heads() {
+    let derived = resolve(&parsed(
+        "defmodule Main do\n  @derive [Eq, Ord, Show, Hash]\n  defstruct Box(a) do\n    value: a\n  end\nend\n",
+    ))
+    .expect("core derives resolve");
+    assert_eq!(derived.structs[0].derives, ["Eq", "Ord", "Show", "Hash"]);
+
+    let overlapping = parsed(
+        "defmodule Main do\n  defstruct Pair(a, b) do\n    left: a\n    right: b\n  end\n  defprotocol P do\n  end\n  defimpl P, for: Pair(a, a) do\n  end\n  defimpl P, for: Pair(i32, b) do\n  end\nend\n",
+    );
+    let diagnostics = resolve(&overlapping).expect_err("generic heads overlap at Pair(i32, i32)");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2016")
+    );
+
+    let disjoint = parsed(
+        "defmodule Main do\n  defstruct Pair(a, b) do\n    left: a\n    right: b\n  end\n  defprotocol P do\n  end\n  defimpl P, for: Pair(i32, i32) do\n  end\n  defimpl P, for: Pair(i32, i64) do\n  end\nend\n",
+    );
+    resolve(&disjoint).expect("different concrete heads are coherent");
+
+    let orphan = parsed(
+        "defmodule Main do\n  defimpl Eq, for: i32 do\n    def eq(left: i32, right: i32) -> bool do\n      true\n    end\n  end\nend\n",
+    );
+    let diagnostics = resolve(&orphan).expect_err("core primitive implementation is orphaned");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2032")
+    );
+}
+
+#[test]
+fn requires_exact_substituted_protocol_method_signatures() {
+    let source = "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  defprotocol Extract do\n    type Item\n    def extract(value: Self) -> Item\n  end\n  defimpl Extract, for: Box(a) do\n    type Item = a\n    def extract(value: Box(a)) -> a do\n      value.value\n    end\n  end\nend\n";
+    resolve(&parsed(source)).expect("Self and associated types substitute exactly");
+
+    let wrong = source.replace(
+        "def extract(value: Box(a)) -> a do",
+        "def extract(value: Box(a)) -> i64 do",
+    );
+    let diagnostics =
+        resolve(&parsed(&wrong)).expect_err("inexact substituted signature is rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2036")
+    );
+}
+
+#[test]
 fn resolves_cross_module_types_functions_and_visibility() {
     let library = parsed(
         "defmodule Library do\n  defstruct Box do\n    value: i64\n  end\n  def public(value: Box) -> Box do\n    value\n  end\n  defp hidden(value: Box) -> Box do\n    value\n  end\nend\n",

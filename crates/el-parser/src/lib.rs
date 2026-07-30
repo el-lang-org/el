@@ -493,6 +493,14 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
             value = Some(Value::Text("improper".to_owned()));
         }
     }
+    if rule == Rule::derived_struct {
+        let mut parts = children.into_iter();
+        let attribute = parts.next().expect("derived struct has an attribute");
+        let mut structure = parts.next().expect("derived struct has a declaration");
+        structure.children.insert(0, attribute);
+        structure.span = span;
+        return Ok(structure);
+    }
     if children.len() == 1 && is_transparent(rule) {
         return Ok(children.into_iter().next().expect("one transparent child"));
     }
@@ -558,7 +566,6 @@ fn is_parser_wrapper(rule: Rule) -> bool {
     matches!(
         rule,
         Rule::module_body
-            | Rule::derived_struct
             | Rule::field_body
             | Rule::function_head
             | Rule::parameters

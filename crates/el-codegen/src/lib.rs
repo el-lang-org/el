@@ -197,6 +197,7 @@ pub fn compute_primitive_layouts(module: &ConcreteModule, abi: PrimitiveAbi) -> 
             | Type::Tuple(_)
             | Type::Struct { .. }
             | Type::Parameter { .. }
+            | Type::Projection { .. }
             | Type::Union(_) => None,
         })
         .collect();

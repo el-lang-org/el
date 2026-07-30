@@ -9730,6 +9730,133 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ))?;
                 values.insert(*result, compared.into());
             }
+            Operation::Concat {
+                result,
+                left,
+                right,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, left, right, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "concat",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    if !matches!(self.core.types.get(ty.0 as usize), Some(Type::String)) {
+                        return Err(BackendError::UnsupportedOperation {
+                            function,
+                            block,
+                            operation: "concat",
+                        });
+                    }
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let left_value = struct_value(values, *left)?;
+                    let right_value = struct_value(values, *right)?;
+                    let left_data = built(builder.build_extract_value(
+                        left_value,
+                        0,
+                        &format!("v{}.left_data", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let left_length = built(builder.build_extract_value(
+                        left_value,
+                        1,
+                        &format!("v{}.left_length", result.0),
+                    ))?
+                    .into_int_value();
+                    let right_data = built(builder.build_extract_value(
+                        right_value,
+                        0,
+                        &format!("v{}.right_data", result.0),
+                    ))?
+                    .into_pointer_value();
+                    let right_length = built(builder.build_extract_value(
+                        right_value,
+                        1,
+                        &format!("v{}.right_length", result.0),
+                    ))?
+                    .into_int_value();
+                    let length = built(builder.build_int_add(
+                        left_length,
+                        right_length,
+                        &format!("v{}.length", result.0),
+                    ))?;
+                    let empty = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        length,
+                        length.get_type().const_zero(),
+                        &format!("v{}.empty", result.0),
+                    ))?;
+                    let allocation_size = built(builder.build_select(
+                        empty,
+                        length.get_type().const_int(1, false),
+                        length,
+                        &format!("v{}.allocation_size.nonzero", result.0),
+                    ))?
+                    .into_int_value();
+                    let allocation_size = if allocation_size.get_type() == self.context.i64_type() {
+                        allocation_size
+                    } else {
+                        built(builder.build_int_cast(
+                            allocation_size,
+                            self.context.i64_type(),
+                            &format!("v{}.allocation_size", result.0),
+                        ))?
+                    };
+                    let source = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.allocate_atomic,
+                            &[
+                                allocation_size.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source.start, false)
+                                    .into(),
+                                self.context.i64_type().const_int(source.end, false).into(),
+                            ],
+                            &format!("v{}.concat", result.0),
+                        ),
+                    )?;
+                    let data = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_pointer_value();
+                    built(builder.build_memcpy(data, 1, left_data, 1, left_length))?;
+                    let destination = self.element_pointer(
+                        builder,
+                        self.context.i8_type().into(),
+                        data,
+                        left_length,
+                        &format!("v{}.right_destination", result.0),
+                    )?;
+                    built(builder.build_memcpy(destination, 1, right_data, 1, right_length))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(output, data, 0, "string.data"))?;
+                    output = built(builder.build_insert_value(output, length, 1, "string.length"))?;
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
             Operation::UnionInject {
                 result,
                 member,
@@ -10812,6 +10939,7 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::IntegerBinary { result, ty, .. }
                     | Operation::IntegerConvert { result, ty, .. }
                     | Operation::WrappingInteger { result, ty, .. }
+                    | Operation::Concat { result, ty, .. }
                     | Operation::FunctionRef { result, ty, .. }
                     | Operation::Call { result, ty, .. }
                     | Operation::IndirectCall { result, ty, .. }
@@ -10955,6 +11083,19 @@ mod tests {
             llvm.as_str()
                 .contains("call void @__el_runtime_fail(i32 1, i32 0, i64")
         );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_protocol_backed_string_concat_with_root_preservation() {
+        let core = concrete(
+            "defmodule Main do\n  def main() -> i32 do\n    value = \"left\" ++ \"right\"\n    if String.byte_size(value) == 9 do\n      0\n    else\n      1\n    end\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("string concat lowers");
+        let text = llvm.as_str();
+        assert!(text.contains("concat"), "{text}");
+        assert!(text.contains("llvm.memcpy"), "{text}");
+        assert!(text.contains("__el_runtime_alloc_atomic"), "{text}");
     }
 
     #[test]

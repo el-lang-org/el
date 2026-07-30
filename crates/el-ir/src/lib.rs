@@ -70,6 +70,7 @@ pub struct CoreImplementation {
     pub target: TypeId,
     pub associated_types: Vec<(String, TypeId)>,
     pub methods: Vec<String>,
+    pub constraints: Vec<(TypeId, String)>,
     pub origin: Span,
 }
 
@@ -78,6 +79,7 @@ pub struct CoreStruct {
     pub declaration: DeclId,
     pub name: String,
     pub parameters: Vec<TypeId>,
+    pub derives: Vec<String>,
     pub fields: Vec<(String, TypeId)>,
     pub origin: Span,
 }
@@ -337,6 +339,7 @@ pub enum Operation {
         result: ValueId,
         value: ValueId,
         known_length: Option<u64>,
+        source_ty: TypeId,
         ty: TypeId,
         origin: Span,
     },
@@ -495,6 +498,13 @@ pub enum Operation {
         operator: WrappingIntegerOperator,
         left: ValueId,
         right: Option<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
+    Concat {
+        result: ValueId,
+        left: ValueId,
+        right: ValueId,
         ty: TypeId,
         origin: Span,
     },
@@ -703,6 +713,7 @@ pub fn lower(program: &TypedProgram) -> GenericModule {
                 declaration: structure.id,
                 name: structure.name.clone(),
                 parameters: structure.parameters.clone(),
+                derives: structure.derives.clone(),
                 fields: structure
                     .fields
                     .iter()
@@ -720,6 +731,7 @@ pub fn lower(program: &TypedProgram) -> GenericModule {
                 target: implementation.target,
                 associated_types: implementation.associated_types.clone(),
                 methods: implementation.methods.clone(),
+                constraints: implementation.constraints.clone(),
                 origin: implementation.span,
             })
             .collect(),
@@ -922,6 +934,27 @@ impl<'a> Lowerer<'a> {
                     span,
                 } => {
                     if !self.lower_while(condition, body, *span) {
+                        result = None;
+                        break;
+                    }
+                    result = None;
+                }
+                TypedItem::For {
+                    pattern,
+                    iterable,
+                    index_ty,
+                    option_ty,
+                    some_ty,
+                    body,
+                    span,
+                } => {
+                    if !self.lower_for(
+                        pattern,
+                        iterable,
+                        (*index_ty, *option_ty, *some_ty),
+                        body,
+                        *span,
+                    ) {
                         result = None;
                         break;
                     }
@@ -1463,6 +1496,7 @@ impl<'a> Lowerer<'a> {
                     result,
                     value: source,
                     known_length: *known_length,
+                    source_ty: value.ty,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -1740,6 +1774,28 @@ impl<'a> Lowerer<'a> {
                 self.operations.push(Operation::WrappingInteger {
                     result,
                     operator: *operator,
+                    left,
+                    right,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::Concat { left, right } => {
+                let left = self.lower_expr(left)?;
+                let right = self.lower_expr(right)?;
+                if let Some(Type::List(item)) = self.types.get(expression.ty.0 as usize) {
+                    return self.lower_list_concat(
+                        left,
+                        right,
+                        expression.ty,
+                        *item,
+                        expression.span,
+                    );
+                }
+                let result = self.value();
+                self.operations.push(Operation::Concat {
+                    result,
                     left,
                     right,
                     ty: expression.ty,
@@ -2042,6 +2098,26 @@ impl<'a> Lowerer<'a> {
                     }
                     result = None;
                 }
+                TypedItem::For {
+                    pattern,
+                    iterable,
+                    index_ty,
+                    option_ty,
+                    some_ty,
+                    body,
+                    span,
+                } => {
+                    if !self.lower_for(
+                        pattern,
+                        iterable,
+                        (*index_ty, *option_ty, *some_ty),
+                        body,
+                        *span,
+                    ) {
+                        return None;
+                    }
+                    result = None;
+                }
                 TypedItem::DeferCall {
                     function,
                     substitutions,
@@ -2265,6 +2341,153 @@ impl<'a> Lowerer<'a> {
         Some(result)
     }
 
+    fn lower_list_concat(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        list_ty: TypeId,
+        item_ty: TypeId,
+        origin: Span,
+    ) -> Option<ValueId> {
+        let empty = self.value();
+        self.operations.push(Operation::List {
+            result: empty,
+            elements: Vec::new(),
+            tail: None,
+            ty: list_ty,
+            origin,
+        });
+        let reverse_loop = self.new_block();
+        let reverse_body = self.new_block();
+        let reverse_done = self.new_block();
+        self.finish_current(Terminator::Branch {
+            target: reverse_loop,
+            arguments: vec![left, empty],
+            origin,
+        });
+
+        self.current_block = reverse_loop;
+        let remaining = self.value();
+        let reversed = self.value();
+        self.current_parameters = vec![
+            CoreParameter {
+                value: remaining,
+                ty: list_ty,
+                origin,
+            },
+            CoreParameter {
+                value: reversed,
+                ty: list_ty,
+                origin,
+            },
+        ];
+        self.finish_current(Terminator::Switch {
+            subject: remaining,
+            subject_ty: list_ty,
+            cases: vec![(SwitchValue::ListEmpty, reverse_done)],
+            default: Some(reverse_body),
+            origin,
+        });
+
+        self.current_block = reverse_body;
+        self.current_parameters.clear();
+        let head = self.value();
+        self.operations.push(Operation::ListHead {
+            result: head,
+            list: remaining,
+            ty: item_ty,
+            origin,
+        });
+        let tail = self.value();
+        self.operations.push(Operation::ListTail {
+            result: tail,
+            list: remaining,
+            ty: list_ty,
+            origin,
+        });
+        let next_reversed = self.value();
+        self.operations.push(Operation::List {
+            result: next_reversed,
+            elements: vec![head],
+            tail: Some(reversed),
+            ty: list_ty,
+            origin,
+        });
+        self.finish_current(Terminator::Branch {
+            target: reverse_loop,
+            arguments: vec![tail, next_reversed],
+            origin,
+        });
+
+        self.current_block = reverse_done;
+        self.current_parameters.clear();
+        let append_loop = self.new_block();
+        let append_body = self.new_block();
+        let append_done = self.new_block();
+        self.finish_current(Terminator::Branch {
+            target: append_loop,
+            arguments: vec![reversed, right],
+            origin,
+        });
+
+        self.current_block = append_loop;
+        let remaining = self.value();
+        let appended = self.value();
+        self.current_parameters = vec![
+            CoreParameter {
+                value: remaining,
+                ty: list_ty,
+                origin,
+            },
+            CoreParameter {
+                value: appended,
+                ty: list_ty,
+                origin,
+            },
+        ];
+        self.finish_current(Terminator::Switch {
+            subject: remaining,
+            subject_ty: list_ty,
+            cases: vec![(SwitchValue::ListEmpty, append_done)],
+            default: Some(append_body),
+            origin,
+        });
+
+        self.current_block = append_body;
+        self.current_parameters.clear();
+        let head = self.value();
+        self.operations.push(Operation::ListHead {
+            result: head,
+            list: remaining,
+            ty: item_ty,
+            origin,
+        });
+        let tail = self.value();
+        self.operations.push(Operation::ListTail {
+            result: tail,
+            list: remaining,
+            ty: list_ty,
+            origin,
+        });
+        let next_appended = self.value();
+        self.operations.push(Operation::List {
+            result: next_appended,
+            elements: vec![head],
+            tail: Some(appended),
+            ty: list_ty,
+            origin,
+        });
+        self.finish_current(Terminator::Branch {
+            target: append_loop,
+            arguments: vec![tail, next_appended],
+            origin,
+        });
+
+        self.current_block = append_done;
+        self.current_parameters.clear();
+        Some(appended)
+    }
+
     fn lower_while(
         &mut self,
         condition: &'a TypedExpr,
@@ -2302,6 +2525,147 @@ impl<'a> Lowerer<'a> {
                 target: condition_target,
                 arguments: Vec::new(),
                 origin: body.span,
+            });
+        }
+
+        self.current_block = exit_target;
+        self.current_parameters.clear();
+        self.bindings = outer_bindings;
+        true
+    }
+
+    fn lower_for(
+        &mut self,
+        pattern: &'a el_types::TypedPattern,
+        iterable: &'a TypedExpr,
+        types: (TypeId, TypeId, TypeId),
+        body: &'a el_types::TypedBlock,
+        origin: Span,
+    ) -> bool {
+        let (usize_ty, option_ty, some_ty) = types;
+        let Some(source) = self.lower_expr(iterable) else {
+            return false;
+        };
+        let known_length = match self.types.get(iterable.ty.0 as usize) {
+            Some(Type::Array { length, .. }) => Some(*length),
+            _ => None,
+        };
+        let length = self.value();
+        self.operations.push(Operation::CollectionLength {
+            result: length,
+            value: source,
+            known_length,
+            source_ty: iterable.ty,
+            ty: usize_ty,
+            origin,
+        });
+        let initial = self.constant(Constant::Integer(0), usize_ty, origin);
+        let condition_target = self.new_block();
+        let item_target = self.new_block();
+        let pattern_target = self.new_block();
+        let failure_target = self.new_block();
+        let exit_target = self.new_block();
+        self.finish_current(Terminator::Branch {
+            target: condition_target,
+            arguments: vec![initial],
+            origin,
+        });
+
+        let outer_bindings = self.bindings.clone();
+        self.current_block = condition_target;
+        let index = self.value();
+        self.current_parameters = vec![CoreParameter {
+            value: index,
+            ty: usize_ty,
+            origin,
+        }];
+        let condition = self.value();
+        self.operations.push(Operation::Compare {
+            result: condition,
+            operator: ComparisonOperator::Less,
+            left: index,
+            right: length,
+            operand_ty: usize_ty,
+            origin,
+        });
+        self.finish_current(Terminator::CondBranch {
+            condition,
+            then_target: item_target,
+            else_target: exit_target,
+            origin,
+        });
+
+        self.current_block = item_target;
+        self.current_parameters.clear();
+        let option = self.value();
+        self.operations.push(Operation::EnumAt {
+            result: option,
+            value: source,
+            index,
+            source_ty: iterable.ty,
+            ty: option_ty,
+            origin,
+        });
+        let some = self.value();
+        self.operations.push(Operation::UnionProject {
+            result: some,
+            member: some_ty,
+            value: option,
+            union_ty: option_ty,
+            ty: some_ty,
+            origin,
+        });
+        let item = self.value();
+        self.operations.push(Operation::TupleProject {
+            result: item,
+            tuple: some,
+            index: 1,
+            ty: pattern.ty,
+            origin,
+        });
+        let mut pattern_bindings = BTreeMap::new();
+        self.lower_pattern(
+            pattern,
+            item,
+            pattern_target,
+            failure_target,
+            &mut pattern_bindings,
+        );
+
+        self.current_block = pattern_target;
+        self.current_parameters = pattern_bindings
+            .values()
+            .map(|(_, ty)| CoreParameter {
+                value: self.value(),
+                ty: *ty,
+                origin: pattern.span,
+            })
+            .collect();
+        self.bindings = outer_bindings.clone();
+        for ((symbol, _), parameter) in pattern_bindings
+            .into_iter()
+            .zip(self.current_parameters.iter())
+        {
+            self.bindings
+                .insert(symbol, Binding::Value(parameter.value));
+        }
+        if self.lower_block_value(body).is_some() {
+            let one = self.constant(Constant::Integer(1), usize_ty, origin);
+            let next = self.value();
+            let failures = self.failure_targets(&[CoreFailureCategory::IntegerOverflow], origin);
+            self.operations.push(Operation::CheckedArithmetic {
+                result: next,
+                operator: ArithmeticOperator::Add,
+                left: index,
+                right: one,
+                failures,
+                ty: usize_ty,
+                origin,
+            });
+            self.finish_current(Terminator::Branch {
+                target: condition_target,
+                arguments: vec![next],
+                origin,
             });
         }
 
@@ -2777,6 +3141,7 @@ pub struct ConcreteStruct {
     pub declaration: DeclId,
     pub name: String,
     pub arguments: Vec<TypeId>,
+    pub derives: Vec<String>,
     pub fields: Vec<(String, TypeId)>,
     pub origin: Span,
 }
@@ -2823,6 +3188,7 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
         || matches!(
             operation,
             Operation::ListReverse { .. }
+                | Operation::Concat { .. }
                 | Operation::MapToList { .. }
                 | Operation::StringCodepoints { .. }
                 | Operation::Bitstring { .. }
@@ -3224,6 +3590,7 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::CheckedArithmetic { left, right, .. }
         | Operation::FloatArithmetic { left, right, .. }
         | Operation::IntegerBinary { left, right, .. }
+        | Operation::Concat { left, right, .. }
         | Operation::Compare { left, right, .. } => {
             live.values.insert(*left);
             live.values.insert(*right);
@@ -3303,6 +3670,7 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::IntegerBinary { result, .. }
         | Operation::IntegerConvert { result, .. }
         | Operation::WrappingInteger { result, .. }
+        | Operation::Concat { result, .. }
         | Operation::Compare { result, .. }
         | Operation::FunctionRef { result, .. }
         | Operation::Call { result, .. }
@@ -3373,7 +3741,7 @@ fn classify_managed_type(
                 visiting,
             )?
         }
-        Type::Parameter { .. } => return None,
+        Type::Parameter { .. } | Type::Projection { .. } => return None,
     };
     visiting.remove(&ty);
     Some(class)
@@ -3403,7 +3771,15 @@ pub enum MonomorphizationError {
         parameter: TypeId,
     },
     ConstrainedFunction(DeclId),
+    UnsatisfiedConstraint {
+        declaration: DeclId,
+        protocol: String,
+    },
     InvalidType(TypeId),
+    UnresolvedProjection {
+        protocol: String,
+        associated: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3582,12 +3958,16 @@ impl<'a> Monomorphizer<'a> {
                 continue;
             }
             let function = self.function_for_key(&key)?;
-            if !function.constraints.is_empty() {
-                return Err(MonomorphizationError::ConstrainedFunction(
-                    function.declaration,
-                ));
-            }
             let substitution = key.substitution.iter().cloned().collect::<BTreeMap<_, _>>();
+            for (parameter, protocol) in &function.constraints {
+                let concrete = self.normalize(*parameter, &substitution)?;
+                if !self.concrete_type_satisfies(&concrete, protocol, &mut BTreeSet::new())? {
+                    return Err(MonomorphizationError::UnsatisfiedConstraint {
+                        declaration: function.declaration,
+                        protocol: protocol.clone(),
+                    });
+                }
+            }
             self.discover_function_layouts(function, &substitution)?;
             for block in &function.blocks {
                 for operation in &block.operations {
@@ -3822,8 +4202,223 @@ impl<'a> Monomorphizer<'a> {
                     parameter: ty,
                 });
             }
+            Type::Projection {
+                protocol,
+                associated,
+                argument,
+            } => {
+                let argument = self.normalize(*argument, substitution)?;
+                if let Some(projected) =
+                    normalize_standard_projection(protocol, associated, argument.clone())
+                {
+                    projected
+                } else {
+                    self.normalize_implementation_projection(protocol, associated, &argument)?
+                        .ok_or_else(|| MonomorphizationError::UnresolvedProjection {
+                            protocol: protocol.clone(),
+                            associated: associated.clone(),
+                        })?
+                }
+            }
         };
         Ok(normalized)
+    }
+
+    fn normalize_implementation_projection(
+        &self,
+        protocol: &str,
+        associated: &str,
+        argument: &NormalizedType,
+    ) -> Result<Option<NormalizedType>, MonomorphizationError> {
+        for implementation in &self.module.implementations {
+            if implementation.protocol != protocol {
+                continue;
+            }
+            let mut substitution = BTreeMap::new();
+            if !self.match_implementation_target(
+                implementation.target,
+                argument,
+                &mut substitution,
+            )? {
+                continue;
+            }
+            let constraints_hold = implementation.constraints.iter().try_fold(
+                true,
+                |holds, (parameter, required)| {
+                    let concrete = self.normalize(*parameter, &substitution)?;
+                    Ok::<_, MonomorphizationError>(
+                        holds
+                            && self.concrete_type_satisfies(
+                                &concrete,
+                                required,
+                                &mut BTreeSet::new(),
+                            )?,
+                    )
+                },
+            )?;
+            if !constraints_hold {
+                continue;
+            }
+            if let Some((_, ty)) = implementation
+                .associated_types
+                .iter()
+                .find(|(name, _)| name == associated)
+            {
+                return self.normalize(*ty, &substitution).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    fn concrete_type_satisfies(
+        &self,
+        ty: &NormalizedType,
+        protocol: &str,
+        visiting: &mut BTreeSet<(NormalizedType, String)>,
+    ) -> Result<bool, MonomorphizationError> {
+        if normalized_type_satisfies(ty, protocol) {
+            return Ok(true);
+        }
+        let key = (ty.clone(), protocol.to_owned());
+        if !visiting.insert(key.clone()) {
+            return Ok(true);
+        }
+
+        let mut satisfied = false;
+        if let NormalizedType::Struct {
+            declaration,
+            arguments,
+        } = ty
+            && let Some(structure) = self
+                .module
+                .structs
+                .iter()
+                .find(|structure| structure.declaration == *declaration)
+            && structure.derives.iter().any(|derived| derived == protocol)
+        {
+            let substitution = structure
+                .parameters
+                .iter()
+                .copied()
+                .zip(arguments.iter().cloned())
+                .collect::<BTreeMap<_, _>>();
+            satisfied = true;
+            for (_, field) in &structure.fields {
+                let field = self.normalize(*field, &substitution)?;
+                if !self.concrete_type_satisfies(&field, protocol, visiting)? {
+                    satisfied = false;
+                    break;
+                }
+            }
+        }
+
+        if !satisfied {
+            for implementation in &self.module.implementations {
+                if implementation.protocol != protocol {
+                    continue;
+                }
+                let mut substitution = BTreeMap::new();
+                if !self.match_implementation_target(
+                    implementation.target,
+                    ty,
+                    &mut substitution,
+                )? {
+                    continue;
+                }
+                let mut constraints_hold = true;
+                for (parameter, required) in &implementation.constraints {
+                    let concrete = self.normalize(*parameter, &substitution)?;
+                    if !self.concrete_type_satisfies(&concrete, required, visiting)? {
+                        constraints_hold = false;
+                        break;
+                    }
+                }
+                if constraints_hold {
+                    satisfied = true;
+                    break;
+                }
+            }
+        }
+        visiting.remove(&key);
+        Ok(satisfied)
+    }
+
+    fn match_implementation_target(
+        &self,
+        target: TypeId,
+        concrete: &NormalizedType,
+        substitution: &mut BTreeMap<TypeId, NormalizedType>,
+    ) -> Result<bool, MonomorphizationError> {
+        let target_ty = self
+            .module
+            .types
+            .get(target.0 as usize)
+            .ok_or(MonomorphizationError::InvalidType(target))?;
+        if matches!(target_ty, Type::Parameter { .. }) {
+            return Ok(match substitution.get(&target) {
+                Some(bound) => bound == concrete,
+                None => {
+                    substitution.insert(target, concrete.clone());
+                    true
+                }
+            });
+        }
+        match (target_ty, concrete) {
+            (Type::List(item), NormalizedType::List(actual))
+            | (Type::Slice(item), NormalizedType::Slice(actual)) => {
+                self.match_implementation_target(*item, actual, substitution)
+            }
+            (
+                Type::Array { item, length },
+                NormalizedType::Array {
+                    item: actual,
+                    length: actual_length,
+                },
+            ) if length == actual_length => {
+                self.match_implementation_target(*item, actual, substitution)
+            }
+            (
+                Type::Map { key, value },
+                NormalizedType::Map {
+                    key: actual_key,
+                    value: actual_value,
+                },
+            ) => Ok(
+                self.match_implementation_target(*key, actual_key, substitution)?
+                    && self.match_implementation_target(*value, actual_value, substitution)?,
+            ),
+            (Type::Tuple(elements), NormalizedType::Tuple(actual))
+            | (Type::Union(elements), NormalizedType::Union(actual))
+                if elements.len() == actual.len() =>
+            {
+                for (element, actual) in elements.iter().zip(actual) {
+                    if !self.match_implementation_target(*element, actual, substitution)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (
+                Type::Struct {
+                    declaration,
+                    arguments,
+                },
+                NormalizedType::Struct {
+                    declaration: actual_declaration,
+                    arguments: actual_arguments,
+                },
+            ) if declaration == actual_declaration && arguments.len() == actual_arguments.len() => {
+                for (argument, actual) in arguments.iter().zip(actual_arguments) {
+                    if !self.match_implementation_target(*argument, actual, substitution)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(self
+                .normalize(target, substitution)
+                .is_ok_and(|ty| ty == *concrete)),
+        }
     }
 
     fn specialize_function(
@@ -3931,7 +4526,6 @@ impl<'a> Monomorphizer<'a> {
             | Operation::BytesFromList { ty, .. }
             | Operation::BytesToList { ty, .. }
             | Operation::BytesSlice { ty, .. }
-            | Operation::CollectionLength { ty, .. }
             | Operation::Map { ty, .. }
             | Operation::MapPut { ty, .. }
             | Operation::MapRemove { ty, .. }
@@ -3947,8 +4541,21 @@ impl<'a> Monomorphizer<'a> {
             | Operation::IntegerUnary { ty, .. }
             | Operation::IntegerBinary { ty, .. }
             | Operation::WrappingInteger { ty, .. }
+            | Operation::Concat { ty, .. }
             | Operation::Load { ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
+            }
+            Operation::CollectionLength {
+                source_ty,
+                known_length,
+                ty,
+                ..
+            } => {
+                *source_ty = self.materialize_type(*source_ty, substitution)?;
+                *ty = self.materialize_type(*ty, substitution)?;
+                if let Some(Type::Array { length, .. }) = self.types.get(source_ty.0 as usize) {
+                    *known_length = Some(*length);
+                }
             }
             Operation::EnumAt { source_ty, ty, .. }
             | Operation::EnumToList { source_ty, ty, .. } => {
@@ -4154,6 +4761,7 @@ impl<'a> Monomorphizer<'a> {
                 .iter()
                 .map(|argument| self.intern_normalized(argument))
                 .collect(),
+            derives: source.derives.clone(),
             fields: source
                 .fields
                 .iter()
@@ -4161,6 +4769,103 @@ impl<'a> Monomorphizer<'a> {
                 .collect::<Result<_, MonomorphizationError>>()?,
             origin: source.origin,
         })
+    }
+}
+
+fn normalize_standard_projection(
+    protocol: &str,
+    associated: &str,
+    argument: NormalizedType,
+) -> Option<NormalizedType> {
+    if protocol != "Iterable" {
+        return None;
+    }
+    match associated {
+        "Item" => match argument {
+            NormalizedType::List(item)
+            | NormalizedType::Slice(item)
+            | NormalizedType::Array { item, .. } => Some(*item),
+            NormalizedType::Bytes => Some(NormalizedType::U8),
+            NormalizedType::Map { key, value } => Some(NormalizedType::Tuple(vec![*key, *value])),
+            NormalizedType::CodepointView => Some(NormalizedType::Rune),
+            NormalizedType::GraphemeView => Some(NormalizedType::String),
+            _ => None,
+        },
+        "Cursor" => match argument {
+            NormalizedType::List(_) => Some(argument),
+            NormalizedType::Array { .. }
+            | NormalizedType::Slice(_)
+            | NormalizedType::Bytes
+            | NormalizedType::Map { .. }
+            | NormalizedType::CodepointView
+            | NormalizedType::GraphemeView => {
+                Some(NormalizedType::Tuple(vec![argument, NormalizedType::Usize]))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn normalized_type_satisfies(ty: &NormalizedType, protocol: &str) -> bool {
+    match ty {
+        NormalizedType::I8
+        | NormalizedType::I16
+        | NormalizedType::I32
+        | NormalizedType::I64
+        | NormalizedType::Isize
+        | NormalizedType::Usize
+        | NormalizedType::Bool
+        | NormalizedType::Unit
+        | NormalizedType::String
+        | NormalizedType::Bytes
+        | NormalizedType::Bits
+        | NormalizedType::Rune
+        | NormalizedType::U8
+        | NormalizedType::U16
+        | NormalizedType::U32
+        | NormalizedType::U64
+        | NormalizedType::Atom(_) => {
+            matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
+                || protocol == "Concat"
+                    && matches!(
+                        ty,
+                        NormalizedType::String | NormalizedType::Bytes | NormalizedType::Bits
+                    )
+        }
+        NormalizedType::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
+        NormalizedType::CodepointView | NormalizedType::GraphemeView => protocol == "Iterable",
+        NormalizedType::List(item) => match protocol {
+            "Iterable" | "Concat" => true,
+            "Eq" | "Ord" | "Show" | "Hash" => normalized_type_satisfies(item, protocol),
+            _ => false,
+        },
+        NormalizedType::Array { item, .. } | NormalizedType::Slice(item) => match protocol {
+            "Iterable" => true,
+            "Eq" | "Ord" | "Show" | "Hash" => normalized_type_satisfies(item, protocol),
+            _ => false,
+        },
+        NormalizedType::Map { key, value } => match protocol {
+            "Iterable" => true,
+            "Eq" | "Show" => {
+                normalized_type_satisfies(key, "Eq")
+                    && normalized_type_satisfies(key, "Hash")
+                    && normalized_type_satisfies(value, protocol)
+            }
+            _ => false,
+        },
+        NormalizedType::Tuple(elements) => {
+            matches!(protocol, "Eq" | "Ord" | "Show" | "Hash")
+                && elements
+                    .iter()
+                    .all(|element| normalized_type_satisfies(element, protocol))
+        }
+        NormalizedType::Buffer
+        | NormalizedType::F32
+        | NormalizedType::F64
+        | NormalizedType::Function { .. }
+        | NormalizedType::Struct { .. }
+        | NormalizedType::Union(_) => false,
     }
 }
 
@@ -4253,7 +4958,6 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::BytesFromList { ty, .. }
         | Operation::BytesToList { ty, .. }
         | Operation::BytesSlice { ty, .. }
-        | Operation::CollectionLength { ty, .. }
         | Operation::Map { ty, .. }
         | Operation::MapPut { ty, .. }
         | Operation::MapRemove { ty, .. }
@@ -4269,9 +4973,14 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::IntegerUnary { ty, .. }
         | Operation::IntegerBinary { ty, .. }
         | Operation::WrappingInteger { ty, .. }
+        | Operation::Concat { ty, .. }
         | Operation::FunctionRef { ty, .. }
         | Operation::Call { ty, .. }
         | Operation::Load { ty, .. } => output.push(*ty),
+        Operation::CollectionLength { source_ty, ty, .. } => {
+            output.push(*source_ty);
+            output.push(*ty);
+        }
         Operation::EnumAt { source_ty, ty, .. } | Operation::EnumToList { source_ty, ty, .. } => {
             output.push(*source_ty);
             output.push(*ty);
@@ -4624,6 +5333,7 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
                 declaration: structure.declaration,
                 name: structure.name.clone(),
                 parameters: Vec::new(),
+                derives: structure.derives.clone(),
                 fields: structure.fields.clone(),
                 origin: structure.origin,
             })
@@ -4703,6 +5413,7 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::IntegerBinary { result, ty, .. }
                     | Operation::IntegerConvert { result, ty, .. }
                     | Operation::WrappingInteger { result, ty, .. }
+                    | Operation::Concat { result, ty, .. }
                     | Operation::FunctionRef { result, ty, .. }
                     | Operation::Call { result, ty, .. }
                     | Operation::IndirectCall { result, ty, .. }
@@ -4915,9 +5626,11 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
         let mut initialized_by_block = BTreeMap::from([(BlockId(0), BTreeSet::new())]);
         let operation_context = OperationVerifyContext {
             types: &module.types,
+            implementations: &module.implementations,
             signatures: &signatures,
             structs: &structs_by_decl,
             slots: &slots,
+            constraints: &function.constraints,
         };
         let mut ordered = function.blocks.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|block| block.id);
@@ -5218,9 +5931,11 @@ fn case_key(value: &SwitchValue) -> String {
 
 struct OperationVerifyContext<'a> {
     types: &'a [Type],
+    implementations: &'a [CoreImplementation],
     signatures: &'a BTreeMap<FunctionId, (Vec<TypeId>, TypeId)>,
     structs: &'a BTreeMap<DeclId, &'a CoreStruct>,
     slots: &'a BTreeMap<SlotId, TypeId>,
+    constraints: &'a [(TypeId, String)],
 }
 
 fn verify_operation(
@@ -5232,9 +5947,11 @@ fn verify_operation(
 ) {
     let OperationVerifyContext {
         types,
+        implementations,
         signatures,
         structs,
         slots,
+        constraints,
     } = context;
     let type_count = types.len() as u32;
     let define = |id: ValueId,
@@ -5909,10 +6626,11 @@ fn verify_operation(
             result,
             value,
             known_length,
+            source_ty,
             ty,
             ..
         } => {
-            let source = values.get(value).and_then(|ty| types.get(ty.0 as usize));
+            let source = types.get(source_ty.0 as usize);
             let valid_source = match (source, known_length) {
                 (Some(Type::Array { length, .. }), Some(known)) => length == known,
                 (
@@ -5929,9 +6647,17 @@ fn verify_operation(
                     ),
                     None,
                 ) => true,
+                (Some(Type::Parameter { .. }), None) => values.get(value).is_some_and(|source| {
+                    constraints
+                        .iter()
+                        .any(|(parameter, required)| parameter == source && required == "Iterable")
+                }),
                 _ => false,
             };
-            if !valid_source || !matches!(types.get(ty.0 as usize), Some(Type::Usize)) {
+            if values.get(value) != Some(source_ty)
+                || !valid_source
+                || !matches!(types.get(ty.0 as usize), Some(Type::Usize))
+            {
                 errors.push(format!("collection length {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
@@ -5949,8 +6675,9 @@ fn verify_operation(
                 && values.get(index).is_some_and(|index_ty| {
                     matches!(types.get(index_ty.0 as usize), Some(Type::Usize))
                 })
-                && payload
-                    .is_some_and(|item| standard_iterable_item_matches(types, *source_ty, item));
+                && payload.is_some_and(|item| {
+                    standard_iterable_item_matches(types, constraints, *source_ty, item)
+                });
             if !valid {
                 errors.push(format!("Enum.at {result:?} has invalid types"));
             }
@@ -5977,7 +6704,7 @@ fn verify_operation(
                                 | Type::CodepointView
                                 | Type::GraphemeView
                         )
-                    ) && standard_iterable_item_matches(types, *source_ty, item)
+                    ) && standard_iterable_item_matches(types, constraints, *source_ty, item)
                 });
             if !valid {
                 errors.push(format!("Enum.to_list {result:?} has invalid types"));
@@ -6303,6 +7030,21 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::Concat {
+            result,
+            left,
+            right,
+            ty,
+            ..
+        } => {
+            if values.get(left) != Some(ty)
+                || values.get(right) != Some(ty)
+                || !type_supports_protocol(types, structs, constraints, *ty, "Concat")
+            {
+                errors.push(format!("concat result {result:?} has invalid operands"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Compare {
             result,
             operator,
@@ -6315,9 +7057,13 @@ fn verify_operation(
                 operator,
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
-            let supported = types.get(operand_ty.0 as usize).is_some_and(|ty| {
-                is_integer_type(ty) || matches!(ty, Type::Rune | Type::F32 | Type::F64)
-            }) || (!ordered && standard_eq_type(types, *operand_ty));
+            let protocol = if ordered { "Ord" } else { "Eq" };
+            let supported =
+                type_supports_protocol(types, structs, constraints, *operand_ty, protocol)
+                    || matches!(
+                        types.get(operand_ty.0 as usize),
+                        Some(Type::F32 | Type::F64)
+                    );
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
                 || !supported
@@ -6347,9 +7093,21 @@ fn verify_operation(
                             .iter()
                             .zip(actual_parameters)
                             .all(|(declared, actual)| {
-                                type_matches_substitution(types, *declared, *actual, &substitutions)
+                                type_matches_substitution(
+                                    types,
+                                    implementations,
+                                    *declared,
+                                    *actual,
+                                    &substitutions,
+                                )
                             })
-                        && type_matches_substitution(types, *result, *actual_result, &substitutions)
+                        && type_matches_substitution(
+                            types,
+                            implementations,
+                            *result,
+                            *actual_result,
+                            &substitutions,
+                        )
                 }
                 _ => false,
             };
@@ -6378,13 +7136,20 @@ fn verify_operation(
                                 values.get(argument).is_some_and(|actual| {
                                     type_matches_substitution(
                                         types,
+                                        implementations,
                                         *declared,
                                         *actual,
                                         &substitutions,
                                     )
                                 })
                             })
-                        && type_matches_substitution(types, *result_ty, *ty, &substitutions)
+                        && type_matches_substitution(
+                            types,
+                            implementations,
+                            *result_ty,
+                            *ty,
+                            &substitutions,
+                        )
                 });
             if !exact {
                 errors.push(format!(
@@ -6489,6 +7254,7 @@ fn verify_operation(
 
 fn type_matches_substitution(
     types: &[Type],
+    implementations: &[CoreImplementation],
     declared: TypeId,
     actual: TypeId,
     substitutions: &BTreeMap<TypeId, TypeId>,
@@ -6499,10 +7265,72 @@ fn type_matches_substitution(
     if declared == actual {
         return true;
     }
+    if let Some(Type::Projection {
+        protocol,
+        associated,
+        argument,
+    }) = types.get(declared.0 as usize)
+    {
+        let argument = substitutions.get(argument).copied().unwrap_or(*argument);
+        for implementation in implementations {
+            if implementation.protocol != *protocol {
+                continue;
+            }
+            let mut implementation_substitutions = BTreeMap::new();
+            if match_core_implementation_target(
+                types,
+                implementation.target,
+                argument,
+                &mut implementation_substitutions,
+            ) && implementation
+                .associated_types
+                .iter()
+                .any(|(name, projected)| {
+                    name == associated
+                        && type_matches_substitution(
+                            types,
+                            implementations,
+                            *projected,
+                            actual,
+                            &implementation_substitutions,
+                        )
+                })
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(Type::Projection {
+        protocol,
+        associated,
+        argument,
+    }) = types.get(declared.0 as usize)
+        && protocol == "Iterable"
+    {
+        let argument = substitutions.get(argument).copied().unwrap_or(*argument);
+        return match (associated.as_str(), types.get(argument.0 as usize)) {
+            ("Item", Some(Type::List(item) | Type::Slice(item) | Type::Array { item, .. })) => {
+                *item == actual
+            }
+            ("Item", Some(Type::Bytes)) => matches!(types.get(actual.0 as usize), Some(Type::U8)),
+            ("Item", Some(Type::Map { key, value })) => matches!(
+                types.get(actual.0 as usize),
+                Some(Type::Tuple(items)) if items.as_slice() == [*key, *value]
+            ),
+            ("Item", Some(Type::CodepointView)) => {
+                matches!(types.get(actual.0 as usize), Some(Type::Rune))
+            }
+            ("Item", Some(Type::GraphemeView)) => {
+                matches!(types.get(actual.0 as usize), Some(Type::String))
+            }
+            ("Cursor", Some(Type::List(_))) => argument == actual,
+            _ => false,
+        };
+    }
     match (types.get(declared.0 as usize), types.get(actual.0 as usize)) {
         (Some(Type::List(left)), Some(Type::List(right)))
         | (Some(Type::Slice(left)), Some(Type::Slice(right))) => {
-            type_matches_substitution(types, *left, *right, substitutions)
+            type_matches_substitution(types, implementations, *left, *right, substitutions)
         }
         (
             Some(Type::Array { item: left, length }),
@@ -6512,7 +7340,7 @@ fn type_matches_substitution(
             }),
         ) => {
             length == actual_length
-                && type_matches_substitution(types, *left, *right, substitutions)
+                && type_matches_substitution(types, implementations, *left, *right, substitutions)
         }
         (
             Some(Type::Map {
@@ -6524,14 +7352,20 @@ fn type_matches_substitution(
                 value: right_value,
             }),
         ) => {
-            type_matches_substitution(types, *left_key, *right_key, substitutions)
-                && type_matches_substitution(types, *left_value, *right_value, substitutions)
+            type_matches_substitution(types, implementations, *left_key, *right_key, substitutions)
+                && type_matches_substitution(
+                    types,
+                    implementations,
+                    *left_value,
+                    *right_value,
+                    substitutions,
+                )
         }
         (Some(Type::Tuple(left)), Some(Type::Tuple(right)))
         | (Some(Type::Union(left)), Some(Type::Union(right))) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    type_matches_substitution(types, *left, *right, substitutions)
+                    type_matches_substitution(types, implementations, *left, *right, substitutions)
                 })
         }
         (
@@ -6546,9 +7380,15 @@ fn type_matches_substitution(
         ) => {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
-                    type_matches_substitution(types, *left, *right, substitutions)
+                    type_matches_substitution(types, implementations, *left, *right, substitutions)
                 })
-                && type_matches_substitution(types, *left_result, *right_result, substitutions)
+                && type_matches_substitution(
+                    types,
+                    implementations,
+                    *left_result,
+                    *right_result,
+                    substitutions,
+                )
         }
         (
             Some(Type::Struct {
@@ -6566,10 +7406,69 @@ fn type_matches_substitution(
                     .iter()
                     .zip(right_arguments)
                     .all(|(left, right)| {
-                        type_matches_substitution(types, *left, *right, substitutions)
+                        type_matches_substitution(
+                            types,
+                            implementations,
+                            *left,
+                            *right,
+                            substitutions,
+                        )
                     })
         }
         _ => false,
+    }
+}
+
+fn match_core_implementation_target(
+    types: &[Type],
+    target: TypeId,
+    actual: TypeId,
+    substitutions: &mut BTreeMap<TypeId, TypeId>,
+) -> bool {
+    if matches!(types.get(target.0 as usize), Some(Type::Parameter { .. })) {
+        return match substitutions.get(&target) {
+            Some(bound) => *bound == actual,
+            None => {
+                substitutions.insert(target, actual);
+                true
+            }
+        };
+    }
+    match (types.get(target.0 as usize), types.get(actual.0 as usize)) {
+        (Some(Type::List(left)), Some(Type::List(right)))
+        | (Some(Type::Slice(left)), Some(Type::Slice(right))) => {
+            match_core_implementation_target(types, *left, *right, substitutions)
+        }
+        (
+            Some(Type::Array { item: left, length }),
+            Some(Type::Array {
+                item: right,
+                length: actual_length,
+            }),
+        ) => {
+            length == actual_length
+                && match_core_implementation_target(types, *left, *right, substitutions)
+        }
+        (
+            Some(Type::Struct {
+                declaration: left,
+                arguments: left_arguments,
+            }),
+            Some(Type::Struct {
+                declaration: right,
+                arguments: right_arguments,
+            }),
+        ) => {
+            left == right
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| {
+                        match_core_implementation_target(types, *left, *right, substitutions)
+                    })
+        }
+        _ => target == actual,
     }
 }
 
@@ -6592,7 +7491,23 @@ fn option_payload_type(types: &[Type], ty: TypeId) -> Option<TypeId> {
     has_none.then_some(payload).flatten()
 }
 
-fn standard_iterable_item_matches(types: &[Type], source: TypeId, item: TypeId) -> bool {
+fn standard_iterable_item_matches(
+    types: &[Type],
+    constraints: &[(TypeId, String)],
+    source: TypeId,
+    item: TypeId,
+) -> bool {
+    if constraints
+        .iter()
+        .any(|(parameter, required)| *parameter == source && required == "Iterable")
+        && matches!(
+            types.get(item.0 as usize),
+            Some(Type::Projection { protocol, associated, argument })
+                if protocol == "Iterable" && associated == "Item" && *argument == source
+        )
+    {
+        return true;
+    }
     match types.get(source.0 as usize) {
         Some(Type::List(expected) | Type::Array { item: expected, .. } | Type::Slice(expected)) => {
             *expected == item
@@ -6660,6 +7575,82 @@ fn standard_eq_type(types: &[Type], ty: TypeId) -> bool {
         Some(Type::Map { key, value }) => {
             standard_hash_type(types, *key) && standard_eq_type(types, *value)
         }
+        _ => false,
+    }
+}
+
+fn type_supports_protocol(
+    types: &[Type],
+    structs: &BTreeMap<DeclId, &CoreStruct>,
+    constraints: &[(TypeId, String)],
+    ty: TypeId,
+    protocol: &str,
+) -> bool {
+    if constraints
+        .iter()
+        .any(|(parameter, required)| *parameter == ty && required == protocol)
+    {
+        return true;
+    }
+    match protocol {
+        "Eq" => {
+            standard_eq_type(types, ty)
+                || derived_struct_supports(types, structs, constraints, ty, protocol)
+        }
+        "Ord" => {
+            standard_ord_type(types, ty)
+                || derived_struct_supports(types, structs, constraints, ty, protocol)
+        }
+        "Concat" => matches!(
+            types.get(ty.0 as usize),
+            Some(Type::String | Type::Bytes | Type::Bits | Type::List(_))
+        ),
+        _ => false,
+    }
+}
+
+fn derived_struct_supports(
+    types: &[Type],
+    structs: &BTreeMap<DeclId, &CoreStruct>,
+    constraints: &[(TypeId, String)],
+    ty: TypeId,
+    protocol: &str,
+) -> bool {
+    let Some(Type::Struct { declaration, .. }) = types.get(ty.0 as usize) else {
+        return false;
+    };
+    structs.get(declaration).is_some_and(|structure| {
+        structure.derives.iter().any(|derived| derived == protocol)
+            && structure.fields.iter().all(|(_, field)| {
+                type_supports_protocol(types, structs, constraints, *field, protocol)
+            })
+    })
+}
+
+fn standard_ord_type(types: &[Type], ty: TypeId) -> bool {
+    match types.get(ty.0 as usize) {
+        Some(
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::Isize
+            | Type::Usize
+            | Type::Bool
+            | Type::Unit
+            | Type::String
+            | Type::Bytes
+            | Type::Bits
+            | Type::Rune
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Atom(_),
+        ) => true,
+        Some(Type::List(item) | Type::Slice(item)) => standard_ord_type(types, *item),
+        Some(Type::Array { item, .. }) => standard_ord_type(types, *item),
+        Some(Type::Tuple(items)) => items.iter().all(|item| standard_ord_type(types, *item)),
         _ => false,
     }
 }
@@ -7277,6 +8268,16 @@ fn display_operation(operation: &Operation) -> String {
             left.0,
             right.map_or_else(String::new, |right| format!(", v{}", right.0)),
             ty.0
+        ),
+        Operation::Concat {
+            result,
+            left,
+            right,
+            ty,
+            ..
+        } => format!(
+            "v{} = concat v{}, v{}: t{}",
+            result.0, left.0, right.0, ty.0
         ),
         Operation::Compare {
             result,

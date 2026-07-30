@@ -1097,30 +1097,30 @@ operators, and generic traversal.
 
 **Deliverables**
 
-- [ ] Parse-to-Typed-AST support for `defprotocol`, `defimpl`, `Self`, explicit
+- [x] Parse-to-Typed-AST support for `defprotocol`, `defimpl`, `Self`, explicit
   associated type declarations/assignments, and qualified projections.
-- [ ] Protocol ownership/orphan checks across the resolved package graph.
-- [ ] Implementation completeness, exact substituted signatures, uniqueness, and
+- [x] Protocol ownership/orphan checks across the resolved package graph.
+- [x] Implementation completeness, exact substituted signatures, uniqueness, and
   overlap detection without using positive constraints as disambiguation.
-- [ ] Generic constraint checking once and concrete implementation selection during
+- [x] Generic constraint checking once and concrete implementation selection during
   monomorphization.
-- [ ] Core protocols: `Eq`, `Ord`, `Show`, `Hash`, `Iterable`, and `Concat`.
-- [ ] Compiler-generated standard implementations and `@derive` for `Eq`, `Ord`,
+- [x] Core protocols: `Eq`, `Ord`, `Show`, `Hash`, `Iterable`, and `Concat`.
+- [x] Compiler-generated standard implementations and `@derive` for `Eq`, `Ord`,
   `Show`, and `Hash` when all field constraints hold.
-- [ ] `for` lowering through one statically selected `Iterable` implementation,
+- [x] `for` lowering through one statically selected `Iterable` implementation,
   immutable cursors, associated `Item`, and irrefutable patterns.
 - [ ] Protocol lowering for nonprimitive equality/ordering and `++`.
-- [ ] Complete `Enum` APIs with deterministic traversal and short-circuit behavior.
+- [x] Complete `Enum` APIs with deterministic traversal and short-circuit behavior.
 
 **Tests**
 
-- [ ] Completeness, duplicate/unknown associated types, orphan rejection, coherence,
+- [x] Completeness, duplicate/unknown associated types, orphan rejection, coherence,
   overlapping generic heads, and alias/union target rejection.
-- [ ] Concrete dispatch at multiple instantiations, projection normalization,
+- [x] Concrete dispatch at multiple instantiations, projection normalization,
   specialization reuse, and defensive post-substitution checks.
-- [ ] Derivation success/failure for generic and nested structs.
+- [x] Derivation success/failure for generic and nested structs.
 - [ ] `Eq`/`Ord`/`Hash` law tests for standard implementations.
-- [ ] Every standard iteration order, map tuple order, cursor threading, and
+- [x] Every standard iteration order, map tuple order, cursor threading, and
   irrefutable/refutable `for` patterns, including zero-based `Enum.at` hits and
   misses plus bounded traversal through the requested position.
 - [ ] Concatenation for `string`, `bytes`, `bits`, and lists.
@@ -1128,6 +1128,22 @@ operators, and generic traversal.
 - [ ] **Exit gate:** derive protocols for a generic struct, instantiate constrained
   generic functions at several concrete types, iterate multiple container types,
   and concatenate every standard `Concat` type.
+
+**Progress:** protocol declarations and implementations now retain exact signature,
+associated-type, constraint, derive, and ownership metadata through resolution,
+Typed AST, verified Generic Core, and monomorphization. Coherence uses structural
+head unification with an occurs check and deliberately ignores positive constraints.
+Concrete specialization validates constraints defensively, reuses specialization
+keys, and normalizes both standard and user-defined associated projections.
+
+Standard `Iterable` sources now lower `for` to a verified immutable index-cursor CFG
+that evaluates the source once, threads the cursor as a block parameter, projects
+the associated item, and rejects refutable patterns. `Concat` type checking covers
+strings, bytes, bits, and lists; bytes desugar through immutable buffer operations,
+lists lower to an order-preserving CFG, and managed LLVM string concatenation roots
+its operands across allocation. The remaining unchecked items require law-focused
+standard implementation tests plus complete nonprimitive ordering/concatenation
+backend coverage and the combined native exit gate.
 
 ### Milestone 8 — Packages, I/O, and standard library
 

@@ -302,7 +302,10 @@ fn rejects_non_bool_control_conditions_and_unsupported_comparisons() {
     let cases = [
         ("while 1 do\n      unit\n    end\n    0", "E2113"),
         ("if 1 do\n      0\n    else\n      1\n    end", "E2113"),
-        ("true < false\n    0", "E2139"),
+        (
+            "left: Map(i32, i32) = %{1 => 1}\n    right: Map(i32, i32) = %{1 => 1}\n    left < right\n    0",
+            "E2139",
+        ),
         ("1 and true\n    0", "E2113"),
     ];
     for (body, code) in cases {
@@ -691,6 +694,71 @@ fn rejects_an_unsatisfied_concrete_constraint() {
             .iter()
             .any(|diagnostic| diagnostic.code == "E2120")
     );
+}
+
+#[test]
+fn derives_generic_struct_protocols_and_checks_field_constraints() {
+    let source = "defmodule Main do\n  @derive [Eq, Ord, Show, Hash]\n  defstruct Box(a) do\n    value: a\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def main() -> bool do\n    left = %Box{value: 1}\n    right = %Box{value: 1}\n    same(left, right)\n  end\nend\n";
+    let typed = checked(source).expect("derived generic Eq is selected for Box(i32)");
+    assert_eq!(typed.structs[0].derives, ["Eq", "Ord", "Show", "Hash"]);
+    verify(&typed).expect("derived struct Typed AST verifies");
+
+    let invalid = source.replace("value: 1", "value: 1.0");
+    let diagnostics = checked(&invalid).expect_err("f64 prevents derived Eq");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2120")
+    );
+}
+
+#[test]
+fn explicit_local_protocol_implementations_satisfy_generic_constraints() {
+    let source = "defmodule Main do\n  defprotocol Marker do\n  end\n  defimpl Marker, for: i32 do\n  end\n  def marked(value: a) -> a when a: Marker do\n    value\n  end\n  def main() -> i32 do\n    marked(1)\n  end\nend\n";
+    checked(source).expect("explicit local implementation satisfies the constraint");
+}
+
+#[test]
+fn checks_concat_for_every_standard_protocol_type() {
+    let source = "defmodule Main do\n  def main() -> bool do\n    left: [i32] = [1]\n    right: [i32] = [2]\n    data = Bytes.from_list([65])\n    bits = Bytes.to_bits(data)\n    \"a\" ++ \"b\" == \"ab\" and Bytes.byte_size(data ++ data) == 2 and Bits.bit_size(bits ++ bits) == 16 and left ++ right == [1, 2]\n  end\nend\n";
+    let typed = checked(source).expect("all standard Concat types check");
+    assert_eq!(typed.debug_tree().matches("concat:").count(), 3);
+    assert_eq!(typed.debug_tree().matches("buffer append").count(), 2);
+    verify(&typed).expect("concat Typed AST verifies");
+
+    let invalid =
+        "defmodule Main do\n  def main() -> [i32; 2] do\n    #[1, 2] ++ #[3, 4]\n  end\nend\n";
+    let diagnostics = checked(invalid).expect_err("arrays do not implement Concat");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2160")
+    );
+}
+
+#[test]
+fn checks_for_patterns_against_static_iterable_items() {
+    let source = "defmodule Main do\n  def main() -> unit do\n    list: [i32] = [1, 2]\n    array: [i32; 2] = #[1, 2]\n    slice = Slice.from_array(array)\n    bytes = String.bytes(\"AB\")\n    map: Map(i32, string) = %{1 => \"one\"}\n    for value in list do\n      unit\n    end\n    for value in array do\n      unit\n    end\n    for value in slice do\n      unit\n    end\n    for value in bytes do\n      unit\n    end\n    for {key, value} in map do\n      unit\n    end\n    for value in String.codepoint_view(\"A🙂\") do\n      unit\n    end\n    for value in String.grapheme_view(\"é\") do\n      unit\n    end\n  end\nend\n";
+    let typed = checked(source).expect("standard Iterable implementations select Item types");
+    assert_eq!(typed.debug_tree().matches("for Binding").count(), 6);
+    assert!(typed.debug_tree().contains("for Tuple"));
+    verify(&typed).expect("for Typed AST verifies");
+
+    let invalid = "defmodule Main do\n  def main() -> unit do\n    values: [[i32]] = [[1]]\n    for [head | tail] in values do\n      unit\n    end\n  end\nend\n";
+    let diagnostics = checked(invalid).expect_err("refutable for patterns are rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2162")
+    );
+}
+
+#[test]
+fn normalizes_qualified_iterable_item_projections_at_instantiation() {
+    let source = "defmodule Main do\n  def keep(values: i, value: Iterable.Item(i)) -> Iterable.Item(i) when i: Iterable do\n    value\n  end\n  def main() -> i32 do\n    values: [i32] = [1]\n    keep(values, 42)\n  end\nend\n";
+    let typed = checked(source).expect("Iterable.Item remains abstract once and normalizes at use");
+    assert!(typed.debug_tree().contains("Iterable.Item(i)"));
+    verify(&typed).expect("projected Typed AST verifies");
 }
 
 #[test]

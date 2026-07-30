@@ -32,6 +32,15 @@ pub enum TypeSyntax {
         name: String,
         span: Span,
     },
+    SelfType {
+        span: Span,
+    },
+    Projection {
+        protocol: String,
+        associated: String,
+        argument: Box<TypeSyntax>,
+        span: Span,
+    },
     Named {
         declaration: DeclId,
         name: String,
@@ -81,6 +90,8 @@ impl TypeSyntax {
         match self {
             Self::Primitive { span, .. }
             | Self::Variable { span, .. }
+            | Self::SelfType { span }
+            | Self::Projection { span, .. }
             | Self::Named { span, .. }
             | Self::Union { span, .. }
             | Self::Atom { span, .. }
@@ -131,6 +142,7 @@ pub struct Protocol {
     pub span: Span,
     pub associated_types: Vec<String>,
     pub methods: Vec<String>,
+    pub method_signatures: Vec<Node>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +152,7 @@ pub struct Implementation {
     pub target: TypeSyntax,
     pub associated_types: Vec<(String, TypeSyntax)>,
     pub methods: Vec<String>,
+    pub constraints: Vec<Constraint>,
     pub span: Span,
 }
 
@@ -169,6 +182,7 @@ pub struct Struct {
     pub name_span: Span,
     pub span: Span,
     pub parameters: Vec<String>,
+    pub derives: Vec<String>,
     pub fields: Vec<StructField>,
 }
 
@@ -468,22 +482,44 @@ fn resolve_with_catalog(
             );
             continue;
         }
+        let associated_types = node
+            .children
+            .iter()
+            .filter(|item| item.kind.as_str() == "assoc_type_decl")
+            .filter_map(|item| child(item, "type_name").map(text))
+            .collect::<Vec<_>>();
+        let method_signatures = node
+            .children
+            .iter()
+            .filter(|item| item.kind.as_str() == "protocol_signature")
+            .cloned()
+            .collect::<Vec<_>>();
+        let methods = method_signatures
+            .iter()
+            .filter_map(|item| child(item, "identifier").map(text))
+            .collect::<Vec<_>>();
+        for (names, kind, code) in [
+            (&associated_types, "associated type", "E2034"),
+            (&methods, "protocol method", "E2035"),
+        ] {
+            let mut seen = BTreeMap::new();
+            for name in names {
+                if seen.insert(name, node.span).is_some() {
+                    diagnostics.push(Diagnostic::error(
+                        code,
+                        node.span,
+                        format!("duplicate {kind} `{name}`"),
+                    ));
+                }
+            }
+        }
         protocols.push(Protocol {
             id: declaration_ids[&node.span.start()],
             name,
             span: node.span,
-            associated_types: node
-                .children
-                .iter()
-                .filter(|item| item.kind.as_str() == "assoc_type_decl")
-                .filter_map(|item| child(item, "type_name").map(text))
-                .collect(),
-            methods: node
-                .children
-                .iter()
-                .filter(|item| item.kind.as_str() == "protocol_signature")
-                .filter_map(|item| child(item, "identifier").map(text))
-                .collect(),
+            associated_types,
+            methods,
+            method_signatures,
         });
     }
 
@@ -532,10 +568,11 @@ fn resolve_with_catalog(
     reject_alias_cycles(&aliases, &mut diagnostics);
 
     let mut structs = Vec::new();
-    for node in module
+    for (node_index, node) in module
         .children
         .iter()
-        .filter(|node| node.kind.as_str() == "struct_decl")
+        .enumerate()
+        .filter(|(_, node)| node.kind.as_str() == "struct_decl")
     {
         let name_node = child(node, "type_name").expect("parser validates struct names");
         let name = text(name_node);
@@ -548,6 +585,41 @@ fn resolve_with_catalog(
         let parameters = child(node, "type_params")
             .map(|params| params.children.iter().map(text).collect::<Vec<_>>())
             .unwrap_or_default();
+        let derives = node
+            .children
+            .iter()
+            .find(|attribute| attribute.kind.as_str() == "derive_attr")
+            .or_else(|| {
+                node_index
+                    .checked_sub(1)
+                    .and_then(|index| module.children.get(index))
+                    .filter(|attribute| attribute.kind.as_str() == "derive_attr")
+            })
+            .map(|attribute| {
+                attribute
+                    .children
+                    .iter()
+                    .filter(|path| path.kind.as_str() == "type_path")
+                    .map(path_name)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut seen_derives = BTreeMap::new();
+        for derive in &derives {
+            if !matches!(derive.as_str(), "Eq" | "Ord" | "Show" | "Hash") {
+                diagnostics.push(Diagnostic::error(
+                    "E2028",
+                    node.span,
+                    format!("`@derive` does not support protocol `{derive}`"),
+                ));
+            } else if seen_derives.insert(derive.clone(), node.span).is_some() {
+                diagnostics.push(Diagnostic::error(
+                    "E2029",
+                    node.span,
+                    format!("duplicate derived protocol `{derive}`"),
+                ));
+            }
+        }
         let mut field_names = BTreeMap::new();
         let mut fields = Vec::new();
         for field in node
@@ -587,6 +659,7 @@ fn resolve_with_catalog(
             name_span: name_node.span,
             span: node.span,
             parameters,
+            derives,
             fields,
         });
     }
@@ -736,7 +809,7 @@ fn resolve_with_catalog(
         .iter()
         .map(|protocol| (protocol.name.clone(), protocol))
         .collect::<BTreeMap<_, _>>();
-    let mut impl_heads = BTreeMap::<String, Span>::new();
+    let mut impl_heads = Vec::<(String, TypeSyntax, Span)>::new();
     for (index, node) in module
         .children
         .iter()
@@ -776,14 +849,78 @@ fn resolve_with_catalog(
         else {
             continue;
         };
-        let head = format!("{protocol_name}:{}", type_name(&target));
-        if let Some(previous) = impl_heads.insert(head, node.span) {
+        let protocol_is_local = protocol_metadata.contains_key(&protocol_name);
+        let target_is_local = matches!(&target, TypeSyntax::Named { declaration, .. }
+            if structs.iter().any(|structure| structure.id == *declaration));
+        if !protocol_is_local && !target_is_local {
+            diagnostics.push(Diagnostic::error(
+                "E2032",
+                node.span,
+                "orphan implementation: this package owns neither the protocol nor the target type",
+            ));
+            continue;
+        }
+        if matches!(target, TypeSyntax::Union { .. })
+            || matches!(&target, TypeSyntax::Named { declaration, .. } if aliases.iter().any(|alias| alias.id == *declaration))
+        {
+            diagnostics.push(Diagnostic::error(
+                "E2030",
+                target.span(),
+                "transparent aliases and structural unions cannot be implementation targets",
+            ));
+            continue;
+        }
+        if let Some((_, _, previous)) = impl_heads.iter().find(|(protocol, candidate, _)| {
+            protocol == &protocol_name && implementation_heads_overlap(candidate, &target)
+        }) {
             diagnostics.push(
-                Diagnostic::error("E2016", node.span, "duplicate implementation head")
-                    .with_label(previous, "first implemented here"),
+                Diagnostic::error("E2016", node.span, "overlapping implementation head")
+                    .with_label(*previous, "first implemented here")
+                    .with_note(
+                        "positive protocol constraints do not disambiguate implementation heads",
+                    ),
             );
             continue;
         }
+        impl_heads.push((protocol_name.clone(), target.clone(), node.span));
+        let mut target_parameters = Vec::new();
+        collect_type_parameter(&target, &mut target_parameters);
+        let constraints = node
+            .children
+            .iter()
+            .find(|child| child.kind.as_str() == "when_clause")
+            .map(|when| {
+                when.children
+                    .iter()
+                    .filter(|child| child.kind.as_str() == "constraint")
+                    .filter_map(|constraint| {
+                        let parameter = constraint.children.first().map(text)?;
+                        let written = constraint.children.get(1).map(path_name)?;
+                        let protocol = written
+                            .strip_prefix(&format!("{module_name}."))
+                            .unwrap_or(&written)
+                            .to_owned();
+                        if !target_parameters.contains(&parameter) {
+                            diagnostics.push(Diagnostic::error(
+                                "E2031",
+                                constraint.span,
+                                format!("implementation constraint references unknown type parameter `{parameter}`"),
+                            ));
+                            return None;
+                        }
+                        if !is_core_protocol(&protocol) && !protocol_names.contains_key(&protocol) {
+                            diagnostics.push(Diagnostic::error(
+                                "E2013",
+                                constraint.span,
+                                format!("unknown protocol `{written}`"),
+                            ));
+                            return None;
+                        }
+                        Some(Constraint { parameter, protocol, span: constraint.span })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut associated_types = Vec::new();
         let mut associated_names = BTreeMap::new();
         let mut methods = Vec::new();
@@ -861,6 +998,73 @@ fn resolve_with_catalog(
                     ));
                 }
             }
+            let mut replacements = associated_types
+                .iter()
+                .map(|(name, ty)| (name.clone(), render_type_syntax(ty)))
+                .collect::<BTreeMap<_, _>>();
+            replacements.insert("Self".to_owned(), render_type_syntax(&target));
+            for required in &protocol.method_signatures {
+                let Some(name_node) = child(required, "identifier") else {
+                    continue;
+                };
+                let name = text(name_node);
+                let implementation_method = node.children.iter().find(|candidate| {
+                    candidate.kind.as_str() == "function_decl"
+                        && child(candidate, "identifier")
+                            .is_some_and(|candidate_name| text(candidate_name) == name)
+                });
+                if let Some(implementation_method) = implementation_method
+                    && method_signature_key(required, &replacements)
+                        != method_signature_key(implementation_method, &replacements)
+                {
+                    diagnostics.push(Diagnostic::error(
+                        "E2036",
+                        implementation_method.span,
+                        format!("implementation method `{name}` does not exactly match the substituted protocol signature"),
+                    ));
+                }
+            }
+        }
+        if !protocol_metadata.contains_key(&protocol_name)
+            && let Some((required_associated, required_methods)) =
+                core_protocol_shape(&protocol_name)
+        {
+            for required in required_associated {
+                if !associated_names.contains_key(*required) {
+                    diagnostics.push(Diagnostic::error(
+                        "E2019",
+                        node.span,
+                        format!("implementation is missing associated type `{required}`"),
+                    ));
+                }
+            }
+            for required in required_methods {
+                if !method_names.contains_key(*required) {
+                    diagnostics.push(Diagnostic::error(
+                        "E2020",
+                        node.span,
+                        format!("implementation is missing method `{required}`"),
+                    ));
+                }
+            }
+            for provided in associated_names.keys() {
+                if !required_associated.contains(&provided.as_str()) {
+                    diagnostics.push(Diagnostic::error(
+                        "E2021",
+                        node.span,
+                        format!("unknown associated type `{provided}`"),
+                    ));
+                }
+            }
+            for provided in method_names.keys() {
+                if !required_methods.contains(&provided.as_str()) {
+                    diagnostics.push(Diagnostic::error(
+                        "E2022",
+                        node.span,
+                        format!("unknown implementation method `{provided}`"),
+                    ));
+                }
+            }
         }
         implementations.push(Implementation {
             id: ImplId(index as u32),
@@ -868,8 +1072,27 @@ fn resolve_with_catalog(
             target,
             associated_types,
             methods,
+            constraints,
             span: node.span,
         });
+    }
+
+    for structure in &structs {
+        for protocol in &structure.derives {
+            if let Some(implementation) = implementations.iter().find(|implementation| {
+                implementation.protocol == *protocol
+                    && matches!(&implementation.target, TypeSyntax::Named { declaration, .. } if *declaration == structure.id)
+            }) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "E2033",
+                        structure.span,
+                        format!("derived `{protocol}` conflicts with an explicit implementation"),
+                    )
+                    .with_label(implementation.span, "explicit implementation declared here"),
+                );
+            }
+        }
     }
 
     if diagnostics.is_empty() {
@@ -893,6 +1116,20 @@ fn is_core_protocol(name: &str) -> bool {
         name,
         "Eq" | "Ord" | "Show" | "Hash" | "Iterable" | "Reader" | "Writer" | "Concat"
     )
+}
+
+fn core_protocol_shape(name: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    Some(match name {
+        "Eq" => (&[], &["eq"]),
+        "Ord" => (&[], &["compare"]),
+        "Show" => (&[], &["show"]),
+        "Hash" => (&[], &["hash"]),
+        "Iterable" => (&["Item", "Cursor"], &["iter", "next"]),
+        "Reader" => (&["Error"], &["read"]),
+        "Writer" => (&["Error"], &["write", "flush"]),
+        "Concat" => (&[], &["concat"]),
+        _ => return None,
+    })
 }
 
 fn is_type_syntax_node(node: &Node) -> bool {
@@ -977,6 +1214,9 @@ fn parse_type(
         "named_type" => {
             let path = node.children.first()?;
             let written = path_name(path);
+            if written == "Self" && node.children.len() == 1 {
+                return Some(TypeSyntax::SelfType { span: node.span });
+            }
             if written == "Slice" {
                 if node.children.len() != 2 {
                     diagnostics.push(Diagnostic::error(
@@ -1048,6 +1288,21 @@ fn parse_type(
                 .strip_prefix(&format!("{module_name}."))
                 .unwrap_or(&written);
             let Some((declaration, _, arity)) = aliases.get(local_name) else {
+                if let Some((protocol, associated)) = written.rsplit_once('.')
+                    && node.children.len() == 2
+                {
+                    return Some(TypeSyntax::Projection {
+                        protocol: protocol.to_owned(),
+                        associated: associated.to_owned(),
+                        argument: Box::new(parse_type(
+                            &node.children[1],
+                            aliases,
+                            module_name,
+                            diagnostics,
+                        )?),
+                        span: node.span,
+                    });
+                }
                 diagnostics.push(Diagnostic::error(
                     "E2006",
                     path.span,
@@ -1100,6 +1355,9 @@ fn collect_type_parameter(ty: &TypeSyntax, parameters: &mut Vec<String>) {
     match ty {
         TypeSyntax::Variable { name, .. } if !parameters.contains(name) => {
             parameters.push(name.clone());
+        }
+        TypeSyntax::Projection { argument, .. } => {
+            collect_type_parameter(argument, parameters);
         }
         TypeSyntax::Named { arguments, .. } => {
             for argument in arguments {
@@ -1341,6 +1599,8 @@ fn type_name(ty: &TypeSyntax) -> &str {
         TypeSyntax::Primitive { name, .. }
         | TypeSyntax::Variable { name, .. }
         | TypeSyntax::Named { name, .. } => name,
+        TypeSyntax::SelfType { .. } => "Self",
+        TypeSyntax::Projection { associated, .. } => associated,
         TypeSyntax::Union { .. } => "union",
         TypeSyntax::Atom { name, .. } => name,
         TypeSyntax::List { .. } => "list",
@@ -1349,5 +1609,297 @@ fn type_name(ty: &TypeSyntax) -> &str {
         TypeSyntax::Map { .. } => "map",
         TypeSyntax::Tuple { .. } => "tuple",
         TypeSyntax::Function { .. } => "function",
+    }
+}
+
+fn method_signature_key(node: &Node, replacements: &BTreeMap<String, String>) -> String {
+    let parameters = node
+        .children
+        .iter()
+        .filter(|child| child.kind.as_str() == "parameter")
+        .filter_map(|parameter| parameter.children.get(1))
+        .map(|ty| render_type_node(ty, replacements))
+        .collect::<Vec<_>>();
+    let result = node
+        .children
+        .iter()
+        .find(|child| child.kind.as_str() == "return_type")
+        .and_then(|result| result.children.first())
+        .map_or_else(
+            || "unit".to_owned(),
+            |ty| render_type_node(ty, replacements),
+        );
+    format!("({})->{result}", parameters.join(","))
+}
+
+fn render_type_node(node: &Node, replacements: &BTreeMap<String, String>) -> String {
+    match node.kind.as_str() {
+        "primitive_type" | "type_variable" => text(node),
+        "atom" => match node.value.as_ref() {
+            Some(Value::Atom { name, .. }) => format!(":{name}"),
+            _ => String::new(),
+        },
+        "named_type" => {
+            let name = node.children.first().map(path_name).unwrap_or_default();
+            if node.children.len() == 1
+                && let Some(replacement) = replacements.get(&name)
+            {
+                return replacement.clone();
+            }
+            let arguments = node.children[1..]
+                .iter()
+                .map(|argument| render_type_node(argument, replacements))
+                .collect::<Vec<_>>();
+            if arguments.is_empty() {
+                name
+            } else {
+                format!("{name}({})", arguments.join(","))
+            }
+        }
+        "list_or_array_type" if node.children.len() == 1 => {
+            format!("[{}]", render_type_node(&node.children[0], replacements))
+        }
+        "list_or_array_type" => format!(
+            "[{};{}]",
+            render_type_node(&node.children[0], replacements),
+            text(&node.children[1]).replace('_', "")
+        ),
+        "tuple_type" => format!(
+            "{{{}}}",
+            node.children
+                .iter()
+                .map(|child| render_type_node(child, replacements))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        "function_type" => {
+            let Some((result, parameters)) = node.children.split_last() else {
+                return String::new();
+            };
+            format!(
+                "({})->{}",
+                parameters
+                    .iter()
+                    .map(|child| render_type_node(child, replacements))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                render_type_node(result, replacements)
+            )
+        }
+        "union_type" => node
+            .children
+            .iter()
+            .map(|child| render_type_node(child, replacements))
+            .collect::<Vec<_>>()
+            .join("|"),
+        _ => String::new(),
+    }
+}
+
+fn render_type_syntax(ty: &TypeSyntax) -> String {
+    match ty {
+        TypeSyntax::Primitive { name, .. } | TypeSyntax::Variable { name, .. } => name.clone(),
+        TypeSyntax::SelfType { .. } => "Self".to_owned(),
+        TypeSyntax::Projection {
+            protocol,
+            associated,
+            argument,
+            ..
+        } => format!("{protocol}.{associated}({})", render_type_syntax(argument)),
+        TypeSyntax::Named {
+            name, arguments, ..
+        } if arguments.is_empty() => name.clone(),
+        TypeSyntax::Named {
+            name, arguments, ..
+        } => format!(
+            "{name}({})",
+            arguments
+                .iter()
+                .map(render_type_syntax)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        TypeSyntax::Union { members, .. } => members
+            .iter()
+            .map(render_type_syntax)
+            .collect::<Vec<_>>()
+            .join("|"),
+        TypeSyntax::Atom { name, .. } => format!(":{name}"),
+        TypeSyntax::List { item, .. } => format!("[{}]", render_type_syntax(item)),
+        TypeSyntax::Array { item, length, .. } => {
+            format!("[{};{length}]", render_type_syntax(item))
+        }
+        TypeSyntax::Slice { item, .. } => format!("Slice({})", render_type_syntax(item)),
+        TypeSyntax::Map { key, value, .. } => format!(
+            "Map({},{})",
+            render_type_syntax(key),
+            render_type_syntax(value)
+        ),
+        TypeSyntax::Tuple { elements, .. } => format!(
+            "{{{}}}",
+            elements
+                .iter()
+                .map(render_type_syntax)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        TypeSyntax::Function {
+            parameters, result, ..
+        } => format!(
+            "({})->{}",
+            parameters
+                .iter()
+                .map(render_type_syntax)
+                .collect::<Vec<_>>()
+                .join(","),
+            render_type_syntax(result)
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ImplementationHead {
+    Variable(String),
+    Constructor(String, Vec<ImplementationHead>),
+}
+
+fn implementation_heads_overlap(left: &TypeSyntax, right: &TypeSyntax) -> bool {
+    let left = implementation_head(left, "left");
+    let right = implementation_head(right, "right");
+    unify_implementation_heads(left, right, &mut BTreeMap::new())
+}
+
+fn implementation_head(ty: &TypeSyntax, side: &str) -> ImplementationHead {
+    let constructor = |name: String, arguments: Vec<ImplementationHead>| {
+        ImplementationHead::Constructor(name, arguments)
+    };
+    match ty {
+        TypeSyntax::Variable { name, .. } => ImplementationHead::Variable(format!("{side}:{name}")),
+        TypeSyntax::Primitive { name, .. } => constructor(format!("primitive:{name}"), vec![]),
+        TypeSyntax::SelfType { .. } => constructor("self".to_owned(), vec![]),
+        TypeSyntax::Projection {
+            protocol,
+            associated,
+            argument,
+            ..
+        } => constructor(
+            format!("projection:{protocol}.{associated}"),
+            vec![implementation_head(argument, side)],
+        ),
+        TypeSyntax::Named {
+            declaration,
+            arguments,
+            ..
+        } => constructor(
+            format!("named:{}", declaration.0),
+            arguments
+                .iter()
+                .map(|argument| implementation_head(argument, side))
+                .collect(),
+        ),
+        TypeSyntax::Union { members, .. } => constructor(
+            "union".to_owned(),
+            members
+                .iter()
+                .map(|member| implementation_head(member, side))
+                .collect(),
+        ),
+        TypeSyntax::Atom { name, .. } => constructor(format!("atom:{name}"), vec![]),
+        TypeSyntax::List { item, .. } => {
+            constructor("list".to_owned(), vec![implementation_head(item, side)])
+        }
+        TypeSyntax::Array { item, length, .. } => constructor(
+            format!("array:{length}"),
+            vec![implementation_head(item, side)],
+        ),
+        TypeSyntax::Slice { item, .. } => {
+            constructor("slice".to_owned(), vec![implementation_head(item, side)])
+        }
+        TypeSyntax::Map { key, value, .. } => constructor(
+            "map".to_owned(),
+            vec![
+                implementation_head(key, side),
+                implementation_head(value, side),
+            ],
+        ),
+        TypeSyntax::Tuple { elements, .. } => constructor(
+            format!("tuple:{}", elements.len()),
+            elements
+                .iter()
+                .map(|element| implementation_head(element, side))
+                .collect(),
+        ),
+        TypeSyntax::Function {
+            parameters, result, ..
+        } => {
+            let mut arguments = parameters
+                .iter()
+                .map(|parameter| implementation_head(parameter, side))
+                .collect::<Vec<_>>();
+            arguments.push(implementation_head(result, side));
+            constructor(format!("function:{}", parameters.len()), arguments)
+        }
+    }
+}
+
+fn unify_implementation_heads(
+    left: ImplementationHead,
+    right: ImplementationHead,
+    substitutions: &mut BTreeMap<String, ImplementationHead>,
+) -> bool {
+    let left = substitute_implementation_head(left, substitutions);
+    let right = substitute_implementation_head(right, substitutions);
+    match (left, right) {
+        (ImplementationHead::Variable(left), ImplementationHead::Variable(right))
+            if left == right =>
+        {
+            true
+        }
+        (ImplementationHead::Variable(variable), value)
+        | (value, ImplementationHead::Variable(variable)) => {
+            if occurs_in_implementation_head(&variable, &value, substitutions) {
+                false
+            } else {
+                substitutions.insert(variable, value);
+                true
+            }
+        }
+        (
+            ImplementationHead::Constructor(left_name, left_arguments),
+            ImplementationHead::Constructor(right_name, right_arguments),
+        ) => {
+            left_name == right_name
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .into_iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| unify_implementation_heads(left, right, substitutions))
+        }
+    }
+}
+
+fn substitute_implementation_head(
+    mut head: ImplementationHead,
+    substitutions: &BTreeMap<String, ImplementationHead>,
+) -> ImplementationHead {
+    while let ImplementationHead::Variable(variable) = &head {
+        let Some(replacement) = substitutions.get(variable) else {
+            break;
+        };
+        head = replacement.clone();
+    }
+    head
+}
+
+fn occurs_in_implementation_head(
+    variable: &str,
+    head: &ImplementationHead,
+    substitutions: &BTreeMap<String, ImplementationHead>,
+) -> bool {
+    match substitute_implementation_head(head.clone(), substitutions) {
+        ImplementationHead::Variable(candidate) => candidate == variable,
+        ImplementationHead::Constructor(_, arguments) => arguments
+            .iter()
+            .any(|argument| occurs_in_implementation_head(variable, argument, substitutions)),
     }
 }

@@ -232,6 +232,7 @@ fn concrete_types_carry_collector_independent_managed_classification() {
         declaration,
         name: "ManagedFields".to_owned(),
         arguments: Vec::new(),
+        derives: Vec::new(),
         fields: vec![("name".to_owned(), string_ty), ("items".to_owned(), list)],
         origin: concrete.functions[0].span,
     });
@@ -1336,6 +1337,124 @@ fn preserves_complete_implementation_metadata_at_the_core_boundary() {
             .starts_with("impl i0 Render for t4 [Output=t1]\n")
     );
     verify(&module).expect("implementation metadata verifies");
+}
+
+#[test]
+fn lowers_and_verifies_protocol_backed_concat() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(Bytes.from_list([65]))\n    bits ++ bits\n    0\n  end\nend\n",
+    );
+    assert!(
+        module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|operation| matches!(operation, Operation::Concat { .. }))
+    );
+    verify(&module).expect("Generic Core concat verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("concat monomorphizes");
+    verify_concrete(&concrete).expect("Concrete Core concat verifies");
+}
+
+#[test]
+fn lowers_list_concat_to_order_preserving_core_cfg() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    left: [i32] = [1, 2]\n    right: [i32] = [3]\n    left ++ right\n    0\n  end\nend\n",
+    );
+    assert!(
+        !module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|operation| matches!(operation, Operation::Concat { .. }))
+    );
+    assert!(
+        module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|operation| matches!(operation, Operation::ListHead { .. }))
+    );
+    verify(&module).expect("list concat Core CFG verifies");
+}
+
+#[test]
+fn lowers_for_to_static_iterable_cursor_cfg() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    values: [i32; 2] = #[1, 2]\n    for value in values do\n      value == 1\n      unit\n    end\n    0\n  end\nend\n",
+    );
+    let operations = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    assert!(
+        operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::CollectionLength { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::EnumAt { .. }))
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::UnionProject { .. }))
+    );
+    verify(&module).expect("for Generic Core CFG verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("for CFG monomorphizes");
+    verify_concrete(&concrete).expect("for Concrete Core CFG verifies");
+}
+
+#[test]
+fn specializes_generic_for_with_associated_items() {
+    let module = lowered(
+        "defmodule Main do\n  def consume(values: i) -> i32 when i: Iterable do\n    for value in values do\n      value\n      unit\n    end\n    0\n  end\n  def main() -> i32 do\n    values: [i32; 2] = #[1, 2]\n    consume(values)\n  end\nend\n",
+    );
+    verify(&module).expect("generic for Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("generic for specializes");
+    verify_concrete(&concrete).expect("specialized for Core verifies");
+}
+
+#[test]
+fn normalizes_associated_item_projections_during_specialization() {
+    let module = lowered(
+        "defmodule Main do\n  def keep(values: i, value: Iterable.Item(i)) -> Iterable.Item(i) when i: Iterable do\n    value\n  end\n  def main() -> i32 do\n    values: [i32] = [1]\n    keep(values, 42)\n  end\nend\n",
+    );
+    verify(&module).expect("abstract projection Generic Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("projection normalizes");
+    verify_concrete(&concrete).expect("Concrete Core contains no projection");
+}
+
+#[test]
+fn validates_derived_and_explicit_constraints_after_substitution() {
+    for source in [
+        "defmodule Main do\n  @derive [Eq]\n  defstruct Box(a) do\n    value: a\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def main() -> i32 do\n    left = %Box{value: 1}\n    right = %Box{value: 1}\n    if same(left, right) do\n      0\n    else\n      1\n    end\n  end\nend\n",
+        "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  defprotocol Marker do\n    def mark(value: Self) -> bool\n  end\n  defimpl Marker, for: Box(a) do\n    def mark(value: Box(a)) -> bool do\n      true\n    end\n  end\n  def keep(value: a) -> a when a: Marker do\n    value\n  end\n  def main() -> i32 do\n    value = %Box{value: 1}\n    keep(value)\n    0\n  end\nend\n",
+    ] {
+        let module = lowered(source);
+        verify(&module).expect("constrained Generic Core verifies");
+        let roots = executable_reachability_roots(&module).expect("entry point");
+        let concrete = monomorphize(&module, &roots).expect("constraint holds after substitution");
+        verify_concrete(&concrete).expect("constrained Concrete Core verifies");
+    }
+}
+
+#[test]
+fn normalizes_user_implementation_associated_types() {
+    let module = lowered(
+        "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  defprotocol Container do\n    type Item\n    def get(value: Self) -> Item\n  end\n  defimpl Container, for: Box(a) do\n    type Item = a\n    def get(value: Box(a)) -> a do\n      value.value\n    end\n  end\n  def keep(value: c, item: Container.Item(c)) -> Container.Item(c) when c: Container do\n    item\n  end\n  def main() -> i32 do\n    value: Box(i32) = %Box{value: 1}\n    keep(value, 42)\n  end\nend\n",
+    );
+    verify(&module).expect("custom projection Generic Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("custom projection normalizes");
+    verify_concrete(&concrete).expect("custom projection Concrete Core verifies");
 }
 
 #[test]
