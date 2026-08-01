@@ -1,0 +1,9 @@
+[package]
+name = "unicode_report"
+namespace = "UnicodeReport"
+version = "1.0.0"
+
+[deps]
+
+[target]
+main = "Main"
