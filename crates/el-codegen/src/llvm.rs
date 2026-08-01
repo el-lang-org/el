@@ -13260,7 +13260,7 @@ mod tests {
 
     fn concrete(source: &str) -> ConcreteModule {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", source);
+        let file = sources.add_file("src/main.ell", source);
         let parsed = parse(file, source).expect("fixture parses");
         let resolved = resolve(&parsed).expect("fixture resolves");
         let typed = check(&resolved).expect("fixture type checks");

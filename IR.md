@@ -2,7 +2,7 @@
 
 Status: version 1 implementation contract
 Language: **EL**
-Last updated: 2026-07-26
+Last updated: 2026-08-01
 
 ## 1. Scope and authority
 
@@ -27,7 +27,7 @@ may differ while preserving the same information and checks.
 The unified compiler and package tool is named `el`.
 
 ```text
-.el source
+.ell source
     |
     v
 PEG parse tree -> AST -> name resolution + type checking -> Typed AST

@@ -4,7 +4,7 @@ use el_span::SourceMap;
 
 fn parsed(source: &str) -> el_ast::Program {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     parse(file, source).expect("fixture parses")
 }
 

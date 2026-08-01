@@ -25,7 +25,7 @@ mod tests {
     #[test]
     fn preserves_the_complete_source_span_for_runtime_metadata() {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", "123 + 456");
+        let file = sources.add_file("src/main.ell", "123 + 456");
         let span = Span::new(file, 4, 9).unwrap();
 
         assert_eq!(

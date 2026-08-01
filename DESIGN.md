@@ -2,7 +2,7 @@
 
 Status: living design document  
 Language name: **EL**
-Last updated: 2026-07-28
+Last updated: 2026-08-01
 
 This document is the source of truth for EL's vision, observable runtime
 semantics, compiler architecture, roadmap, open questions, and design decisions.
@@ -168,7 +168,7 @@ an explanatory summary.
 
 ### 4.1 Source files
 
-- Source file extension: `.el`.
+- Source file extension: `.ell`.
 - Source text is UTF-8.
 - UTF-8 BOMs are not accepted. A physical newline is either LF or CRLF; a bare
   carriage return is invalid. Outside literals, horizontal whitespace is ASCII
@@ -1757,8 +1757,8 @@ The conventional layout is:
 project/
   el.toml
   src/
-    main.el
-    parser.el
+    main.ell
+    parser.ell
 ```
 
 V1 has no language-integrated test declarations, test discovery, special
@@ -1775,16 +1775,16 @@ paths relative to `src/`:
 ```text
 namespace = "Example"
 
-src/main.el          -> defmodule Main        -> Example.Main
-src/http/client.el   -> defmodule Http.Client -> Example.Http.Client
-src/json_api.el      -> defmodule JsonApi     -> Example.JsonApi
-src/foo/index.el     -> defmodule Foo.Index   -> Example.Foo.Index
+src/main.ell          -> defmodule Main        -> Example.Main
+src/http/client.ell   -> defmodule Http.Client -> Example.Http.Client
+src/json_api.ell      -> defmodule JsonApi     -> Example.JsonApi
+src/foo/index.ell     -> defmodule Foo.Index   -> Example.Foo.Index
 ```
 
 The compiler strips the source extension, requires every path component to be
 lowercase `snake_case`, converts each component mechanically to `PascalCase`,
 and joins components with dots. Acronyms receive no special casing, and
-`index.el` has no special meaning. The declared `defmodule` must exactly match
+`index.ell` has no special meaning. The declared `defmodule` must exactly match
 the derived package-relative name. The manifest target module name is also
 package-relative; external package modules use their declared root namespace.
 
@@ -1950,7 +1950,7 @@ overview.
 The unified compiler and package tool is named `el`.
 
 ```text
-.el source
+.ell source
     |
     v
 PEG parse tree -> AST -> name resolution + type checking -> Typed AST
@@ -2093,7 +2093,7 @@ Minimum diagnostic structure:
 
 ```text
 error[E0301]: cannot update immutable binding `x`
-  --> example.el:4:3
+  --> example.ell:4:3
    |
  2 |   x = 1
    |   ----- `x` is immutable because it was declared here
@@ -2476,7 +2476,8 @@ Version 1 is ready when:
 
 These require explicit decisions before the affected implementation begins:
 
-1. Resolved by D-035: the language name is EL and source files use `.el`.
+1. Resolved by D-035 and superseded in part by D-066: the language name is EL
+   and source files use `.ell`.
 2. Resolved by D-007: use `pest` 2.8.7 with `pest_derive` 2.8.7.
 3. Resolved by D-008: use LLVM 22.1.8 through Inkwell 0.9.0.
 4. Resolved by D-024: structs are immutable value types with no observable
@@ -2980,7 +2981,7 @@ These require explicit decisions before the affected implementation begins:
 ### D-032 — Source paths determine module names
 
 - Date: 2026-07-26
-- Status: accepted
+- Status: superseded in part by D-066
 - Decision: Each `.el` file under `src/` maps to one package-relative module by
   stripping `src/` and the extension, converting every lowercase `snake_case`
   path component mechanically to `PascalCase`, and joining components with
@@ -3036,7 +3037,7 @@ These require explicit decisions before the affected implementation begins:
 ### D-035 — EL name and `.el` source extension
 
 - Date: 2026-07-26
-- Status: accepted
+- Status: superseded in part by D-066
 - Decision: The permanent language name is EL and source files use the `.el`
   extension.
 - Reason: Retaining the established project name avoids an unrelated naming
@@ -3770,6 +3771,19 @@ These require explicit decisions before the affected implementation begins:
 - Reason: A language can remain small and rigorous while respecting the people
   who use it. Making routine development satisfying is part of EL's quality,
   not merely a post-v1 tooling concern.
+
+### D-066 — `.ell` source extension
+
+- Date: 2026-08-01
+- Status: accepted
+- Decision: The permanent language name remains EL, and EL source files use the
+  `.ell` extension. This supersedes only the source-extension portions of D-032
+  and D-035; their module-mapping and language-name decisions remain accepted.
+- Reason: `.ell` reads naturally as "EL language" while avoiding `.el`'s
+  established association with Emacs Lisp.
+- Consequence: Project discovery, module-to-path mapping, examples, diagnostics,
+  editor integrations, and compiler tooling must recognize `.ell` as the EL
+  source extension. `.el` is not an alternate EL source extension.
 
 ## 21. Next design checkpoint
 

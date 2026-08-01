@@ -7,6 +7,10 @@ tagged results, exhaustive pattern matching, pipelines, generic `Enum`
 reduction and callbacks, immutable maps, recursive numeric formatting, buffers,
 process arguments, Unicode 17 semantics, and console output.
 
+Its source tree also demonstrates path-derived nested modules: analysis lives
+under `src/analysis/`, presentation and formatting live under `src/output/`,
+and `src/main.ell` remains the executable entry module.
+
 From this directory, build and run it with:
 
 ```sh

@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn derives_locations_from_utf8_lf_crlf_and_eof() {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/Main.el", "α\r\nbeta\n");
+        let file = sources.add_file("src/Main.ell", "α\r\nbeta\n");
 
         assert_eq!(
             sources.location(file, 0),
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn rejects_offsets_inside_multibyte_text() {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/Main.el", "α");
+        let file = sources.add_file("src/Main.ell", "α");
 
         assert_eq!(
             sources.location(file, 1),
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn verifies_zero_width_and_label_spans() {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/Main.el", "value");
+        let file = sources.add_file("src/Main.ell", "value");
         let eof = Span::new(file, 5, 5).expect("ordered span");
         let value = Span::new(file, 0, 5).expect("ordered span");
         let diagnostic = Diagnostic::error("E0001", eof, "expected expression")
@@ -415,14 +415,14 @@ mod tests {
         assert_eq!(diagnostic.verify(&sources), Ok(()));
         assert_eq!(
             sources.file(file).expect("known file").path(),
-            Path::new("src/Main.el")
+            Path::new("src/Main.ell")
         );
     }
 
     #[test]
     fn renders_stable_package_relative_unicode_source_presentations() {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/Main.el", "first\r\n\tvalue = λ\n");
+        let file = sources.add_file("src/Main.ell", "first\r\n\tvalue = λ\n");
         let lambda = Span::new(file, 16, 18).unwrap();
         let diagnostic = Diagnostic::error("E2106", lambda, "unknown value `λ`")
             .with_label(Span::new(file, 8, 13).unwrap(), "binding starts here")
@@ -431,7 +431,7 @@ mod tests {
 
         assert_eq!(
             render_diagnostic(&sources, &diagnostic).unwrap(),
-            "error[E2106]: unknown value `λ`\n --> src/Main.el:2:10\n  |\n2 |     value = λ\n  |             ^\n  = label: src/Main.el:2:2: binding starts here\n  = note: names are resolved before type checking\n  = help: declare `λ` before this expression\n"
+            "error[E2106]: unknown value `λ`\n --> src/Main.ell:2:10\n  |\n2 |     value = λ\n  |             ^\n  = label: src/Main.ell:2:2: binding starts here\n  = note: names are resolved before type checking\n  = help: declare `λ` before this expression\n"
         );
     }
 }

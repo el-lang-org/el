@@ -704,10 +704,28 @@ mod tests {
     }
 
     #[test]
+    fn project_discovery_accepts_only_ell_source_files() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path().join("src")).expect("create source directory");
+        fs::write(
+            temp.path().join(MANIFEST_FILE_NAME),
+            "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps]\n",
+        )
+        .expect("write manifest");
+        fs::write(temp.path().join("src/main.el"), "defmodule Main do\nend\n")
+            .expect("write legacy-extension source");
+
+        let error = run_project_command(ProjectCommand::Check { locked: false }, temp.path())
+            .expect_err("the superseded .el extension must not be discovered");
+
+        assert!(error.to_string().contains("contains no .ell source files"));
+    }
+
+    #[test]
     fn analyzes_the_milestone_two_slice_without_a_backend() {
         let source = "defmodule Main do\n  def main() -> i32 do\n    value: i32 = 40\n    value + 2\n  end\nend\n";
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", source);
+        let file = sources.add_file("src/main.ell", source);
 
         let core = analyze_source(file, source).expect("source reaches verified Generic Core IR");
 
@@ -718,7 +736,7 @@ mod tests {
     fn invalid_source_never_reaches_lowering() {
         let source = "defmodule Main do\n  def main() -> i32 do\n    value = true\n    value + 2\n  end\nend\n";
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", source);
+        let file = sources.add_file("src/main.ell", source);
 
         let diagnostics = analyze_source(file, source).expect_err("type error stops the pipeline");
 
@@ -734,8 +752,8 @@ mod tests {
         let library = "defmodule Library do\n  def answer() -> i32 do\n    42\n  end\nend\n";
         let main = "defmodule Main do\n  def main() -> i32 do\n    Library.answer()\n  end\nend\n";
         let mut sources = SourceMap::new();
-        let library_file = sources.add_file("src/library.el", library);
-        let main_file = sources.add_file("src/main.el", main);
+        let library_file = sources.add_file("src/library.ell", library);
+        let main_file = sources.add_file("src/main.ell", main);
 
         let core = analyze_package_sources(&[(library_file, library), (main_file, main)])
             .expect("package reaches Generic Core IR");
@@ -749,8 +767,8 @@ mod tests {
         let library = "defmodule Library do\n  defp hidden() -> i32 do\n    1\n  end\nend\n";
         let main = "defmodule Main do\n  def main() -> i32 do\n    Library.hidden()\n  end\nend\n";
         let mut sources = SourceMap::new();
-        let library_file = sources.add_file("src/library.el", library);
-        let main_file = sources.add_file("src/main.el", main);
+        let library_file = sources.add_file("src/library.ell", library);
+        let main_file = sources.add_file("src/main.ell", main);
 
         let diagnostics = analyze_package_sources(&[(library_file, library), (main_file, main)])
             .expect_err("private cross-module call is rejected");
@@ -776,7 +794,7 @@ mod tests {
             "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps.dep]\npath = \"dep\"\nversion = \"2.0.0\"\n\n[target]\nmain = \"Main\"\n",
         ).unwrap();
         fs::write(
-            temp.path().join("src/main.el"),
+            temp.path().join("src/main.ell"),
             "defmodule Main do\n  def main() -> i32 do\n    Dep.Utility.answer()\n  end\nend\n",
         )
         .unwrap();
@@ -786,7 +804,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            dependency.join("src/utility.el"),
+            dependency.join("src/utility.ell"),
             "defmodule Utility do\n  def answer() -> i32 do\n    42\n  end\nend\n",
         )
         .unwrap();
@@ -812,7 +830,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            temp.path().join("src/main.el"),
+            temp.path().join("src/main.ell"),
             "defmodule Main do\n  def main() -> i32 do\n    0\n  end\nend\n",
         )
         .unwrap();
@@ -836,7 +854,7 @@ mod tests {
             "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps]\n\n[target]\nmain = \"Command\"\n",
         ).unwrap();
         fs::write(
-            temp.path().join("src/command.el"),
+            temp.path().join("src/command.ell"),
             "defmodule Command do\n  def main() -> i32 do\n    42\n  end\nend\n",
         )
         .unwrap();

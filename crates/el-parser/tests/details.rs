@@ -4,7 +4,7 @@ use el_span::{Location, SourceMap};
 
 fn parsed(source: &str) -> (SourceMap, el_ast::Program) {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let program = parse(file, source).expect("source parses");
     (sources, program)
 }
@@ -53,7 +53,7 @@ fn rejects_invalid_unicode_scalars_and_unrepresentable_array_lengths() {
     ] {
         let source = format!("defmodule Main do\n  def bad() do\n    {fragment}\n  end\nend\n");
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", &source);
+        let file = sources.add_file("src/main.ell", &source);
         assert!(parse(file, &source).is_err(), "accepted {fragment}");
     }
 }
@@ -137,7 +137,7 @@ fn newlines_are_soft_only_at_normative_continuation_points() {
         "defmodule Main do\n  def x() do\n    1 2\n  end\nend\n",
     ] {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", source);
+        let file = sources.add_file("src/main.ell", source);
         assert!(parse(file, source).is_err());
     }
 }
@@ -149,7 +149,7 @@ fn rejects_private_or_malformed_protocol_implementation_members() {
         "defmodule Main do\n  defimpl P, for: T do\n    defp hidden() do\n      unit\n    end\n  end\nend\n",
     ] {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/main.el", source);
+        let file = sources.add_file("src/main.ell", source);
         assert!(parse(file, source).is_err());
     }
 }

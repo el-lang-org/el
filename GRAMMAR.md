@@ -2,7 +2,7 @@
 
 Status: normative version 1 specification
 Language: **EL**
-Last updated: 2026-07-26
+Last updated: 2026-08-01
 
 ## 1. Scope and authority
 
@@ -25,7 +25,7 @@ it. A disagreement between this file and the parser is a compiler bug.
 
 ### 2.1 Source files
 
-- Source file extension: `.el`.
+- Source file extension: `.ell`.
 - Source text is UTF-8.
 - UTF-8 BOMs are not accepted. A physical newline is either LF or CRLF; a bare
   carriage return is invalid. Outside literals, horizontal whitespace is ASCII

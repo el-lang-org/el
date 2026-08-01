@@ -1,4 +1,4 @@
-defmodule TextStats do
+defmodule Analysis.TextStats do
   @derive [Eq, Show]
   defstruct Summary do
     text: string

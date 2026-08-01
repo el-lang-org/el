@@ -11,7 +11,7 @@ use el_types::{EnumVisitKind, Type, TypeId, check};
 
 fn lowered(source: &str) -> el_ir::GenericModule {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let parsed = parse(file, source).expect("fixture parses");
     let resolved = resolve(&parsed).expect("fixture resolves");
     let typed = check(&resolved).expect("fixture type checks");
@@ -24,7 +24,7 @@ fn lowered_package(sources: &[&str]) -> el_ir::GenericModule {
         .iter()
         .enumerate()
         .map(|(index, source)| {
-            let file = source_map.add_file(format!("src/{index}.el"), *source);
+            let file = source_map.add_file(format!("src/{index}.ell"), *source);
             parse(file, source).expect("fixture parses")
         })
         .collect::<Vec<_>>();

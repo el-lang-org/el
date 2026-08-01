@@ -171,7 +171,7 @@ fn build_and_run(
     profile: BuildProfile,
 ) -> ExitStatus {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let generic = analyze_source(file, source).expect("source reaches Generic Core");
     let roots = executable_reachability_roots(&generic).expect("select executable entry");
     let concrete = monomorphize(&generic, &roots).expect("monomorphize executable");
@@ -227,7 +227,7 @@ fn build_managed_executable(
     profile: BuildProfile,
 ) -> PathBuf {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let generic = analyze_source(file, source).expect("source reaches Generic Core");
     let roots = executable_reachability_roots(&generic).expect("select executable entry");
     let concrete = monomorphize(&generic, &roots).expect("monomorphize executable");
@@ -299,12 +299,12 @@ fn milestone_eight_manifest_exit_gate_handles_every_recoverable_file_result() {
     )
     .expect("write project manifest");
     fs::write(
-        temp.0.join("src/transform.el"),
+        temp.0.join("src/transform.ell"),
         "defmodule Transform do\n  def apply(data: bytes) -> bytes do\n    data ++ String.bytes(\"!\")\n  end\nend\n",
     )
     .expect("write transform module");
     fs::write(
-        temp.0.join("src/main.el"),
+        temp.0.join("src/main.ell"),
         "defmodule Main do\n  def close_reader(reader: File.Reader) -> unit do\n    match File.close(reader) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def close_writer(writer: File.Writer) -> unit do\n    match File.close(writer) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def flushed(value: {:ok, unit}) -> bool do\n    true\n  end\n  def wrote(writer: File.Writer, value: {:ok, unit}) -> bool do\n    match Writer.flush(writer) do\n      value: {:ok, unit} -> flushed(value)\n      value: {:error, File.Error} -> false\n    end\n  end\n  def created(data: bytes, value: {:ok, File.Writer}) -> bool do\n    match value do\n      {:ok, writer} ->\n        defer close_writer(writer)\n        match Writer.write(writer, data) do\n          value: {:ok, unit} -> wrote(writer, value)\n          value: {:error, File.Error} -> false\n        end\n    end\n  end\n  def write_data(data: bytes) -> bool do\n    match File.create(\"output.bin\") do\n      value: {:ok, File.Writer} -> created(data, value)\n      value: {:error, File.Error} -> false\n    end\n  end\n  def read_ok(value: {:ok, bytes}) -> bool do\n    match value do {:ok, data} -> write_data(Transform.apply(data)) end\n  end\n  def read_data(reader: File.Reader) -> bool do\n    match Reader.read(reader, 1024) do\n      value: {:ok, bytes} -> read_ok(value)\n      :eof -> write_data(String.bytes(\"!\"))\n      value: {:error, File.Error} -> false\n    end\n  end\n  def opened(value: {:ok, File.Reader}) -> bool do\n    match value do\n      {:ok, reader} ->\n        defer close_reader(reader)\n        read_data(reader)\n    end\n  end\n  def main() -> i32 do\n    success = match File.open_read(\"input.bin\") do\n      value: {:ok, File.Reader} -> opened(value)\n      value: {:error, File.Error} -> false\n    end\n    if success do 42 else 1 end\n  end\nend\n",
     )
     .expect("write main module");
@@ -1232,7 +1232,7 @@ fn managed_allocation_failure_reports_origin_and_skips_cleanup() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def dynamic_divide(left: i32, right: i32) -> i32 do\n    left / right\n  end\n  def cleanup() -> unit do\n    dynamic_divide(1, 0)\n    unit\n  end\n  def main() -> i32 do\n    defer cleanup()\n    values: [i32] = [1]\n    0\n  end\nend\n";
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let generic = analyze_source(file, source).expect("source reaches Generic Core");
     let roots = executable_reachability_roots(&generic).expect("select executable entry");
     let concrete = monomorphize(&generic, &roots).expect("monomorphize executable");

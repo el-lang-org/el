@@ -19,7 +19,7 @@ An EL project has an `el.toml` manifest and source files under `src/`:
 hello/
   el.toml
   src/
-    main.el
+    main.ell
 ```
 
 `el.toml`:
@@ -36,7 +36,7 @@ version = "0.1.0"
 main = "Main"
 ```
 
-`src/main.el`:
+`src/main.ell`:
 
 ```el
 defmodule Main do
@@ -47,7 +47,7 @@ defmodule Main do
 end
 ```
 
-The path `src/main.el` requires the package-relative declaration
+The path `src/main.ell` requires the package-relative declaration
 `defmodule Main`. With the manifest namespace, its fully qualified module name
 is `Hello.Main`. `Main.main() -> i32` is the executable entry point, and its
 result is forwarded as the process exit code. The host operating system may
@@ -934,14 +934,14 @@ its path relative to `src/`:
 
 ```text
 Source path          Required declaration       With namespace "Example"
-src/main.el          defmodule Main              Example.Main
-src/http/client.el   defmodule Http.Client       Example.Http.Client
-src/json_api.el      defmodule JsonApi            Example.JsonApi
-src/foo/index.el     defmodule Foo.Index          Example.Foo.Index
+src/main.ell          defmodule Main              Example.Main
+src/http/client.ell   defmodule Http.Client       Example.Http.Client
+src/json_api.ell      defmodule JsonApi            Example.JsonApi
+src/foo/index.ell     defmodule Foo.Index          Example.Foo.Index
 ```
 
 Path components must be lowercase `snake_case`; each is mechanically converted
-to `PascalCase`. Acronyms and `index.el` receive no special treatment. A module
+to `PascalCase`. Acronyms and `index.ell` receive no special treatment. A module
 cannot span multiple files, and nested module declarations are not supported in
 v1.
 

@@ -3,14 +3,14 @@ use el_span::SourceMap;
 
 fn parses(source: &str) -> bool {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/all.el", source);
+    let file = sources.add_file("src/all.ell", source);
     parse(file, source).is_ok()
 }
 
 fn assert_parses(source: &str) {
     if !parses(source) {
         let mut sources = SourceMap::new();
-        let file = sources.add_file("src/all.el", source);
+        let file = sources.add_file("src/all.ell", source);
         panic!("did not parse: {:?}\n{source}", parse(file, source));
     }
 }
@@ -159,7 +159,7 @@ fn rejects_invalid_source_tokens_and_decodes_utf8_at_the_boundary() {
     }
 
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/bad.el", "");
+    let file = sources.add_file("src/bad.ell", "");
     assert!(parse_bytes(file, b"\xff").is_err());
 }
 
@@ -167,7 +167,7 @@ fn rejects_invalid_source_tokens_and_decodes_utf8_at_the_boundary() {
 fn recovery_collects_boundary_errors_but_never_returns_a_conforming_ast() {
     let source = "defmodule Main do\n  nonsense ???\n  def bad() do\n    @broken\n  end\nend\n";
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let outcome = parse_recovering(file, source);
 
     assert!(outcome.program.is_none());

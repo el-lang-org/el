@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
-    let usage = "usage: compile_source <source.el> <project-root> <package-name> [--release]";
+    let usage = "usage: compile_source <source.ell> <project-root> <package-name> [--release]";
     let source_path = arguments.next().map(PathBuf::from).ok_or(usage)?;
     let project_root = arguments.next().map(PathBuf::from).ok_or(usage)?;
     let package_name = arguments

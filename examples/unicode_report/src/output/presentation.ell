@@ -1,4 +1,4 @@
-defmodule Presentation do
+defmodule Output.Presentation do
   def banner() -> string do
     buffer = Buffer.new()
     titled = Buffer.append_string(buffer, "EL v1")
@@ -16,22 +16,22 @@ defmodule Presentation do
         IO.print("  ")
         IO.print(grapheme)
         IO.print(": ")
-        IO.println(Format.positive_i32(count))
+        IO.println(Output.Format.positive_i32(count))
     end
   end
 
-  def print(summary: TextStats.Summary) -> unit do
+  def print(summary: Analysis.TextStats.Summary) -> unit do
     IO.println(banner())
     IO.println("Input:")
     IO.println(summary.text)
     IO.println("UTF-8 bytes:")
-    IO.println(Format.decimal(summary.byte_count))
+    IO.println(Output.Format.decimal(summary.byte_count))
     IO.println("Unicode code points:")
-    IO.println(Format.decimal(summary.codepoint_count))
+    IO.println(Output.Format.decimal(summary.codepoint_count))
     IO.println("Extended grapheme clusters:")
-    IO.println(Format.decimal(summary.grapheme_count))
+    IO.println(Output.Format.decimal(summary.grapheme_count))
     IO.println("Unique grapheme clusters:")
-    IO.println(Format.decimal(summary.unique_graphemes))
+    IO.println(Output.Format.decimal(summary.unique_graphemes))
     IO.println("Frequency map (first-seen order):")
     Enum.each(summary.frequencies, print_frequency)
   end

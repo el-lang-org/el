@@ -88,7 +88,7 @@ fn source_diagnostics_use_stable_codes_and_package_relative_presentations() {
     )
     .expect("write manifest");
     fs::write(
-        temp.path().join("src/main.el"),
+        temp.path().join("src/main.ell"),
         "defmodule Main do\n  def main() -> i32 do\n    missing\n  end\nend\n",
     )
     .expect("write source");

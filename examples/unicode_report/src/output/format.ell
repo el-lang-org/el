@@ -1,4 +1,4 @@
-defmodule Format do
+defmodule Output.Format do
   def append_digits(buffer: Buffer, value: usize) -> Buffer do
     if value >= 10 do
       prefix = append_digits(buffer, value / 10)

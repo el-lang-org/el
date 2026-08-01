@@ -808,7 +808,7 @@ fn discover_sources(root: &Path) -> Result<Vec<SourceModule>, PackageError> {
     }
     if modules.is_empty() {
         return Err(PackageError::Source(format!(
-            "`{}` contains no .el source files",
+            "`{}` contains no .ell source files",
             source_root.display()
         )));
     }
@@ -835,7 +835,7 @@ fn collect_el_files(directory: &Path, output: &mut Vec<PathBuf>) -> Result<(), P
             && entry
                 .path()
                 .extension()
-                .is_some_and(|extension| extension == "el")
+                .is_some_and(|extension| extension == "ell")
         {
             output.push(entry.path());
         }
@@ -854,7 +854,7 @@ fn module_name_from_path(path: &Path) -> Result<String, PackageError> {
         let text = value.to_str().ok_or_else(|| {
             PackageError::Source(format!("source path `{}` is not Unicode", path.display()))
         })?;
-        let stem = text.strip_suffix(".el").unwrap_or(text);
+        let stem = text.strip_suffix(".ell").unwrap_or(text);
         if stem.is_empty()
             || stem.split('_').any(|part| {
                 part.is_empty()
@@ -955,9 +955,9 @@ mod tests {
     #[test]
     fn path_mapping_is_mechanical() {
         assert_eq!(
-            module_name_from_path(Path::new("http/json_api.el")).unwrap(),
+            module_name_from_path(Path::new("http/json_api.ell")).unwrap(),
             "Http.JsonApi"
         );
-        assert!(module_name_from_path(Path::new("Bad.el")).is_err());
+        assert!(module_name_from_path(Path::new("Bad.ell")).is_err());
     }
 }

@@ -5,7 +5,7 @@ use el_types::{Type, TypeId, TypedExprKind, check, verify};
 
 fn checked(source: &str) -> Result<el_types::TypedProgram, Vec<el_span::Diagnostic>> {
     let mut sources = SourceMap::new();
-    let file = sources.add_file("src/main.el", source);
+    let file = sources.add_file("src/main.ell", source);
     let parsed = parse(file, source).expect("fixture parses");
     let resolved = resolve(&parsed).expect("fixture resolves");
     check(&resolved)
@@ -17,7 +17,7 @@ fn checked_package(sources: &[&str]) -> Result<el_types::TypedProgram, Vec<el_sp
         .iter()
         .enumerate()
         .map(|(index, source)| {
-            let file = source_map.add_file(format!("src/{index}.el"), *source);
+            let file = source_map.add_file(format!("src/{index}.ell"), *source);
             parse(file, source).expect("fixture parses")
         })
         .collect::<Vec<_>>();

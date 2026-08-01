@@ -1,11 +1,11 @@
 error: compilation failed
 error[E2107]: unknown value `missing`
- --> src/main.el:3:5
+ --> src/main.ell:3:5
   |
 3 |     missing
   |     ^^^^^^^
 error[E2113]: expected `i32`, found `unit`
- --> src/main.el:2:23
+ --> src/main.ell:2:23
   |
 2 |   def main() -> i32 do
   |                       ^

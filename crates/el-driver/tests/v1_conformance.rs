@@ -66,7 +66,7 @@ fn fixture_paths(root: &Path) -> Vec<PathBuf> {
     for directory in [root.join("accept"), root.join("reject")] {
         for entry in fs::read_dir(directory).expect("read fixture directory") {
             let path = entry.expect("read fixture entry").path();
-            if path.extension().is_some_and(|extension| extension == "el") {
+            if path.extension().is_some_and(|extension| extension == "ell") {
                 paths.push(path);
             }
         }
