@@ -1109,7 +1109,7 @@ operators, and generic traversal.
   `Show`, and `Hash` when all field constraints hold.
 - [x] `for` lowering through one statically selected `Iterable` implementation,
   immutable cursors, associated `Item`, and irrefutable patterns.
-- [ ] Protocol lowering for nonprimitive equality/ordering and `++`.
+- [x] Protocol lowering for nonprimitive equality/ordering and `++`.
 - [x] Complete `Enum` APIs with deterministic traversal and short-circuit behavior.
 
 **Tests**
@@ -1119,13 +1119,13 @@ operators, and generic traversal.
 - [x] Concrete dispatch at multiple instantiations, projection normalization,
   specialization reuse, and defensive post-substitution checks.
 - [x] Derivation success/failure for generic and nested structs.
-- [ ] `Eq`/`Ord`/`Hash` law tests for standard implementations.
+- [x] `Eq`/`Ord`/`Hash` law tests for standard implementations.
 - [x] Every standard iteration order, map tuple order, cursor threading, and
   irrefutable/refutable `for` patterns, including zero-based `Enum.at` hits and
   misses plus bounded traversal through the requested position.
-- [ ] Concatenation for `string`, `bytes`, `bits`, and lists.
+- [x] Concatenation for `string`, `bytes`, `bits`, and lists.
 
-- [ ] **Exit gate:** derive protocols for a generic struct, instantiate constrained
+- [x] **Exit gate:** derive protocols for a generic struct, instantiate constrained
   generic functions at several concrete types, iterate multiple container types,
   and concatenate every standard `Concat` type.
 
@@ -1141,9 +1141,29 @@ that evaluates the source once, threads the cursor as a block parameter, project
 the associated item, and rejects refutable patterns. `Concat` type checking covers
 strings, bytes, bits, and lists; bytes desugar through immutable buffer operations,
 lists lower to an order-preserving CFG, and managed LLVM string concatenation roots
-its operands across allocation. The remaining unchecked items require law-focused
-standard implementation tests plus complete nonprimitive ordering/concatenation
-backend coverage and the combined native exit gate.
+its operands across allocation. Managed LLVM bit concatenation copies arbitrary
+unaligned views into a fresh packed value, and native GC-stress regressions cover
+all four standard concatenation types in development and release. Standard and
+derived structural equality, hashing, and lexicographic ordering lower through
+LLVM; native development/release GC-stress regressions exercise the `Eq`
+equivalence laws,
+`Ord` total-order and equality-consistency laws, and equal-key `Hash` behavior.
+Explicit implementation methods now receive stable hidden declaration identities,
+retain their bodies through resolution, are checked as ordinary typed functions,
+and remain linked from implementation metadata through verified Generic Core.
+Concrete `Eq`, `Ord`, and `Concat` operators select those identities as ordinary
+reachable calls, including boolean adaptation for `!=` and atom-union adaptation
+for all four ordered comparisons. Operators inside constrained generic functions
+defer selection until substitution during monomorphization; selected method bodies
+join deterministic reachability and generic implementation heads reuse distinct
+specializations by concrete arguments. Native development/release GC-stress
+regressions execute direct and constrained explicit dispatch.
+
+The combined Milestone 7 native exit program derives `Eq`, `Ord`, and `Hash` for a
+generic struct, instantiates constrained functions at several standard and nominal
+types, traverses lists, arrays, slices, bytes, and maps, and concatenates strings,
+bytes, arbitrary bit views, and lists. It passes in development and release under
+collection at every allocation. This completes Milestone 7.
 
 ### Milestone 8 — Packages, I/O, and standard library
 

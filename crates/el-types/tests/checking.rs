@@ -719,6 +719,56 @@ fn explicit_local_protocol_implementations_satisfy_generic_constraints() {
 }
 
 #[test]
+fn checks_implementation_method_bodies_as_hidden_typed_functions() {
+    let source = "defmodule Main do\n  defprotocol Render do\n    def render(value: Self) -> i32\n  end\n  defimpl Render, for: i32 do\n    def render(value: i32) -> i32 do\n      value + 1\n    end\n  end\n  def main() -> i32 do\n    0\n  end\nend\n";
+    let typed = checked(source).expect("implementation method body checks");
+    let implementation = &typed.implementations[0];
+    assert_eq!(implementation.method_declarations.len(), 1);
+    let method = implementation.method_declarations[0].1;
+    assert!(typed.functions.iter().any(|function| function.id == method));
+    verify(&typed).expect("hidden implementation method Typed AST verifies");
+
+    let invalid = source.replace("value + 1", "true");
+    let diagnostics = checked(&invalid).expect_err("invalid implementation body is rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2113")
+    );
+}
+
+#[test]
+fn dispatches_concrete_core_protocol_operators_to_explicit_methods() {
+    let source = "defmodule Main do\n  defstruct Score do\n    value: i32\n  end\n  defimpl Eq, for: Score do\n    def eq(left: Score, right: Score) -> bool do\n      left.value == right.value\n    end\n  end\n  defimpl Ord, for: Score do\n    def compare(left: Score, right: Score) -> :less | :equal | :greater do\n      if left.value < right.value do\n        :less\n      else\n        if left.value > right.value do\n          :greater\n        else\n          :equal\n        end\n      end\n    end\n  end\n  defimpl Concat, for: Score do\n    def concat(left: Score, right: Score) -> Score do\n      %Score{value: left.value + right.value}\n    end\n  end\n  def main() -> bool do\n    one = %Score{value: 1}\n    two = %Score{value: 2}\n    sum = one ++ two\n    one == one and one != two and one < two and one <= two and two > one and two >= one and sum.value == 3\n  end\nend\n";
+    let typed = checked(source).expect("explicit core protocol methods dispatch");
+    let tree = typed.debug_tree();
+    let method = |implementation: usize, name: &str| {
+        typed.implementations[implementation]
+            .method_declarations
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .expect("method declaration")
+            .1
+    };
+    assert!(
+        tree.matches(&format!("call d{}", method(0, "eq").0))
+            .count()
+            >= 2
+    );
+    assert!(
+        tree.matches(&format!("call d{}", method(1, "compare").0))
+            .count()
+            >= 4
+    );
+    assert_eq!(
+        tree.matches(&format!("call d{}", method(2, "concat").0))
+            .count(),
+        1
+    );
+    verify(&typed).expect("dispatched Typed AST verifies");
+}
+
+#[test]
 fn checks_concat_for_every_standard_protocol_type() {
     let source = "defmodule Main do\n  def main() -> bool do\n    left: [i32] = [1]\n    right: [i32] = [2]\n    data = Bytes.from_list([65])\n    bits = Bytes.to_bits(data)\n    \"a\" ++ \"b\" == \"ab\" and Bytes.byte_size(data ++ data) == 2 and Bits.bit_size(bits ++ bits) == 16 and left ++ right == [1, 2]\n  end\nend\n";
     let typed = checked(source).expect("all standard Concat types check");

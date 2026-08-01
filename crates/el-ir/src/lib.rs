@@ -70,6 +70,7 @@ pub struct CoreImplementation {
     pub target: TypeId,
     pub associated_types: Vec<(String, TypeId)>,
     pub methods: Vec<String>,
+    pub method_declarations: Vec<(String, DeclId)>,
     pub constraints: Vec<(TypeId, String)>,
     pub origin: Span,
 }
@@ -516,6 +517,19 @@ pub enum Operation {
         operand_ty: TypeId,
         origin: Span,
     },
+    /// A comparison whose explicit protocol method was selected while
+    /// specializing Generic Core. This operation is forbidden in Generic Core
+    /// and carries a fully specialized concrete function identity.
+    ProtocolCompare {
+        result: ValueId,
+        operator: ComparisonOperator,
+        left: ValueId,
+        right: ValueId,
+        operand_ty: TypeId,
+        function: FunctionId,
+        method_result_ty: TypeId,
+        origin: Span,
+    },
     FunctionRef {
         result: ValueId,
         function: FunctionId,
@@ -731,6 +745,7 @@ pub fn lower(program: &TypedProgram) -> GenericModule {
                 target: implementation.target,
                 associated_types: implementation.associated_types.clone(),
                 methods: implementation.methods.clone(),
+                method_declarations: implementation.method_declarations.clone(),
                 constraints: implementation.constraints.clone(),
                 origin: implementation.span,
             })
@@ -3178,7 +3193,10 @@ pub enum CollectionEffect {
 pub const fn operation_collection_effect(operation: &Operation) -> CollectionEffect {
     if matches!(
         operation,
-        Operation::Call { .. } | Operation::IndirectCall { .. } | Operation::EnumVisit { .. }
+        Operation::Call { .. }
+            | Operation::ProtocolCompare { .. }
+            | Operation::IndirectCall { .. }
+            | Operation::EnumVisit { .. }
     ) || matches!(operation, Operation::List { elements, .. } if !elements.is_empty())
         || matches!(operation, Operation::Map { entries, .. } if !entries.is_empty())
         || matches!(
@@ -3591,7 +3609,8 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         | Operation::FloatArithmetic { left, right, .. }
         | Operation::IntegerBinary { left, right, .. }
         | Operation::Concat { left, right, .. }
-        | Operation::Compare { left, right, .. } => {
+        | Operation::Compare { left, right, .. }
+        | Operation::ProtocolCompare { left, right, .. } => {
             live.values.insert(*left);
             live.values.insert(*right);
         }
@@ -3672,6 +3691,7 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::WrappingInteger { result, .. }
         | Operation::Concat { result, .. }
         | Operation::Compare { result, .. }
+        | Operation::ProtocolCompare { result, .. }
         | Operation::FunctionRef { result, .. }
         | Operation::Call { result, .. }
         | Operation::IndirectCall { result, .. }
@@ -3988,6 +4008,33 @@ impl<'a> Monomorphizer<'a> {
                             .ok_or(MonomorphizationError::UnknownFunction(*function))?;
                         pending.insert(self.call_key(called, substitutions, &substitution)?);
                     }
+                    let selected = match operation {
+                        Operation::Compare {
+                            operand_ty,
+                            operator,
+                            ..
+                        } => {
+                            let protocol = if matches!(
+                                operator,
+                                ComparisonOperator::Equal | ComparisonOperator::NotEqual
+                            ) {
+                                "Eq"
+                            } else {
+                                "Ord"
+                            };
+                            let method = if protocol == "Eq" { "eq" } else { "compare" };
+                            let concrete = self.normalize(*operand_ty, &substitution)?;
+                            self.explicit_method_key(&concrete, protocol, method)?
+                        }
+                        Operation::Concat { ty, .. } => {
+                            let concrete = self.normalize(*ty, &substitution)?;
+                            self.explicit_method_key(&concrete, "Concat", "concat")?
+                        }
+                        _ => None,
+                    };
+                    if let Some(key) = selected {
+                        pending.insert(key);
+                    }
                 }
             }
         }
@@ -4079,6 +4126,76 @@ impl<'a> Monomorphizer<'a> {
             declaration: called.declaration,
             substitution,
         })
+    }
+
+    fn explicit_method_key(
+        &self,
+        concrete: &NormalizedType,
+        protocol: &str,
+        method: &str,
+    ) -> Result<Option<FunctionSpecializationKey>, MonomorphizationError> {
+        for implementation in &self.module.implementations {
+            if implementation.protocol != protocol {
+                continue;
+            }
+            let mut implementation_substitution = BTreeMap::new();
+            if !self.match_implementation_target(
+                implementation.target,
+                concrete,
+                &mut implementation_substitution,
+            )? {
+                continue;
+            }
+            let mut constraints_hold = true;
+            for (parameter, required) in &implementation.constraints {
+                let concrete = self.normalize(*parameter, &implementation_substitution)?;
+                if !self.concrete_type_satisfies(&concrete, required, &mut BTreeSet::new())? {
+                    constraints_hold = false;
+                    break;
+                }
+            }
+            if !constraints_hold {
+                continue;
+            }
+            let Some((_, declaration)) = implementation
+                .method_declarations
+                .iter()
+                .find(|(name, _)| name == method)
+            else {
+                continue;
+            };
+            let called = self
+                .functions_by_decl
+                .get(declaration)
+                .copied()
+                .ok_or(MonomorphizationError::UnknownDeclaration(*declaration))?;
+            let mut substitution = Vec::with_capacity(called.type_parameters.len());
+            for parameter in &called.type_parameters {
+                let name = match self.module.types.get(parameter.0 as usize) {
+                    Some(Type::Parameter { name, .. }) => name,
+                    _ => return Err(MonomorphizationError::InvalidType(*parameter)),
+                };
+                let argument = implementation_substitution
+                    .iter()
+                    .find_map(|(implementation_parameter, argument)| {
+                        matches!(
+                            self.module.types.get(implementation_parameter.0 as usize),
+                            Some(Type::Parameter { name: candidate, .. }) if candidate == name
+                        )
+                        .then_some(argument.clone())
+                    })
+                    .ok_or(MonomorphizationError::MissingSubstitution {
+                        declaration: called.declaration,
+                        parameter: *parameter,
+                    })?;
+                substitution.push((*parameter, argument));
+            }
+            return Ok(Some(FunctionSpecializationKey {
+                declaration: called.declaration,
+                substitution,
+            }));
+        }
+        Ok(None)
     }
 
     fn discover_function_layouts(
@@ -4541,7 +4658,6 @@ impl<'a> Monomorphizer<'a> {
             | Operation::IntegerUnary { ty, .. }
             | Operation::IntegerBinary { ty, .. }
             | Operation::WrappingInteger { ty, .. }
-            | Operation::Concat { ty, .. }
             | Operation::Load { ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
             }
@@ -4572,8 +4688,65 @@ impl<'a> Monomorphizer<'a> {
                 *function_ty = self.materialize_type(*function_ty, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
             }
-            Operation::Compare { operand_ty, .. } => {
-                *operand_ty = self.materialize_type(*operand_ty, substitution)?;
+            Operation::Concat {
+                result,
+                left,
+                right,
+                ty,
+                origin,
+            } => {
+                let concrete = self.normalize(*ty, substitution)?;
+                if let Some(key) = self.explicit_method_key(&concrete, "Concat", "concat")? {
+                    *operation = Operation::Call {
+                        result: *result,
+                        function: ids[&key],
+                        substitutions: Vec::new(),
+                        arguments: vec![*left, *right],
+                        ty: self.intern_normalized(&concrete),
+                        origin: *origin,
+                    };
+                } else {
+                    *ty = self.intern_normalized(&concrete);
+                }
+            }
+            Operation::Compare {
+                result,
+                operator,
+                left,
+                right,
+                operand_ty,
+                origin,
+            } => {
+                let concrete = self.normalize(*operand_ty, substitution)?;
+                let (protocol, method) = if matches!(
+                    operator,
+                    ComparisonOperator::Equal | ComparisonOperator::NotEqual
+                ) {
+                    ("Eq", "eq")
+                } else {
+                    ("Ord", "compare")
+                };
+                if let Some(key) = self.explicit_method_key(&concrete, protocol, method)? {
+                    let called = self.function_for_key(&key)?;
+                    let method_substitution =
+                        key.substitution.iter().cloned().collect::<BTreeMap<_, _>>();
+                    let method_result = self.normalize(called.result, &method_substitution)?;
+                    *operation = Operation::ProtocolCompare {
+                        result: *result,
+                        operator: *operator,
+                        left: *left,
+                        right: *right,
+                        operand_ty: self.intern_normalized(&concrete),
+                        function: ids[&key],
+                        method_result_ty: self.intern_normalized(&method_result),
+                        origin: *origin,
+                    };
+                } else {
+                    *operand_ty = self.intern_normalized(&concrete);
+                }
+            }
+            Operation::ProtocolCompare { .. } => {
+                unreachable!("ProtocolCompare is produced only while specializing Generic Core")
             }
             Operation::Bitstring { segments, ty, .. } => {
                 *ty = self.materialize_type(*ty, substitution)?;
@@ -4994,6 +5167,11 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
             output.extend([*source_ty, *function_ty, *ty]);
         }
         Operation::Compare { operand_ty, .. } => output.push(*operand_ty),
+        Operation::ProtocolCompare {
+            operand_ty,
+            method_result_ty,
+            ..
+        } => output.extend([*operand_ty, *method_result_ty]),
         Operation::Bitstring { segments, ty, .. } => {
             output.push(*ty);
             output.extend(segments.iter().filter_map(|segment| match segment {
@@ -5300,9 +5478,9 @@ pub fn verify_concrete(module: &ConcreteModule) -> Result<(), Vec<String>> {
                 .operations
                 .iter()
                 .filter_map(|operation| match operation {
-                    Operation::Call { function, .. } | Operation::FunctionRef { function, .. } => {
-                        Some(*function)
-                    }
+                    Operation::Call { function, .. }
+                    | Operation::ProtocolCompare { function, .. }
+                    | Operation::FunctionRef { function, .. } => Some(*function),
                     _ => None,
                 })
         }) {
@@ -5420,7 +5598,8 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::UnionInject { result, ty, .. }
                     | Operation::UnionProject { result, ty, .. }
                     | Operation::Load { result, ty, .. } => Some((*result, *ty)),
-                    Operation::Compare { result, .. } => Some((*result, TypeId(2))),
+                    Operation::Compare { result, .. }
+                    | Operation::ProtocolCompare { result, .. } => Some((*result, TypeId(2))),
                     Operation::BitstringPatternCheck { .. } | Operation::Store { .. } => None,
                 })
         }))
@@ -5520,6 +5699,32 @@ pub fn verify(module: &GenericModule) -> Result<(), Vec<String>> {
             if ty.0 >= type_count {
                 errors.push(format!(
                     "implementation {:?} has unknown associated type",
+                    implementation.id
+                ));
+            }
+        }
+        let mut method_names = BTreeSet::new();
+        let mut method_declarations = BTreeSet::new();
+        for (name, declaration) in &implementation.method_declarations {
+            if !implementation.methods.contains(name) {
+                errors.push(format!(
+                    "implementation {:?} references unknown method `{name}`",
+                    implementation.id
+                ));
+            }
+            if !method_names.insert(name) || !method_declarations.insert(declaration) {
+                errors.push(format!(
+                    "implementation {:?} contains duplicate method metadata",
+                    implementation.id
+                ));
+            }
+            if !module
+                .functions
+                .iter()
+                .any(|function| function.declaration == *declaration)
+            {
+                errors.push(format!(
+                    "implementation {:?} references missing method declaration {declaration:?}",
                     implementation.id
                 ));
             }
@@ -7058,17 +7263,66 @@ fn verify_operation(
                 ComparisonOperator::Equal | ComparisonOperator::NotEqual
             );
             let protocol = if ordered { "Ord" } else { "Eq" };
-            let supported =
-                type_supports_protocol(types, structs, constraints, *operand_ty, protocol)
-                    || matches!(
-                        types.get(operand_ty.0 as usize),
-                        Some(Type::F32 | Type::F64)
-                    );
+            let supported = type_supports_protocol(
+                types,
+                structs,
+                constraints,
+                *operand_ty,
+                protocol,
+            ) || (!ordered
+                && matches!(types.get(operand_ty.0 as usize), Some(Type::Union(members))
+                            if members.iter().all(|member| matches!(types.get(member.0 as usize), Some(Type::Atom(_))))))
+                || matches!(
+                    types.get(operand_ty.0 as usize),
+                    Some(Type::F32 | Type::F64)
+                );
             if values.get(left) != Some(operand_ty)
                 || values.get(right) != Some(operand_ty)
                 || !supported
             {
                 errors.push(format!("comparison result {result:?} has invalid operands"));
+            }
+            define(*result, TypeId(2), values, errors);
+        }
+        Operation::ProtocolCompare {
+            result,
+            operator,
+            left,
+            right,
+            operand_ty,
+            function,
+            method_result_ty,
+            ..
+        } => {
+            let exact = signatures
+                .get(function)
+                .is_some_and(|(parameters, result)| {
+                    parameters.as_slice() == [*operand_ty, *operand_ty]
+                        && result == method_result_ty
+                });
+            let result_shape = if matches!(
+                operator,
+                ComparisonOperator::Equal | ComparisonOperator::NotEqual
+            ) {
+                *method_result_ty == TypeId(2)
+            } else {
+                matches!(types.get(method_result_ty.0 as usize), Some(Type::Union(members)) if {
+                    ["less", "equal", "greater"].iter().all(|required| {
+                        members.iter().any(|member| matches!(
+                            types.get(member.0 as usize),
+                            Some(Type::Atom(name)) if name == required
+                        ))
+                    })
+                })
+            };
+            if values.get(left) != Some(operand_ty)
+                || values.get(right) != Some(operand_ty)
+                || !exact
+                || !result_shape
+            {
+                errors.push(format!(
+                    "protocol comparison result {result:?} has an invalid selected method"
+                ));
             }
             define(*result, TypeId(2), values, errors);
         }
@@ -7616,15 +7870,144 @@ fn derived_struct_supports(
     ty: TypeId,
     protocol: &str,
 ) -> bool {
-    let Some(Type::Struct { declaration, .. }) = types.get(ty.0 as usize) else {
+    let Some(Type::Struct {
+        declaration,
+        arguments,
+    }) = types.get(ty.0 as usize)
+    else {
         return false;
     };
     structs.get(declaration).is_some_and(|structure| {
+        let substitutions = structure
+            .parameters
+            .iter()
+            .copied()
+            .zip(arguments.iter().copied())
+            .collect::<BTreeMap<_, _>>();
         structure.derives.iter().any(|derived| derived == protocol)
             && structure.fields.iter().all(|(_, field)| {
-                type_supports_protocol(types, structs, constraints, *field, protocol)
+                substituted_type_supports_protocol(
+                    types,
+                    structs,
+                    constraints,
+                    *field,
+                    protocol,
+                    &substitutions,
+                    &mut BTreeSet::new(),
+                )
             })
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn substituted_type_supports_protocol(
+    types: &[Type],
+    structs: &BTreeMap<DeclId, &CoreStruct>,
+    constraints: &[(TypeId, String)],
+    ty: TypeId,
+    protocol: &str,
+    substitutions: &BTreeMap<TypeId, TypeId>,
+    visiting: &mut BTreeSet<TypeId>,
+) -> bool {
+    if let Some(substituted) = substitutions.get(&ty).copied()
+        && substituted != ty
+    {
+        return substituted_type_supports_protocol(
+            types,
+            structs,
+            constraints,
+            substituted,
+            protocol,
+            substitutions,
+            visiting,
+        );
+    }
+    if constraints
+        .iter()
+        .any(|(parameter, required)| *parameter == ty && required == protocol)
+    {
+        return true;
+    }
+    if !visiting.insert(ty) {
+        return true;
+    }
+    let satisfied = match types.get(ty.0 as usize) {
+        Some(Type::List(item) | Type::Slice(item)) => substituted_type_supports_protocol(
+            types,
+            structs,
+            constraints,
+            *item,
+            protocol,
+            substitutions,
+            visiting,
+        ),
+        Some(Type::Array { item, .. }) => substituted_type_supports_protocol(
+            types,
+            structs,
+            constraints,
+            *item,
+            protocol,
+            substitutions,
+            visiting,
+        ),
+        Some(Type::Tuple(items)) => items.iter().all(|item| {
+            substituted_type_supports_protocol(
+                types,
+                structs,
+                constraints,
+                *item,
+                protocol,
+                substitutions,
+                visiting,
+            )
+        }),
+        Some(Type::Map { key, value }) if protocol == "Eq" => {
+            standard_hash_type(types, substitutions.get(key).copied().unwrap_or(*key))
+                && substituted_type_supports_protocol(
+                    types,
+                    structs,
+                    constraints,
+                    *value,
+                    protocol,
+                    substitutions,
+                    visiting,
+                )
+        }
+        Some(Type::Struct {
+            declaration,
+            arguments,
+        }) => structs.get(declaration).is_some_and(|structure| {
+            if !structure.derives.iter().any(|derived| derived == protocol) {
+                return false;
+            }
+            let mut nested = substitutions.clone();
+            nested.extend(
+                structure
+                    .parameters
+                    .iter()
+                    .copied()
+                    .zip(arguments.iter().copied()),
+            );
+            structure.fields.iter().all(|(_, field)| {
+                substituted_type_supports_protocol(
+                    types,
+                    structs,
+                    constraints,
+                    *field,
+                    protocol,
+                    &nested,
+                    visiting,
+                )
+            })
+        }),
+        _ => match protocol {
+            "Eq" => standard_eq_type(types, ty),
+            "Ord" => standard_ord_type(types, ty),
+            _ => false,
+        },
+    };
+    visiting.remove(&ty);
+    satisfied
 }
 
 fn standard_ord_type(types: &[Type], ty: TypeId) -> bool {
@@ -8289,6 +8672,18 @@ fn display_operation(operation: &Operation) -> String {
         } => format!(
             "v{} = compare.{operator:?} v{}, v{}: t{} -> t2",
             result.0, left.0, right.0, operand_ty.0
+        ),
+        Operation::ProtocolCompare {
+            result,
+            operator,
+            left,
+            right,
+            operand_ty,
+            function,
+            ..
+        } => format!(
+            "v{} = protocol_compare.{operator:?} f{}(v{}, v{}): t{} -> t2",
+            result.0, function.0, left.0, right.0, operand_ty.0
         ),
         Operation::FunctionRef {
             result,

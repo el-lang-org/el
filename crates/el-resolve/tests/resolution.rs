@@ -119,6 +119,13 @@ fn collects_and_validates_complete_user_implementation_metadata() {
     let source = "defmodule Main do\n  defstruct Box do\n    value: i64\n  end\n  defprotocol Render do\n    type Output\n    def render(value: Box) -> i64\n  end\n  defimpl Render, for: Box do\n    type Output = i64\n    def render(value: Box) -> i64 do\n      0\n    end\n  end\nend\n";
     let program = resolve(&parsed(source)).expect("complete implementation resolves");
     assert_eq!(program.implementations.len(), 1);
+    let method = program.implementations[0].method_declarations[0].1;
+    assert!(
+        program
+            .functions
+            .iter()
+            .any(|function| function.id == method)
+    );
     assert!(program.debug_tree().contains("impl i0 Render for Box"));
 
     let incomplete = source.replace("    type Output = i64\n", "");

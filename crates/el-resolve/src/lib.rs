@@ -152,6 +152,7 @@ pub struct Implementation {
     pub target: TypeSyntax,
     pub associated_types: Vec<(String, TypeSyntax)>,
     pub methods: Vec<String>,
+    pub method_declarations: Vec<(String, DeclId)>,
     pub constraints: Vec<Constraint>,
     pub span: Span,
 }
@@ -283,6 +284,23 @@ pub fn resolve_package(programs: &[Program]) -> Result<Vec<ResolvedProgram>, Vec
         };
         let module_name = path_name(name_node);
         for node in &module.children {
+            if node.kind.as_str() == "protocol_impl" {
+                for method in node
+                    .children
+                    .iter()
+                    .filter(|item| item.kind.as_str() == "function_decl")
+                {
+                    let Some(name) = child(method, "identifier").map(text) else {
+                        continue;
+                    };
+                    catalog.insert(
+                        format!("{module_name}.<impl@{}>.{name}", node.span.start()),
+                        (DeclId(next), method.span, 0),
+                    );
+                    next += 1;
+                }
+                continue;
+            }
             if !matches!(
                 node.kind.as_str(),
                 "type_alias" | "struct_decl" | "protocol_decl" | "function_decl"
@@ -734,7 +752,7 @@ fn resolve_with_catalog(
         if let Some(return_type) = &return_type {
             collect_type_parameter(return_type, &mut type_parameters);
         }
-        let constraints = node
+        let constraints: Vec<Constraint> = node
             .children
             .iter()
             .find(|child| child.kind.as_str() == "when_clause")
@@ -885,7 +903,7 @@ fn resolve_with_catalog(
         impl_heads.push((protocol_name.clone(), target.clone(), node.span));
         let mut target_parameters = Vec::new();
         collect_type_parameter(&target, &mut target_parameters);
-        let constraints = node
+        let constraints: Vec<Constraint> = node
             .children
             .iter()
             .find(|child| child.kind.as_str() == "when_clause")
@@ -924,6 +942,7 @@ fn resolve_with_catalog(
         let mut associated_types = Vec::new();
         let mut associated_names = BTreeMap::new();
         let mut methods = Vec::new();
+        let mut method_declarations = Vec::new();
         let mut method_names = BTreeMap::new();
         for item in &node.children {
             match item.kind.as_str() {
@@ -960,6 +979,86 @@ fn resolve_with_catalog(
                 }
                 _ => {}
             }
+        }
+        for method in node
+            .children
+            .iter()
+            .filter(|item| item.kind.as_str() == "function_decl")
+        {
+            let name_node = child(method, "identifier").expect("implementation method name");
+            let protocol_method_name = text(name_node);
+            let catalog_name = format!(
+                "{module_name}.<impl@{}>.{protocol_method_name}",
+                node.span.start()
+            );
+            let id = catalog.get(&catalog_name).map_or_else(
+                || {
+                    let id = DeclId(next_declaration);
+                    next_declaration += 1;
+                    id
+                },
+                |entry| entry.0,
+            );
+            let mut parameters = Vec::new();
+            let mut parameter_names = BTreeMap::<String, Span>::new();
+            for parameter in method
+                .children
+                .iter()
+                .filter(|candidate| candidate.kind.as_str() == "parameter")
+            {
+                let parameter_name_node =
+                    child(parameter, "identifier").expect("implementation parameter name");
+                let parameter_name = text(parameter_name_node);
+                if let Some(previous) =
+                    parameter_names.insert(parameter_name.clone(), parameter_name_node.span)
+                {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "E2002",
+                            parameter_name_node.span,
+                            format!("duplicate parameter `{parameter_name}`"),
+                        )
+                        .with_label(previous, "first declared here"),
+                    );
+                    continue;
+                }
+                let Some(type_node) = parameter.children.get(1) else {
+                    continue;
+                };
+                if let Some(ty) = parse_type(type_node, &type_names, &module_name, &mut diagnostics)
+                {
+                    parameters.push(Parameter {
+                        symbol: SymbolId(next_symbol),
+                        name: parameter_name,
+                        name_span: parameter_name_node.span,
+                        ty,
+                    });
+                    next_symbol += 1;
+                }
+            }
+            let return_type = method
+                .children
+                .iter()
+                .find(|candidate| candidate.kind.as_str() == "return_type")
+                .and_then(|result| result.children.first())
+                .and_then(|result| parse_type(result, &type_names, &module_name, &mut diagnostics));
+            let body = child(method, "block")
+                .expect("implementation method has a body")
+                .clone();
+            functions.push(Function {
+                id,
+                name: format!("<impl{index}>.{protocol_method_name}"),
+                name_span: name_node.span,
+                span: method.span,
+                visibility: Visibility::Private,
+                module_name: module_name.clone(),
+                parameters,
+                return_type,
+                type_parameters: target_parameters.clone(),
+                constraints: constraints.clone(),
+                body,
+            });
+            method_declarations.push((protocol_method_name, id));
         }
         if let Some(protocol) = protocol_metadata.get(&protocol_name) {
             for required in &protocol.associated_types {
@@ -1072,6 +1171,7 @@ fn resolve_with_catalog(
             target,
             associated_types,
             methods,
+            method_declarations,
             constraints,
             span: node.span,
         });

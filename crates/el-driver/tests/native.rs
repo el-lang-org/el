@@ -267,6 +267,102 @@ fn named_function_values_call_indirectly_in_both_gc_stress_profiles() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn every_standard_concat_type_runs_in_both_gc_stress_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def main() -> i32 do\n    data = Bytes.from_list([65])\n    source = Bytes.to_bits(Bytes.from_list([178]))\n    left_bits = Bits.slice(source, 1, 3)\n    right_bits = Bits.slice(source, 5, 3)\n    expected_bits = Bits.slice(Bytes.to_bits(Bytes.from_list([104])), 0, 6)\n    left_list: [i32] = [1, 2]\n    right_list: [i32] = [3, 4]\n    if \"left\" ++ \"right\" == \"leftright\" and data ++ data == Bytes.from_list([65, 65]) and left_bits ++ right_bits == expected_bits and left_list ++ right_list == [1, 2, 3, 4] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-standard-concat"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "all standard Concat implementations preserve content in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn standard_and_derived_eq_ord_hash_laws_hold_in_both_gc_stress_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  @derive [Eq, Ord, Hash]\n  defstruct Pair(a) do\n    first: a\n    second: a\n  end\n  def main() -> i32 do\n    a = %Pair{first: 1, second: 2}\n    a_copy = %Pair{first: 1, second: 2}\n    a_third = %Pair{first: 1, second: 2}\n    b = %Pair{first: 1, second: 3}\n    c = %Pair{first: 2, second: 0}\n    keys: Map(Pair(i64), i32) = %{a => 1, a_copy => 2}\n    small_a: Pair(i32) = %Pair{first: 1, second: 2}\n    small_b: Pair(i32) = %Pair{first: 1, second: 3}\n    small_keys: Map(Pair(i32), i32) = %{small_a => 1, small_a => 2}\n    left_array: [i32; 2] = #[1, 2]\n    right_array: [i32; 2] = #[1, 3]\n    left_slice = Slice.from_array(left_array)\n    right_slice = Slice.from_array(right_array)\n    left_bits = Bits.slice(Bytes.to_bits(Bytes.from_list([64])), 0, 2)\n    right_bits = Bits.slice(Bytes.to_bits(Bytes.from_list([128])), 0, 2)\n    if a == a and a == a_copy and a_copy == a and a_copy == a_third and a == a_third and a <= a_copy and a >= a_copy and a < b and b < c and a < c and Map.size(keys) == 1 and small_a < small_b and Map.size(small_keys) == 1 and {1, 2} < {1, 3} and [1, 2] < [1, 2, 0] and left_array < right_array and left_slice < right_slice and Bytes.from_list([1, 2]) < Bytes.from_list([1, 3]) and left_bits < right_bits and \"z\" < \"é\" do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-derived-protocol-laws"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "derived Eq, Ord, and Hash must obey their laws in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn explicit_eq_ord_and_concat_methods_run_in_both_gc_stress_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  defstruct Score do\n    value: i32\n  end\n  defimpl Eq, for: Score do\n    def eq(left: Score, right: Score) -> bool do\n      left.value == right.value\n    end\n  end\n  defimpl Ord, for: Score do\n    def compare(left: Score, right: Score) -> :less | :equal | :greater do\n      if left.value < right.value do\n        :less\n      else\n        if left.value > right.value do\n          :greater\n        else\n          :equal\n        end\n      end\n    end\n  end\n  defimpl Concat, for: Score do\n    def concat(left: Score, right: Score) -> Score do\n      Rune.to_string('🙂')\n      %Score{value: left.value + right.value}\n    end\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def different(left: a, right: a) -> bool when a: Eq do\n    left != right\n  end\n  def lower(left: a, right: a) -> bool when a: Ord do\n    left < right\n  end\n  def lower_equal(left: a, right: a) -> bool when a: Ord do\n    left <= right\n  end\n  def greater(left: a, right: a) -> bool when a: Ord do\n    left > right\n  end\n  def greater_equal(left: a, right: a) -> bool when a: Ord do\n    left >= right\n  end\n  def append(left: a, right: a) -> a when a: Concat do\n    left ++ right\n  end\n  def main() -> i32 do\n    one = %Score{value: 1}\n    two = %Score{value: 2}\n    other_two = %Score{value: 2}\n    sum = append(one, two)\n    if same(one, one) and different(one, two) and same(two, other_two) and lower(one, two) and lower_equal(one, two) and greater(two, one) and greater_equal(two, one) and lower_equal(two, other_two) and greater_equal(two, other_two) and sum.value == 3 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-explicit-core-protocols"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "explicit Eq, Ord, and Concat methods must dispatch in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn milestone_seven_exit_gate_runs_in_both_gc_stress_profiles() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  @derive [Eq, Ord, Hash]\n  defstruct Pair(a) do\n    first: a\n    second: a\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def lower(left: a, right: a) -> bool when a: Ord do\n    left < right\n  end\n  def visit_list(values: [i32]) -> unit do\n    for _ in values do\n      unit\n    end\n    unit\n  end\n  def visit_array(values: [i32; 3]) -> unit do\n    for _ in values do\n      unit\n    end\n    unit\n  end\n  def visit_slice(values: Slice(i32)) -> unit do\n    for _ in values do\n      unit\n    end\n    unit\n  end\n  def visit_bytes(values: bytes) -> unit do\n    for _ in values do\n      unit\n    end\n    unit\n  end\n  def visit_map(values: Map(i32, i32)) -> unit do\n    for {_, _} in values do\n      unit\n    end\n    unit\n  end\n  def main() -> i32 do\n    pair = %Pair{first: 1, second: 2}\n    pair_copy = %Pair{first: 1, second: 2}\n    pair_next = %Pair{first: 1, second: 3}\n    wide: Pair(i64) = %Pair{first: 1, second: 2}\n    wide_copy: Pair(i64) = %Pair{first: 1, second: 2}\n    array: [i32; 3] = #[1, 2, 3]\n    slice = Slice.from_array(array)\n    data = Bytes.from_list([1, 2, 3])\n    values: Map(i32, i32) = %{1 => 10, 2 => 20}\n    visit_list([1, 2, 3])\n    visit_array(array)\n    visit_slice(slice)\n    visit_bytes(data)\n    visit_map(values)\n    bits_source = Bytes.to_bits(Bytes.from_list([178]))\n    left_bits = Bits.slice(bits_source, 1, 3)\n    right_bits = Bits.slice(bits_source, 5, 3)\n    expected_bits = Bits.slice(Bytes.to_bits(Bytes.from_list([104])), 0, 6)\n    left_list: [i32] = [1, 2]\n    right_list: [i32] = [3, 4]\n    if same(pair, pair_copy) and lower(pair, pair_next) and same(wide, wide_copy) and same(\"same\", \"same\") and \"left\" ++ \"right\" == \"leftright\" and data ++ data == Bytes.from_list([1, 2, 3, 1, 2, 3]) and left_bits ++ right_bits == expected_bits and left_list ++ right_list == [1, 2, 3, 4] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-milestone-seven-exit"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "Milestone 7 combined protocol, iteration, and concat gate failed in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn enum_count_at_and_to_list_preserve_order_and_managed_items() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def list_at(values: [string]) -> bool do\n    match Enum.at(values, 1) do\n      some: {:some, string} -> match some do\n        {:some, value} -> value == \"bb\"\n      end\n      _ -> false\n    end\n  end\n  def array_missing(values: [string; 2]) -> bool do\n    match Enum.at(values, 2) do\n      some: {:some, string} -> false\n      _ -> true\n    end\n  end\n  def slice_at(values: Slice(string)) -> bool do\n    match Enum.at(values, 0) do\n      some: {:some, string} -> match some do\n        {:some, value} -> value == \"a\"\n      end\n      _ -> false\n    end\n  end\n  def byte_at(values: bytes) -> bool do\n    match Enum.at(values, 1) do\n      some: {:some, u8} -> match some do\n        {:some, value} -> value == 66\n      end\n      _ -> false\n    end\n  end\n  def map_at(values: Map(i32, i32)) -> bool do\n    match Enum.at(values, 0) do\n      some: {:some, {i32, i32}} -> match some do\n        {:some, {key, value}} -> key == 1 and value == 50\n      end\n      _ -> false\n    end\n  end\n  def main() -> i32 do\n    list: [string] = [\"a\", \"bb\"]\n    array: [string; 2] = #[\"a\", \"bb\"]\n    slice = Slice.from_array(array)\n    data = String.bytes(\"AB\")\n    map: Map(i32, i32) = %{1 => 50, 2 => 60}\n    list_copy = Enum.to_list(list)\n    array_list = Enum.to_list(array)\n    slice_list = Enum.to_list(slice)\n    byte_list = Enum.to_list(data)\n    map_list = Enum.to_list(map)\n    Rune.to_string('🙂')\n    if Enum.count(list) == 2 and Enum.count(array) == 2 and Enum.count(slice) == 2 and Enum.count(data) == 2 and Enum.count(map) == 2 and list_at(list) and array_missing(array) and slice_at(slice) and byte_at(data) and map_at(map) and list_copy == [\"a\", \"bb\"] and array_list == [\"a\", \"bb\"] and slice_list == [\"a\", \"bb\"] and byte_list == [65, 66] and map_list == [{1, 50}, {2, 60}] do\n      42\n    else\n      0\n    end\n  end\nend\n";

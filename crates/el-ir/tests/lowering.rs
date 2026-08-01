@@ -1331,6 +1331,13 @@ fn preserves_complete_implementation_metadata_at_the_core_boundary() {
         "defmodule Main do\n  defstruct Box do\n    value: i64\n  end\n  defprotocol Render do\n    type Output\n    def render(value: Box) -> i64\n  end\n  defimpl Render, for: Box do\n    type Output = i64\n    def render(value: Box) -> i64 do\n      0\n    end\n  end\nend\n",
     );
     assert_eq!(module.implementations.len(), 1);
+    let method = module.implementations[0].method_declarations[0].1;
+    assert!(
+        module
+            .functions
+            .iter()
+            .any(|function| function.declaration == method)
+    );
     assert!(
         module
             .debug_text()
@@ -1355,6 +1362,66 @@ fn lowers_and_verifies_protocol_backed_concat() {
     let roots = executable_reachability_roots(&module).expect("entry point");
     let concrete = monomorphize(&module, &roots).expect("concat monomorphizes");
     verify_concrete(&concrete).expect("Concrete Core concat verifies");
+}
+
+#[test]
+fn selects_explicit_operator_methods_after_generic_substitution() {
+    let source = "defmodule Main do\n  defstruct Score do\n    value: i32\n  end\n  defimpl Eq, for: Score do\n    def eq(left: Score, right: Score) -> bool do\n      left.value == right.value\n    end\n  end\n  defimpl Ord, for: Score do\n    def compare(left: Score, right: Score) -> :less | :equal | :greater do\n      if left.value < right.value do\n        :less\n      else\n        if left.value > right.value do\n          :greater\n        else\n          :equal\n        end\n      end\n    end\n  end\n  defimpl Concat, for: Score do\n    def concat(left: Score, right: Score) -> Score do\n      %Score{value: left.value + right.value}\n    end\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left != right\n  end\n  def lower(left: a, right: a) -> bool when a: Ord do\n    left <= right\n  end\n  def append(left: a, right: a) -> a when a: Concat do\n    left ++ right\n  end\n  def main() -> i32 do\n    one = %Score{value: 1}\n    two = %Score{value: 2}\n    same(one, two)\n    lower(one, two)\n    append(one, two).value\n  end\nend\n";
+    let generic = lowered(source);
+    verify(&generic).expect("constrained operators verify before selection");
+    let roots = executable_reachability_roots(&generic).expect("entry point");
+    let concrete = monomorphize(&generic, &roots).expect("operator methods select");
+    verify_concrete(&concrete).expect("selected operator calls verify");
+
+    let comparisons = concrete
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .filter(|operation| matches!(operation, Operation::ProtocolCompare { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(comparisons.len(), 2);
+    assert!(comparisons.iter().all(|operation| {
+        operation_collection_effect(operation) == CollectionEffect::MayCollect
+    }));
+    assert!(
+        ["<impl0>.eq", "<impl1>.compare", "<impl2>.concat"]
+            .iter()
+            .all(|name| concrete
+                .functions
+                .iter()
+                .any(|function| function.name == *name))
+    );
+}
+
+#[test]
+fn reuses_generic_explicit_operator_methods_at_multiple_instantiations() {
+    let source = "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  defimpl Eq, for: Box(a) when a: Eq do\n    def eq(left: Box(a), right: Box(a)) -> bool do\n      left.value == right.value\n    end\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def main() -> i32 do\n    first: Box(i32) = %Box{value: 1}\n    second: Box(i32) = %Box{value: 2}\n    wide_first: Box(i64) = %Box{value: 1}\n    wide_second: Box(i64) = %Box{value: 2}\n    same(first, second)\n    same(wide_first, wide_second)\n    0\n  end\nend\n";
+    let generic = lowered(source);
+    let roots = executable_reachability_roots(&generic).expect("entry point");
+    let concrete = monomorphize(&generic, &roots).expect("generic implementation specializes");
+    verify_concrete(&concrete).expect("generic method specializations verify");
+
+    let methods = concrete
+        .functions
+        .iter()
+        .filter(|function| function.name == "<impl0>.eq")
+        .collect::<Vec<_>>();
+    assert_eq!(methods.len(), 2);
+    assert_ne!(
+        methods[0].specialization_arguments,
+        methods[1].specialization_arguments
+    );
+    assert_eq!(
+        concrete
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.operations)
+            .filter(|operation| matches!(operation, Operation::ProtocolCompare { .. }))
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1436,6 +1503,8 @@ fn normalizes_associated_item_projections_during_specialization() {
 fn validates_derived_and_explicit_constraints_after_substitution() {
     for source in [
         "defmodule Main do\n  @derive [Eq]\n  defstruct Box(a) do\n    value: a\n  end\n  def same(left: a, right: a) -> bool when a: Eq do\n    left == right\n  end\n  def main() -> i32 do\n    left = %Box{value: 1}\n    right = %Box{value: 1}\n    if same(left, right) do\n      0\n    else\n      1\n    end\n  end\nend\n",
+        "defmodule Main do\n  @derive [Eq, Ord]\n  defstruct Box(a) do\n    value: a\n  end\n  def main() -> i32 do\n    left = %Box{value: 1}\n    right = %Box{value: 2}\n    if left < right do\n      0\n    else\n      1\n    end\n  end\nend\n",
+        "defmodule Main do\n  @derive [Eq, Ord]\n  defstruct Box(a) do\n    values: [a]\n  end\n  def main() -> i32 do\n    left: Box(i64) = %Box{values: [1]}\n    right: Box(i64) = %Box{values: [2]}\n    if left < right do\n      0\n    else\n      1\n    end\n  end\nend\n",
         "defmodule Main do\n  defstruct Box(a) do\n    value: a\n  end\n  defprotocol Marker do\n    def mark(value: Self) -> bool\n  end\n  defimpl Marker, for: Box(a) do\n    def mark(value: Box(a)) -> bool do\n      true\n    end\n  end\n  def keep(value: a) -> a when a: Marker do\n    value\n  end\n  def main() -> i32 do\n    value = %Box{value: 1}\n    keep(value)\n    0\n  end\nend\n",
     ] {
         let module = lowered(source);

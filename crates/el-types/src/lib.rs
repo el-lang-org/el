@@ -83,6 +83,7 @@ pub struct TypedImplementation {
     pub target: TypeId,
     pub associated_types: Vec<(String, TypeId)>,
     pub methods: Vec<String>,
+    pub method_declarations: Vec<(String, DeclId)>,
     pub constraints: Vec<(TypeId, String)>,
     pub span: Span,
 }
@@ -717,6 +718,7 @@ impl<'a> Checker<'a> {
                     target,
                     associated_types,
                     methods: implementation.methods.clone(),
+                    method_declarations: implementation.method_declarations.clone(),
                     constraints,
                     span: implementation.span,
                 })
@@ -2989,6 +2991,20 @@ impl<'a> Checker<'a> {
         }
         let right = self.check_expr(&node.children[1], Some(left.ty), owner, scopes)?;
         let concat_ty = left.ty;
+        if let Some(call) = self.explicit_protocol_call(
+            concat_ty,
+            "Concat",
+            "concat",
+            vec![left.clone(), right.clone()],
+            node.span,
+            owner,
+        ) {
+            if call.ty != concat_ty {
+                self.type_mismatch(node.span, concat_ty, call.ty);
+                return None;
+            }
+            return Some(call);
+        }
         let buffer_kind = match self.types[concat_ty.0 as usize] {
             Type::Bytes => Some(BufferAppendKind::Bytes),
             _ => None,
@@ -3447,6 +3463,18 @@ impl<'a> Checker<'a> {
             return None;
         }
         let right = self.check_expr(&node.children[1], Some(left.ty), owner, scopes)?;
+        let protocol = if ordered { "Ord" } else { "Eq" };
+        let method = if ordered { "compare" } else { "eq" };
+        if let Some(call) = self.explicit_protocol_call(
+            left.ty,
+            protocol,
+            method,
+            vec![left.clone(), right.clone()],
+            node.span,
+            owner,
+        ) {
+            return self.adapt_explicit_comparison(operator, call, node.span);
+        }
         Some(TypedExpr {
             kind: TypedExprKind::Comparison {
                 operator,
@@ -3455,6 +3483,165 @@ impl<'a> Checker<'a> {
             },
             ty: TypeId(2),
             span: node.span,
+        })
+    }
+
+    fn explicit_protocol_call(
+        &mut self,
+        target: TypeId,
+        protocol: &str,
+        method: &str,
+        arguments: Vec<TypedExpr>,
+        span: Span,
+        owner: DeclId,
+    ) -> Option<TypedExpr> {
+        let selected = self
+            .program
+            .implementations
+            .iter()
+            .find_map(|implementation| {
+                if implementation.protocol != protocol {
+                    return None;
+                }
+                let mut concrete_by_name = BTreeMap::new();
+                if !implementation_target_matches(
+                    &self.types,
+                    target,
+                    &implementation.target,
+                    &mut concrete_by_name,
+                ) {
+                    return None;
+                }
+                Some((
+                    implementation.clone(),
+                    concrete_by_name,
+                    implementation
+                        .method_declarations
+                        .iter()
+                        .find(|(name, _)| name == method)
+                        .map(|(_, declaration)| *declaration),
+                ))
+            })?;
+        let (implementation, concrete_by_name, declaration) = selected;
+        if !implementation.constraints.iter().all(|constraint| {
+            concrete_by_name
+                .get(&constraint.parameter)
+                .is_some_and(|argument| self.type_satisfies(*argument, &constraint.protocol, owner))
+        }) {
+            return None;
+        }
+        let declaration = declaration?;
+        let signature = self.signatures.get(&declaration)?.clone();
+        let substitutions = signature
+            .type_parameters
+            .iter()
+            .filter_map(|parameter| match &self.types[parameter.0 as usize] {
+                Type::Parameter { name, .. } => concrete_by_name
+                    .get(name)
+                    .map(|concrete| (*parameter, *concrete)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        if signature.type_parameters.len() != substitutions.len()
+            || signature.parameters.len() != arguments.len()
+        {
+            return None;
+        }
+        for (parameter, argument) in signature.parameters.iter().zip(&arguments) {
+            let expected = self.apply_substitutions(*parameter, &substitutions);
+            if expected != argument.ty {
+                self.type_mismatch(argument.span, expected, argument.ty);
+                return None;
+            }
+        }
+        let result = self.apply_substitutions(signature.result, &substitutions);
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                function: declaration,
+                substitutions: substitutions.into_iter().collect(),
+                arguments,
+            },
+            ty: result,
+            span,
+        })
+    }
+
+    fn adapt_explicit_comparison(
+        &mut self,
+        operator: ComparisonOperator,
+        call: TypedExpr,
+        span: Span,
+    ) -> Option<TypedExpr> {
+        if matches!(
+            operator,
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual
+        ) {
+            if call.ty != TypeId(2) {
+                self.type_mismatch(span, TypeId(2), call.ty);
+                return None;
+            }
+            if matches!(operator, ComparisonOperator::Equal) {
+                return Some(call);
+            }
+            return Some(TypedExpr {
+                kind: TypedExprKind::Comparison {
+                    operator: ComparisonOperator::Equal,
+                    left: Box::new(call),
+                    right: Box::new(TypedExpr {
+                        kind: TypedExprKind::Boolean(false),
+                        ty: TypeId(2),
+                        span,
+                    }),
+                },
+                ty: TypeId(2),
+                span,
+            });
+        }
+
+        let (atom, comparison) = match operator {
+            ComparisonOperator::Less => ("less", ComparisonOperator::Equal),
+            ComparisonOperator::LessEqual => ("greater", ComparisonOperator::NotEqual),
+            ComparisonOperator::Greater => ("greater", ComparisonOperator::Equal),
+            ComparisonOperator::GreaterEqual => ("less", ComparisonOperator::NotEqual),
+            ComparisonOperator::Equal | ComparisonOperator::NotEqual => unreachable!(),
+        };
+        let atom_ty = self.intern(Type::Atom(atom.to_owned()));
+        let Type::Union(members) = &self.types[call.ty.0 as usize] else {
+            self.diagnostics.push(Diagnostic::error(
+                "E2113",
+                span,
+                "`Ord.compare` must return `:less | :equal | :greater`",
+            ));
+            return None;
+        };
+        if !members.contains(&atom_ty) {
+            self.diagnostics.push(Diagnostic::error(
+                "E2113",
+                span,
+                "`Ord.compare` must return `:less | :equal | :greater`",
+            ));
+            return None;
+        }
+        let expected = TypedExpr {
+            kind: TypedExprKind::UnionInject {
+                member: atom_ty,
+                value: Box::new(TypedExpr {
+                    kind: TypedExprKind::Atom(atom.to_owned()),
+                    ty: atom_ty,
+                    span,
+                }),
+            },
+            ty: call.ty,
+            span,
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Comparison {
+                operator: comparison,
+                left: Box::new(call),
+                right: Box::new(expected),
+            },
+            ty: TypeId(2),
+            span,
         })
     }
 
@@ -6296,6 +6483,36 @@ pub fn verify(program: &TypedProgram) -> Result<(), Vec<String>> {
         .iter()
         .map(|function| function.id)
         .collect::<BTreeSet<_>>();
+    for implementation in &program.implementations {
+        let mut method_names = BTreeSet::new();
+        let mut method_declarations = BTreeSet::new();
+        for (name, declaration) in &implementation.method_declarations {
+            if !implementation.methods.contains(name) {
+                errors.push(format!(
+                    "implementation {:?} references unknown method `{name}`",
+                    implementation.id
+                ));
+            }
+            if !method_names.insert(name) {
+                errors.push(format!(
+                    "implementation {:?} references method `{name}` twice",
+                    implementation.id
+                ));
+            }
+            if !method_declarations.insert(declaration) {
+                errors.push(format!(
+                    "implementation {:?} references declaration {declaration:?} twice",
+                    implementation.id
+                ));
+            }
+            if !declarations.contains(declaration) {
+                errors.push(format!(
+                    "implementation {:?} references missing declaration {declaration:?}",
+                    implementation.id
+                ));
+            }
+        }
+    }
     for function in &program.functions {
         if function.result.0 >= type_count || function.body.ty.0 >= type_count {
             errors.push(format!(
@@ -8210,7 +8427,13 @@ fn verify_expr(
                 || left.ty != expression.ty
                 || !matches!(
                     types.get(expression.ty.0 as usize),
-                    Some(Type::String | Type::Bytes | Type::Bits | Type::List(_))
+                    Some(
+                        Type::String
+                            | Type::Bytes
+                            | Type::Bits
+                            | Type::List(_)
+                            | Type::Parameter { .. }
+                    )
                 )
             {
                 errors.push("concat expression has invalid types".to_owned());
@@ -8292,8 +8515,11 @@ fn verify_expr(
                 is_integer_type(ty) || matches!(ty, Type::Rune | Type::F32 | Type::F64)
             }) || if ordered {
                 standard_ord_type(types, left.ty)
+                    || matches!(types.get(left.ty.0 as usize), Some(Type::Parameter { .. }))
             } else {
                 standard_eq_type(types, left.ty)
+                    || matches!(types.get(left.ty.0 as usize), Some(Type::Union(members))
+                        if members.iter().all(|member| matches!(types.get(member.0 as usize), Some(Type::Atom(_)))))
                     || matches!(
                         types.get(left.ty.0 as usize),
                         Some(Type::Struct { .. } | Type::Parameter { .. })
