@@ -1,0 +1,21 @@
+# conformance: accept; spec=EXAMPLES.md §6, TYPES.md §8
+defmodule Main do
+  @type Parsed = {:ok, i32} | :error
+
+  def parsed_ok(value: {:ok, i32}) -> i32 do
+    match value do
+      {:ok, number} -> number
+    end
+  end
+
+  def value(parsed: Parsed) -> i32 do
+    match parsed do
+      ok: {:ok, i32} -> parsed_ok(ok)
+      _ -> 0
+    end
+  end
+
+  def main() -> i32 do
+    value({:ok, 42})
+  end
+end

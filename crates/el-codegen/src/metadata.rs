@@ -3,6 +3,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+/// LLVM release required by the EL v1 compiler distribution.
+pub const LLVM_VERSION: &str = "22.1.8";
+
 /// Target-dependent facts recorded with native build output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetMetadata {
@@ -51,9 +54,14 @@ impl TargetMetadata {
     #[must_use]
     pub fn reproducibility_text(&self) -> String {
         format!(
-            "llvm_target_triple = \"{}\"\npointer_width = {}\nunicode_version = \"{}\"\n",
+            "compiler_version = \"{}\"\nllvm_version = \"{}\"\nllvm_target_triple = \"{}\"\npointer_width = {}\nruntime_abi_version = {}\nboehm_gc_version = \"{}\"\nboehm_gc_revision = \"{}\"\nunicode_version = \"{}\"\n",
+            env!("CARGO_PKG_VERSION"),
+            LLVM_VERSION,
             self.llvm_target_triple,
             self.pointer_width,
+            el_runtime::PRIVATE_ABI_VERSION,
+            el_runtime::BOEHM_GC_VERSION,
+            el_runtime::BOEHM_GC_REVISION,
             el_runtime::UNICODE_VERSION
         )
     }
@@ -135,7 +143,7 @@ mod tests {
         assert_eq!(metadata.pointer_width(), 64);
         assert_eq!(
             metadata.reproducibility_text(),
-            "llvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\nunicode_version = \"17.0.0\"\n"
+            "compiler_version = \"0.1.0\"\nllvm_version = \"22.1.8\"\nllvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\nruntime_abi_version = 4\nboehm_gc_version = \"8.2.12\"\nboehm_gc_revision = \"4fab5386df64466b2b61fc7209bef033cad1e6cc\"\nunicode_version = \"17.0.0\"\n"
         );
         assert_eq!(
             metadata.to_string(),

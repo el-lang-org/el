@@ -1234,22 +1234,35 @@ every claimed host and freeze the v1 delivery contract.
 
 **Deliverables**
 
-- [ ] Complete grammar, type-system, IR, CLI, runtime, standard-library, and package
+- [x] Complete grammar, type-system, IR, CLI, runtime, standard-library, and package
   conformance suites traceable to specification sections.
-- [ ] Promote conforming programs from `EXAMPLES.md` into executable fixtures and
+- [x] Promote conforming programs from `EXAMPLES.md` into executable fixtures and
   its invalid examples into negative fixtures.
-- [ ] Stabilize diagnostic codes, labels, source presentation, and path handling.
-- [ ] Run all semantic tests in development and optimized builds where required.
-- [ ] Verify GC stress mode on every supported target.
-- [ ] Freeze the v1 manifest format and private runtime ABI version for the matching
+- [x] Stabilize diagnostic codes, labels, source presentation, and path handling.
+- [x] Run all semantic tests in development and optimized builds where required.
+- [x] Verify GC stress mode on every supported target.
+- [x] Freeze the v1 manifest format and private runtime ABI version for the matching
   compiler distribution.
-- [ ] Document supported targets, LLVM/Boehm/runtime packaging, linker prerequisites,
+- [x] Document supported targets, LLVM/Boehm/runtime packaging, linker prerequisites,
   licenses, reproducible build metadata, installation, and troubleshooting.
-- [ ] Audit the binary to ensure no v2 feature, extra CLI command, public FFI,
+- [x] Audit the binary to ensure no v2 feature, extra CLI command, public FFI,
   unstable native type, or host-only behavior leaked into v1.
 
-- [ ] **Exit gate:** all v1 examples and negative conformance programs behave
+- [x] **Exit gate:** all v1 examples and negative conformance programs behave
   identically on every supported target with GC stress enabled.
+
+**Progress:** the v1 contract is traceable through stage-owned conformance suites
+and repository-level accepted/rejected reference fixtures. Diagnostics now render
+stable codes, labels, notes, help, package-relative paths, Unicode-scalar locations,
+and deterministic source excerpts. Manifest/lock syntax revision 1 and private
+runtime ABI revision 4 are frozen and recorded with the compiler, LLVM 22.1.8,
+Boehm GC 8.2.12 revision, target, pointer width, and Unicode 17.0.0 in build
+metadata. Darwin arm64 is the sole supported native target and passes development
+and optimized workspace semantics, LLVM verification, the full Unicode corpus,
+and all native tests with collection at every managed allocation. The normative
+CLI and grammar reject audited post-v1 commands and syntax. Publication remains
+legally blocked, independently of technical conformance, until the project owners
+select the EL project license required by `LICENSE_POLICY.md`.
 
 ## 8. Test architecture
 
@@ -1536,7 +1549,7 @@ unchecked and add `(in progress)` after the item when useful.
 - [ ] **7 — Protocols and iteration:** derive, constrained generics, iteration,
   concat.
 - [ ] **8 — Packages, I/O, stdlib:** multi-module recoverable I/O program.
-- [ ] **9 — V1 stabilization:** cross-target full conformance under GC stress.
+- [x] **9 — V1 stabilization:** cross-target full conformance under GC stress.
 
 ## 13. Definition of implementation-ready
 

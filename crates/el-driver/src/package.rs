@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::LOCKFILE_FORMAT_VERSION;
+
 const LOCK_FILE_NAME: &str = "el.lock";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -247,7 +249,7 @@ impl PackageGraph {
     fn lock_text(&self) -> String {
         let mut packages = self.packages.iter().collect::<Vec<_>>();
         packages.sort_by(|left, right| left.id().cmp(right.id()));
-        let mut output = String::from("version = 1\n");
+        let mut output = format!("version = {LOCKFILE_FORMAT_VERSION}\n");
         for package in packages {
             output.push_str("\n[[package]]\n");
             push_quoted(&mut output, "name", package.id().as_str());

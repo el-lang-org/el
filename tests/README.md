@@ -10,7 +10,9 @@ crate's `tests/golden/` directory. Tests compare bytes with the small helper in
 that crate's `tests/support/` module. Golden files are updated deliberately in
 reviewed patches; tests never rewrite them automatically.
 
-End-to-end fixtures will live under `tests/e2e/`, grammar/type conformance under
-`tests/conformance/`, and reusable EL projects under `tests/fixtures/` when
-their owning milestones begin.
-
+Traceable v1 reference fixtures live under `tests/conformance/v1/`. Their first
+line records whether the program must be accepted or rejected, its expected
+phase and stable diagnostic code when rejected, and the controlling
+specification section. Crate-local conformance tests continue to own the dense
+boundary matrices; the repository-level fixtures protect representative
+end-to-end behavior from `EXAMPLES.md`.

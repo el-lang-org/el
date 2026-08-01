@@ -246,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_every_audited_post_v1_command_and_global_option() {
+        for invocation in [
+            vec!["run"],
+            vec!["test"],
+            vec!["fmt"],
+            vec!["repl"],
+            vec!["--verbose", "check"],
+            vec!["--target", "aarch64-unknown-linux-gnu", "build"],
+            vec!["build", "--output", "program"],
+        ] {
+            assert!(
+                parse(&arguments(&invocation)).is_err(),
+                "post-v1 surface leaked through {invocation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_missing_values_and_invalid_modules() {
         let rejected = [
             vec!["emit"],

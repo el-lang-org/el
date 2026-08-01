@@ -77,3 +77,25 @@ fn malformed_project_is_status_one_without_panicking() {
     assert!(stderr.contains("manifest error"));
     assert!(!stderr.contains("panicked"));
 }
+
+#[test]
+fn source_diagnostics_use_stable_codes_and_package_relative_presentations() {
+    let temp = TempDir::new();
+    fs::create_dir(temp.path().join("src")).expect("create source directory");
+    fs::write(
+        temp.path().join("el.toml"),
+        "[package]\nname = \"diagnostic\"\nnamespace = \"Diagnostic\"\nversion = \"1.0.0\"\n\n[deps]\n",
+    )
+    .expect("write manifest");
+    fs::write(
+        temp.path().join("src/main.el"),
+        "defmodule Main do\n  def main() -> i32 do\n    missing\n  end\nend\n",
+    )
+    .expect("write source");
+
+    let output = run(&["check"], temp.path());
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_golden("source-diagnostic.stderr", &output.stderr);
+}

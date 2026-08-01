@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 pub const PRIVATE_ABI_VERSION: u32 = 4;
 /// Unicode data version fixed by the EL v1 language contract.
 pub const UNICODE_VERSION: &str = "17.0.0";
+/// Vendored collector release shipped with the matching compiler distribution.
+pub const BOEHM_GC_VERSION: &str = "8.2.12";
+/// Exact vendored collector source revision used for reproducible distributions.
+pub const BOEHM_GC_REVISION: &str = "4fab5386df64466b2b61fc7209bef033cad1e6cc";
 
 /// Symbol called by generated code for source-mandated unrecoverable failures.
 pub const FAILURE_SYMBOL: &str = "__el_runtime_fail";
@@ -166,6 +170,11 @@ mod tests {
     #[test]
     fn private_abi_tracks_the_unicode_segmentation_boundary() {
         assert_eq!(PRIVATE_ABI_VERSION, 4);
+        assert_eq!(BOEHM_GC_VERSION, "8.2.12");
+        assert_eq!(
+            BOEHM_GC_REVISION,
+            "4fab5386df64466b2b61fc7209bef033cad1e6cc"
+        );
     }
 
     #[test]

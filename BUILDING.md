@@ -1,8 +1,9 @@
-# Building EL
+# Building and validating EL
 
-Milestone 0 supports frontend workspace development on the compiler host. It
-does not yet claim a supported compilation target; that requires the compiler,
-linker, runtime, GC stress, and conformance gates in later milestones.
+EL v1 claims only the Darwin arm64 native host target described in
+`V1_DISTRIBUTION.md`. A builder must pass every command in this document before
+shipping that target. Other hosts remain useful for frontend development but
+are not supported compilation targets.
 
 ## Rust workspace
 
@@ -96,6 +97,31 @@ requests a full collection; it is a compiler/runtime conformance mode, not an EL
 source option. `allocation-failure-test` is a separate conformance build that
 forces managed allocation failure; do not combine it with `gc-stress-test`.
 Passing these commands alone does not make Darwin arm64 a supported EL target.
+
+## V1 release gate
+
+Set the pinned LLVM prefix, then run all independent, backend, runtime, profile,
+and stress checks:
+
+```sh
+export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm
+export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo test --release --workspace
+cargo test -p el-codegen --features llvm,managed-runtime
+cargo test -p el-runtime --features gc-stress-test
+cargo test --release -p el-runtime --features gc-stress-test
+cargo test -p el-driver --features gc-stress-test --test native
+cargo test --release -p el-driver --features gc-stress-test --test native
+cargo build --workspace --locked --offline
+```
+
+Verify `/opt/homebrew/opt/llvm/bin/llvm-config --version` is `22.1.8` before the
+backend commands. Publication remains blocked until the project-license issue
+in `LICENSE_POLICY.md` is resolved.
 
 ## Unicode data regeneration
 

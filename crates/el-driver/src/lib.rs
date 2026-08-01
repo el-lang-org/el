@@ -3,7 +3,7 @@
 use el_ast::{Node, Program, Value};
 use el_codegen::{CodegenProfile, MetadataWriteError, TargetMetadata};
 use el_ir::GenericModule;
-use el_span::{Diagnostic, FileId};
+use el_span::{Diagnostic, FileId, SourceMap, render_diagnostic};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,10 @@ pub use package::{
 };
 
 pub const MANIFEST_FILE_NAME: &str = "el.toml";
+/// Frozen syntax revision for the EL v1 manifest contract.
+pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Frozen syntax revision emitted at the head of every EL v1 lockfile.
+pub const LOCKFILE_FORMAT_VERSION: u32 = 1;
 
 /// The two native build profiles in the v1 CLI contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,7 +263,7 @@ pub fn run_project_command(
         ProjectCommand::EmitLlvmIr { .. } => false,
     };
     let graph = load_package_graph(project.directory(), locked).map_err(ProjectError::Package)?;
-    let mut source_map = el_span::SourceMap::new();
+    let mut source_map = SourceMap::new();
     let mut programs = Vec::new();
     for package in graph.packages() {
         let package_modules = package
@@ -274,19 +278,37 @@ pub fn run_project_command(
                 PathBuf::from(package.namespace()).join(module.relative_path())
             };
             let file = source_map.add_file(display, module.source().to_owned());
-            let mut program = el_parser::parse(file, module.source()).map_err(|error| {
-                ProjectError::Diagnostics(vec![Diagnostic::error(
-                    "E1000",
-                    error.span,
-                    error.message,
-                )])
-            })?;
+            let mut program = match el_parser::parse(file, module.source()) {
+                Ok(program) => program,
+                Err(error) => {
+                    return Err(ProjectError::Diagnostics(DiagnosticReport::new(
+                        source_map,
+                        vec![Diagnostic::error("E1000", error.span, error.message)],
+                    )));
+                }
+            };
             qualify_dependency_program(&mut program, package.namespace(), &package_modules);
             programs.push(program);
         }
     }
-    let resolved = el_resolve::resolve_package(&programs).map_err(ProjectError::Diagnostics)?;
-    let typed = el_types::check_package(&resolved).map_err(ProjectError::Diagnostics)?;
+    let resolved = match el_resolve::resolve_package(&programs) {
+        Ok(resolved) => resolved,
+        Err(diagnostics) => {
+            return Err(ProjectError::Diagnostics(DiagnosticReport::new(
+                source_map,
+                diagnostics,
+            )));
+        }
+    };
+    let typed = match el_types::check_package(&resolved) {
+        Ok(typed) => typed,
+        Err(diagnostics) => {
+            return Err(ProjectError::Diagnostics(DiagnosticReport::new(
+                source_map,
+                diagnostics,
+            )));
+        }
+    };
     let core = el_ir::lower(&typed);
 
     match command {
@@ -426,6 +448,28 @@ pub struct ProjectOutput {
     stdout: String,
 }
 
+/// A verified set of source diagnostics and the immutable sources they refer to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagnosticReport {
+    sources: SourceMap,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl DiagnosticReport {
+    #[must_use]
+    pub fn new(sources: SourceMap, diagnostics: Vec<Diagnostic>) -> Self {
+        Self {
+            sources,
+            diagnostics,
+        }
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
 impl ProjectOutput {
     #[must_use]
     pub fn stdout(&self) -> &str {
@@ -443,7 +487,7 @@ pub enum ProjectError {
         manifest: PathBuf,
     },
     Package(package::PackageError),
-    Diagnostics(Vec<Diagnostic>),
+    Diagnostics(DiagnosticReport),
     NoExecutableTarget {
         package: String,
     },
@@ -466,18 +510,18 @@ impl fmt::Display for ProjectError {
                 manifest.display()
             ),
             Self::Package(error) => write!(formatter, "{error}"),
-            Self::Diagnostics(diagnostics) => {
-                write!(
-                    formatter,
-                    "compilation failed with {} diagnostic(s)",
-                    diagnostics.len()
-                )?;
-                for diagnostic in diagnostics {
-                    write!(
-                        formatter,
-                        "\nerror[{}]: {}",
-                        diagnostic.code, diagnostic.message
-                    )?;
+            Self::Diagnostics(report) => {
+                write!(formatter, "compilation failed")?;
+                for diagnostic in &report.diagnostics {
+                    formatter.write_str("\n")?;
+                    match render_diagnostic(&report.sources, diagnostic) {
+                        Ok(rendered) => formatter.write_str(rendered.trim_end())?,
+                        Err(error) => write!(
+                            formatter,
+                            "internal error: invalid source diagnostic [{}]: {error}",
+                            diagnostic.code
+                        )?,
+                    }
                 }
                 Ok(())
             }
@@ -573,6 +617,12 @@ mod tests {
             fs::read_to_string(development.metadata()).unwrap(),
             target.reproducibility_text()
         );
+    }
+
+    #[test]
+    fn v1_distribution_formats_are_frozen() {
+        assert_eq!(MANIFEST_FORMAT_VERSION, 1);
+        assert_eq!(LOCKFILE_FORMAT_VERSION, 1);
     }
 
     #[test]

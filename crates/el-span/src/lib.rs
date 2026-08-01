@@ -93,7 +93,7 @@ impl SourceFile {
 }
 
 /// Source storage for one compilation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceMap {
     files: Vec<SourceFile>,
 }
@@ -263,6 +263,106 @@ impl Diagnostic {
     }
 }
 
+/// Renders one diagnostic using only package-relative source paths.
+///
+/// The format is part of the EL v1 tool contract. It deliberately avoids
+/// terminal color, host paths, and locale-sensitive formatting so snapshots
+/// and diagnostics are identical on every supported host.
+pub fn render_diagnostic(
+    sources: &SourceMap,
+    diagnostic: &Diagnostic,
+) -> Result<String, SourceMapError> {
+    diagnostic.verify(sources)?;
+    let file = sources.file(diagnostic.primary.file())?;
+    let location = sources.location(diagnostic.primary.file(), diagnostic.primary.start())?;
+    let (line_text, line_start, line_end) = source_line(file.text(), diagnostic.primary.start());
+    let marker_start = file.text()[line_start..diagnostic.primary.start()]
+        .chars()
+        .count();
+    let marker_end = diagnostic.primary.end().min(line_end);
+    let marker_width = file.text()[diagnostic.primary.start()..marker_end]
+        .chars()
+        .count()
+        .max(1);
+    let gutter_width = location.line.to_string().len();
+
+    let mut output = format!(
+        "error[{}]: {}\n --> {}:{}:{}\n{:width$} |\n{} | {}\n{:width$} | {}{}",
+        diagnostic.code,
+        diagnostic.message,
+        file.path().display(),
+        location.line,
+        location.column,
+        "",
+        location.line,
+        expand_tabs(line_text),
+        "",
+        " ".repeat(display_indent(line_text, marker_start)),
+        "^".repeat(marker_width),
+        width = gutter_width,
+    );
+
+    for label in &diagnostic.labels {
+        let label_file = sources.file(label.span.file())?;
+        let label_location = sources.location(label.span.file(), label.span.start())?;
+        output.push_str(&format!(
+            "\n{:width$} = label: {}:{}:{}: {}",
+            "",
+            label_file.path().display(),
+            label_location.line,
+            label_location.column,
+            label.message,
+            width = gutter_width,
+        ));
+    }
+    for note in &diagnostic.notes {
+        output.push_str(&format!(
+            "\n{:width$} = note: {note}",
+            "",
+            width = gutter_width
+        ));
+    }
+    if let Some(help) = &diagnostic.help {
+        output.push_str(&format!(
+            "\n{:width$} = help: {help}",
+            "",
+            width = gutter_width
+        ));
+    }
+    output.push('\n');
+    Ok(output)
+}
+
+fn source_line(source: &str, offset: usize) -> (&str, usize, usize) {
+    let start = source[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let mut end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |index| offset + index);
+    if end > start && source.as_bytes()[end - 1] == b'\r' {
+        end -= 1;
+    }
+    (&source[start..end], start, end)
+}
+
+fn expand_tabs(text: &str) -> String {
+    let mut expanded = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\t' {
+            expanded.push_str("    ");
+        } else {
+            expanded.push(character);
+        }
+    }
+    expanded
+}
+
+fn display_indent(line: &str, scalar_count: usize) -> usize {
+    line.chars()
+        .take(scalar_count)
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +416,22 @@ mod tests {
         assert_eq!(
             sources.file(file).expect("known file").path(),
             Path::new("src/Main.el")
+        );
+    }
+
+    #[test]
+    fn renders_stable_package_relative_unicode_source_presentations() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("src/Main.el", "first\r\n\tvalue = λ\n");
+        let lambda = Span::new(file, 16, 18).unwrap();
+        let diagnostic = Diagnostic::error("E2106", lambda, "unknown value `λ`")
+            .with_label(Span::new(file, 8, 13).unwrap(), "binding starts here")
+            .with_note("names are resolved before type checking")
+            .with_help("declare `λ` before this expression");
+
+        assert_eq!(
+            render_diagnostic(&sources, &diagnostic).unwrap(),
+            "error[E2106]: unknown value `λ`\n --> src/Main.el:2:10\n  |\n2 |     value = λ\n  |             ^\n  = label: src/Main.el:2:2: binding starts here\n  = note: names are resolved before type checking\n  = help: declare `λ` before this expression\n"
         );
     }
 }
