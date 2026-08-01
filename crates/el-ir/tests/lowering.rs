@@ -1538,6 +1538,18 @@ fn lowers_typed_union_patterns_to_member_switches_and_projections() {
 }
 
 #[test]
+fn lowers_tagged_tuple_union_patterns_to_projection_then_destructuring() {
+    let module = lowered(
+        "defmodule Main do\n  @type Option(a) = {:some, a} | :none\n  def value(option: Option(i32)) -> i32 do\n    match option do\n      {:some, frequency} -> frequency + 1\n      :none -> 1\n    end\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("UnionMember"), "{debug}");
+    assert!(debug.contains(" = project "), "{debug}");
+    assert!(debug.contains("tuple_project"), "{debug}");
+    verify(&module).expect("tagged tuple union pattern Core verifies");
+}
+
+#[test]
 fn verifier_rejects_mistyped_union_discriminants_and_payload_projections() {
     let source = "defmodule Main do\n  @type Scalar = bool | i64\n  def choose(value: Scalar) -> i64 do\n    match value do\n      number: i64 -> number\n      flag: bool -> 0\n    end\n  end\nend\n";
 

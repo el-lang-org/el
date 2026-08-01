@@ -10,16 +10,10 @@ defmodule Main do
     end
   end
 
-  def arguments_from_ok(value: {:ok, [string]}) -> [string] do
-    match value do
-      {:ok, arguments} -> arguments
-    end
-  end
-
   def input_text() -> string do
     match Process.arguments() do
-      value: {:ok, [string]} -> first_argument(arguments_from_ok(value))
-      value: {:error, {:invalid_text, usize}} -> default_text()
+      {:ok, arguments} -> first_argument(arguments)
+      {:error, {:invalid_text, _}} -> default_text()
     end
   end
 

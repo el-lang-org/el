@@ -1,18 +1,12 @@
 defmodule Presentation do
-  def string_from_ok(value: {:ok, string}) -> string do
-    match value do
-      {:ok, text} -> text
-    end
-  end
-
   def banner() -> string do
     buffer = Buffer.new()
     titled = Buffer.append_string(buffer, "EL v1")
     separated = Buffer.append_bytes(titled, String.bytes(" · "))
     complete = Buffer.append_string(separated, "Unicode report")
     match Buffer.to_string(complete) do
-      value: {:ok, string} -> string_from_ok(value)
-      value: {:error, String.Utf8Error} -> "Unicode report"
+      {:ok, text} -> text
+      {:error, _} -> "Unicode report"
     end
   end
 

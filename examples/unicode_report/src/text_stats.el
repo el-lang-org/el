@@ -9,16 +9,10 @@ defmodule TextStats do
     frequencies: Map(string, i32)
   end
 
-  def count_from_some(value: {:some, i32}) -> i32 do
-    match value do
-      {:some, count} -> count
-    end
-  end
-
   def increment(frequencies: Map(string, i32), grapheme: string) -> Map(string, i32) do
     match Map.fetch(frequencies, grapheme) do
-      found: {:some, i32} ->
-        Map.put(frequencies, grapheme, count_from_some(found) + 1)
+      {:some, frequency} ->
+        Map.put(frequencies, grapheme, frequency + 1)
       :none -> Map.put(frequencies, grapheme, 1)
     end
   end

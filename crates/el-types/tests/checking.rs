@@ -991,6 +991,15 @@ fn typed_union_patterns_bind_members_and_cover_the_union() {
 }
 
 #[test]
+fn tagged_tuple_patterns_select_and_destructure_union_members() {
+    let source = "defmodule Main do\n  @type Option(a) = {:some, a} | :none\n  def value(option: Option(i32)) -> i32 do\n    match option do\n      {:some, frequency} -> frequency + 1\n      :none -> 1\n    end\n  end\n  def nested(value: {Option(i32), bool}) -> i32 do\n    match value do\n      {{:some, frequency}, _} -> frequency\n      {:none, _} -> 0\n    end\n  end\nend\n";
+    let typed = checked(source).expect("tagged tuple pattern selects its union member");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("StructuralUnionMember"), "{debug}");
+    verify(&typed).expect("structural union-member Typed AST verifies");
+}
+
+#[test]
 fn checks_structural_tuple_list_and_struct_pattern_matrices() {
     let source = "defmodule Main do\n  defstruct Point do\n    flag: bool\n    value: i64\n  end\n  def tuple(value: {bool, i64}) -> i64 do\n    match value do\n      {true, number} -> number\n      {false, _} -> 0\n    end\n  end\n  def list(value: [i64]) -> i64 do\n    match value do\n      [] -> 0\n      [head | _] -> head\n    end\n  end\n  def structure(value: Point) -> i64 do\n    match value do\n      %Point{flag: true, value: number} -> number\n      %Point{flag: false} -> 0\n    end\n  end\nend\n";
 

@@ -2895,6 +2895,32 @@ impl<'a> Lowerer<'a> {
                     origin: pattern.span,
                 });
             }
+            TypedPatternKind::StructuralUnionMember {
+                member,
+                pattern: nested,
+            } => {
+                let matched = self.new_block();
+                self.pattern_switch(
+                    (subject, pattern.ty),
+                    SwitchValue::UnionMember(*member),
+                    matched,
+                    failure,
+                    pattern.span,
+                    Vec::new(),
+                );
+                self.current_block = matched;
+                self.current_parameters.clear();
+                let value = self.value();
+                self.operations.push(Operation::UnionProject {
+                    result: value,
+                    member: *member,
+                    value: subject,
+                    union_ty: pattern.ty,
+                    ty: *member,
+                    origin: pattern.span,
+                });
+                self.lower_pattern(nested, value, success, failure, bindings);
+            }
             TypedPatternKind::Tuple(elements) => {
                 let mut children = Vec::new();
                 for (index, child) in elements.iter().enumerate() {

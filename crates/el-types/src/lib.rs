@@ -176,6 +176,10 @@ pub enum TypedPatternKind {
         symbol: SymbolId,
         name: String,
     },
+    StructuralUnionMember {
+        member: TypeId,
+        pattern: Box<TypedPattern>,
+    },
     Tuple(Vec<TypedPattern>),
     ListEmpty,
     ListCons {
@@ -592,7 +596,7 @@ enum PatternShape {
     Integer(i128),
     Float(u64),
     Atom(String),
-    Union(TypeId),
+    Union(TypeId, Box<(TypeId, PatternShape)>),
     Tuple(Vec<(TypeId, PatternShape)>),
     ListEmpty,
     ListCons(Box<(TypeId, PatternShape)>, Box<(TypeId, PatternShape)>),
@@ -2231,6 +2235,40 @@ impl<'a> Checker<'a> {
         scopes: &[BTreeMap<String, Local>],
         bindings: &mut BTreeMap<String, Local>,
     ) -> Option<(TypedPattern, PatternShape)> {
+        if node.kind.as_str() == "tuple_pattern"
+            && let Type::Union(members) = self.types[subject.0 as usize].clone()
+        {
+            let candidates = members
+                .into_iter()
+                .filter(|member| self.pattern_may_match_type(node, *member))
+                .collect::<Vec<_>>();
+            let [member] = candidates.as_slice() else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2131",
+                    node.span,
+                    "tuple pattern must select exactly one tuple member of the subject union",
+                ));
+                return None;
+            };
+            let member = *member;
+            let (nested, nested_shape) =
+                self.check_pattern(node, member, owner, scopes, bindings)?;
+            return Some((
+                TypedPattern {
+                    kind: TypedPatternKind::StructuralUnionMember {
+                        member,
+                        pattern: Box::new(nested),
+                    },
+                    ty: subject,
+                    span: node.span,
+                    facts: PatternFacts {
+                        reachable: true,
+                        irrefutable: false,
+                    },
+                },
+                PatternShape::Union(member, Box::new((member, nested_shape))),
+            ));
+        }
         let (kind, irrefutable, shape) = match node.kind.as_str() {
             "wildcard_pattern" => (TypedPatternKind::Wildcard, true, PatternShape::Wildcard),
             "identifier" => {
@@ -2289,7 +2327,7 @@ impl<'a> Checker<'a> {
                             name: String::new(),
                         },
                         false,
-                        PatternShape::Union(expected),
+                        PatternShape::Union(expected, Box::new((expected, PatternShape::Wildcard))),
                     )
                 } else {
                     if expected != subject {
@@ -2397,7 +2435,7 @@ impl<'a> Checker<'a> {
                         name,
                     },
                     false,
-                    PatternShape::Union(member),
+                    PatternShape::Union(member, Box::new((member, PatternShape::Wildcard))),
                 )
             }
             "tuple_pattern" => {
@@ -2682,6 +2720,37 @@ impl<'a> Checker<'a> {
             },
             shape,
         ))
+    }
+
+    fn pattern_may_match_type(&self, node: &Node, ty: TypeId) -> bool {
+        match node.kind.as_str() {
+            "wildcard_pattern" | "identifier" => true,
+            "kw_true" | "kw_false" => matches!(self.types[ty.0 as usize], Type::Bool),
+            "atom" => {
+                let Some(Value::Atom { name, .. }) = node.value.as_ref() else {
+                    return false;
+                };
+                matches!(&self.types[ty.0 as usize], Type::Atom(expected) if expected == name)
+            }
+            "integer" => is_integer_type(&self.types[ty.0 as usize]),
+            "float" => matches!(self.types[ty.0 as usize], Type::F32 | Type::F64),
+            "tuple_pattern" => {
+                let Type::Tuple(elements) = &self.types[ty.0 as usize] else {
+                    return false;
+                };
+                node.children.len() == elements.len()
+                    && node
+                        .children
+                        .iter()
+                        .zip(elements)
+                        .all(|(child, element)| self.pattern_may_match_type(child, *element))
+            }
+            "list_pattern" => matches!(self.types[ty.0 as usize], Type::List(_)),
+            "bitstring_pattern" => matches!(self.types[ty.0 as usize], Type::Bytes),
+            "struct_pattern" => matches!(self.types[ty.0 as usize], Type::Struct { .. }),
+            "typed_pattern" => matches!(self.types[ty.0 as usize], Type::Union(_)),
+            _ => false,
+        }
     }
 
     fn check_ascription(
@@ -6711,6 +6780,7 @@ fn constructor_component_types(
     types: &[Type],
 ) -> Vec<TypeId> {
     match constructor {
+        PatternConstructor::Union(member) => vec![*member],
         PatternConstructor::Tuple(_) => match &types[ty.0 as usize] {
             Type::Tuple(elements) => elements.clone(),
             _ => Vec::new(),
@@ -6759,6 +6829,7 @@ fn specialize_matrix(
 
 fn constructor_arity(constructor: &PatternConstructor, matrix: &[Vec<PatternShape>]) -> usize {
     match constructor {
+        PatternConstructor::Union(_) => 1,
         PatternConstructor::Tuple(arity) => *arity,
         PatternConstructor::ListCons => 2,
         PatternConstructor::Struct(declaration) => matrix
@@ -6780,7 +6851,7 @@ fn shape_constructor(shape: &PatternShape) -> Option<PatternConstructor> {
         PatternShape::Integer(value) => Some(PatternConstructor::Integer(*value)),
         PatternShape::Float(value) => Some(PatternConstructor::Float(*value)),
         PatternShape::Atom(value) => Some(PatternConstructor::Atom(value.clone())),
-        PatternShape::Union(member) => Some(PatternConstructor::Union(*member)),
+        PatternShape::Union(member, _) => Some(PatternConstructor::Union(*member)),
         PatternShape::Tuple(elements) => Some(PatternConstructor::Tuple(elements.len())),
         PatternShape::ListEmpty => Some(PatternConstructor::ListEmpty),
         PatternShape::ListCons(_, _) => Some(PatternConstructor::ListCons),
@@ -6791,6 +6862,7 @@ fn shape_constructor(shape: &PatternShape) -> Option<PatternConstructor> {
 
 fn shape_components(shape: &PatternShape) -> Vec<(TypeId, PatternShape)> {
     match shape {
+        PatternShape::Union(_, payload) => vec![(**payload).clone()],
         PatternShape::Tuple(elements) | PatternShape::Struct(_, elements) => elements.clone(),
         PatternShape::ListCons(head, tail) => vec![(**head).clone(), (**tail).clone()],
         _ => Vec::new(),
@@ -6842,7 +6914,17 @@ fn verified_pattern_shape(pattern: &TypedPattern) -> (PatternShape, bool) {
             false,
         ),
         TypedPatternKind::Atom(value) => (PatternShape::Atom(value.clone()), true),
-        TypedPatternKind::UnionMember { member, .. } => (PatternShape::Union(*member), false),
+        TypedPatternKind::UnionMember { member, .. } => (
+            PatternShape::Union(*member, Box::new((*member, PatternShape::Wildcard))),
+            false,
+        ),
+        TypedPatternKind::StructuralUnionMember { member, pattern } => {
+            let (shape, _) = verified_pattern_shape(pattern);
+            (
+                PatternShape::Union(*member, Box::new((*member, shape))),
+                false,
+            )
+        }
         TypedPatternKind::Tuple(elements) => {
             let mut irrefutable = true;
             let children = elements
@@ -7558,6 +7640,9 @@ fn collect_pattern_expr_locals(pattern: &TypedPattern, output: &mut BTreeSet<Sym
                 }
                 collect_pattern_expr_locals(&segment.pattern, output);
             }
+        }
+        TypedPatternKind::StructuralUnionMember { pattern, .. } => {
+            collect_pattern_expr_locals(pattern, output);
         }
         TypedPatternKind::Wildcard
         | TypedPatternKind::Binding { .. }
@@ -9338,6 +9423,25 @@ fn verify_pattern(
             if symbols.insert(*symbol, *member).is_some() {
                 errors.push("pattern binding symbol is defined twice".to_owned());
             }
+        }
+        TypedPatternKind::StructuralUnionMember {
+            member,
+            pattern: nested,
+        } => {
+            if !matches!(&types[pattern.ty.0 as usize], Type::Union(members) if members.contains(member))
+                || nested.ty != *member
+            {
+                errors.push("structural union pattern names an invalid member".to_owned());
+            }
+            verify_pattern(
+                nested,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
         }
         TypedPatternKind::Tuple(elements) => {
             let expected = match &types[pattern.ty.0 as usize] {
