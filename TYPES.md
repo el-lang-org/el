@@ -23,10 +23,10 @@ truthiness, nullable reference, runtime-reified generic, or runtime protocol
 value. The compiler may carry an error type internally for diagnostic recovery;
 that type is not an EL type and cannot make an otherwise invalid program valid.
 
-EL's type system is Go-inspired rather than Go-identical: it is small and
-static, uses explicit conversions, has no implicit numeric coercions, and favors
-simple nominal types. EL protocols use explicit `defimpl` declarations rather
-than Go's implicit structural interface satisfaction.
+EL's type system is small and static: it uses explicit conversions, has no
+implicit numeric coercions, and favors simple nominal types. EL protocols use
+explicit `defimpl` declarations rather than implicit structural interface
+satisfaction.
 
 ## 2. Primitive and built-in scalar types
 

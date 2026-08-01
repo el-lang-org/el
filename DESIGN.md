@@ -24,7 +24,7 @@ decision log before implementation or examples depend on it.
 EL is a statically typed, garbage-collected systems programming language with:
 
 - Elixir-inspired surface syntax;
-- a Go-inspired type system;
+- a small static type system;
 - immutable local bindings by default;
 - explicit local mutability with `mut` and rebinding with `:=`;
 - native ahead-of-time (AOT) compilation through LLVM; and
@@ -328,10 +328,10 @@ is a design-oriented tour of the same type system and its standard-library
 contracts; if the descriptions diverge, `TYPES.md` controls type formation,
 equality, inference, checking, conformance, and static well-formedness.
 
-EL's type system is Go-inspired rather than Go-identical: it is small and
-static, uses explicit conversions, has no implicit numeric coercions, and favors
-simple nominal types. EL protocols use explicit `defimpl` declarations rather
-than Go's implicit structural interface satisfaction.
+EL's type system is small and static: it uses explicit conversions, has no
+implicit numeric coercions, and favors simple nominal types. EL protocols use
+explicit `defimpl` declarations rather than implicit structural interface
+satisfaction.
 
 ### 6.1 Primitive and built-in scalar types
 
