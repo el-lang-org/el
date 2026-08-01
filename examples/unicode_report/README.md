@@ -4,8 +4,9 @@ This multi-module EL v1 program accepts an optional text argument and reports
 its UTF-8 byte count, Unicode scalar count, extended grapheme-cluster count, and
 grapheme frequency map. It demonstrates manifests, modules, a derived struct,
 tagged results, exhaustive pattern matching, pipelines, generic `Enum`
-reduction and callbacks, immutable maps, recursive numeric formatting, buffers,
-process arguments, Unicode 17 semantics, and console output.
+reduction and callbacks, immutable maps, recursive list traversal, recursive
+numeric formatting, buffers, process arguments, Unicode 17 semantics, and
+console output.
 
 Its source tree also demonstrates path-derived nested modules: analysis lives
 under `src/analysis/`, presentation and formatting live under `src/output/`,

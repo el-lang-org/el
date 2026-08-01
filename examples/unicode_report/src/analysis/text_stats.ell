@@ -17,6 +17,13 @@ defmodule Analysis.TextStats do
     end
   end
 
+  def count_graphemes(graphemes: [string]) -> usize do
+    match graphemes do
+      [_ | rest] -> 1 + count_graphemes(rest)
+      [] -> 0
+    end
+  end
+
   def analyze(text: string) -> Summary do
     graphemes = text |> String.graphemes()
     frequencies: Map(string, i32) = Enum.reduce(graphemes, Map.new(), increment)
@@ -24,7 +31,7 @@ defmodule Analysis.TextStats do
       text: text,
       byte_count: String.byte_size(text),
       codepoint_count: Enum.count(String.codepoint_view(text)),
-      grapheme_count: Enum.count(graphemes),
+      grapheme_count: count_graphemes(graphemes),
       unique_graphemes: Map.size(frequencies),
       frequencies: frequencies
     }
