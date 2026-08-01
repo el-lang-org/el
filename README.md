@@ -2,6 +2,9 @@
 
 An Elixir-syntax-inspired, statically typed programming language.
 
+> **Note:** EL is a toy language built for experimentation and fun. It
+> is not intended for production use.
+
 EL is a small, statically typed, garbage-collected systems programming language.
 It compiles ahead of time to native executables through LLVM. The bootstrap
 compiler is written in Rust.
