@@ -1,0 +1,8 @@
+version = 1
+
+[[package]]
+name = "file_copy"
+namespace = "FileCopy"
+version = "1.0.0"
+source = "root"
+dependencies = []

@@ -1,0 +1,68 @@
+defmodule Main do
+  def close_reader(reader: File.Reader) -> unit do
+    match File.close(reader) do
+      {:ok, _} -> unit
+      {:error, error} -> IO.report(error)
+    end
+  end
+
+  def close_writer(writer: File.Writer) -> unit do
+    match File.close(writer) do
+      {:ok, _} -> unit
+      {:error, error} -> IO.report(error)
+    end
+  end
+
+  def copy(reader: File.Reader, writer: File.Writer) -> bool do
+    match Reader.read(reader, 16) do
+      {:ok, data} ->
+        match Writer.write(writer, data) do
+          {:ok, _} -> copy(reader, writer)
+          {:error, error} ->
+            IO.report(error)
+            false
+        end
+      :eof ->
+        match Writer.flush(writer) do
+          {:ok, _} -> true
+          {:error, error} ->
+            IO.report(error)
+            false
+        end
+      {:error, error} ->
+        IO.report(error)
+        false
+    end
+  end
+
+  def copy_to(reader: File.Reader) -> bool do
+    match File.create("output.txt") do
+      {:ok, writer} ->
+        defer close_writer(writer)
+        copy(reader, writer)
+      {:error, error} ->
+        IO.report(error)
+        false
+    end
+  end
+
+  def run() -> bool do
+    match File.open_read("input.txt") do
+      {:ok, reader} ->
+        defer close_reader(reader)
+        copy_to(reader)
+      {:error, error} ->
+        IO.report(error)
+        false
+    end
+  end
+
+  def main() -> i32 do
+    if run() do
+      IO.println("Copied input.txt to output.txt")
+      0
+    else
+      1
+    end
+  end
+end
