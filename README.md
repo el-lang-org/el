@@ -1,8 +1,9 @@
 # EL
 
+An Elixir-syntax-inspired, statically typed programming language.
+
 EL is a small, statically typed, garbage-collected systems programming language.
-It combines an Elixir-inspired surface syntax with a small static type system
-and compiles ahead of time to native executables through LLVM. The bootstrap
+It compiles ahead of time to native executables through LLVM. The bootstrap
 compiler is written in Rust.
 
 ```el
@@ -50,18 +51,18 @@ EL deliberately leaves out exceptions, hidden numeric coercions, macros, async
 runtimes, a JIT, and user-facing `unsafe` or FFI features in v1.
 That smaller surface is intentional: the goal is a language whose behavior can
 be understood and trusted from source to native executable. See
-[EXAMPLES.md](EXAMPLES.md) for a guided tour of these features.
+[docs/EXAMPLES.md](docs/EXAMPLES.md) for a guided tour of these features.
 
 ## Project status
 
 The v1 implementation and conformance milestones are complete. The only
 supported native target is currently Darwin arm64 (`aarch64-apple-darwin`), and
 native builds require the pinned LLVM and runtime prerequisites described in
-[BUILDING.md](BUILDING.md).
+[docs/BUILDING.md](docs/BUILDING.md).
 
 EL is available under the [MIT License](LICENSE). Distribution requirements for
 the project and its vendored components are documented in
-[LICENSE_POLICY.md](LICENSE_POLICY.md).
+[docs/LICENSE_POLICY.md](docs/LICENSE_POLICY.md).
 
 ## Build the compiler
 
@@ -85,8 +86,8 @@ cargo build --release -p el-cli --features el-driver/managed-runtime
 ```
 
 LLVM, Boehm GC, validation, and release-gate details are maintained in
-[BUILDING.md](BUILDING.md). The technical distribution contract is in
-[V1_DISTRIBUTION.md](V1_DISTRIBUTION.md).
+[docs/BUILDING.md](docs/BUILDING.md). The technical distribution contract is in
+[docs/V1_DISTRIBUTION.md](docs/V1_DISTRIBUTION.md).
 
 ## Try the example project
 
@@ -119,14 +120,14 @@ command. Native executables are written beneath
 
 ## Language and compiler documentation
 
-- [DESIGN.md](DESIGN.md) — vision, runtime semantics, architecture, roadmap,
+- [docs/DESIGN.md](docs/DESIGN.md) — vision, runtime semantics, architecture,
   CLI contract, and accepted decisions
-- [GRAMMAR.md](GRAMMAR.md) — normative lexical and concrete syntax
-- [TYPES.md](TYPES.md) — normative type formation and static semantics
-- [IR.md](IR.md) — compiler representations, lowering boundaries, and verifier
+- [docs/GRAMMAR.md](docs/GRAMMAR.md) — normative lexical and concrete syntax
+- [docs/TYPES.md](docs/TYPES.md) — normative type formation and static semantics
+- [docs/IR.md](docs/IR.md) — compiler representations, lowering boundaries, and verifier
   invariants
-- [EXAMPLES.md](EXAMPLES.md) — illustrative EL programs and language tour
-- [V1_CONFORMANCE.md](V1_CONFORMANCE.md) — specification-to-test traceability
+- [docs/EXAMPLES.md](docs/EXAMPLES.md) — illustrative EL programs and language tour
+- [docs/V1_CONFORMANCE.md](docs/V1_CONFORMANCE.md) — specification-to-test traceability
 
 When documents overlap, the normative document for the subject takes
 precedence; examples do not override the language specification.
@@ -135,6 +136,7 @@ precedence; examples do not override the language specification.
 
 ```text
 crates/                    Rust compiler and runtime crates
+docs/                      Language and compiler specification documents
 examples/unicode_report/  Multi-module EL v1 example project
 runtime/                   Vendored GC and pinned Unicode inputs
 tests/conformance/v1/      Accepted and rejected v1 fixtures
@@ -142,6 +144,6 @@ tools/                     Deterministic source-data generators
 ```
 
 Changes should follow the milestone and compiler-stage boundaries in
-[DESIGN.md](DESIGN.md) and the repository guidance in [AGENTS.md](AGENTS.md).
-Run the checks required by [BUILDING.md](BUILDING.md) before handing off a
+[docs/DESIGN.md](docs/DESIGN.md) and the repository guidance in [docs/AGENTS.md](docs/AGENTS.md).
+Run the checks required by [docs/BUILDING.md](docs/BUILDING.md) before handing off a
 change.

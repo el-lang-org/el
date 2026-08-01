@@ -1,4 +1,4 @@
-# conformance: accept; spec=EXAMPLES.md §10-12, TYPES.md §6
+# conformance: accept; spec=docs/EXAMPLES.md §10-12, docs/TYPES.md §6
 defmodule Main do
   @derive [Eq]
   defstruct Box(a) when a: Eq do

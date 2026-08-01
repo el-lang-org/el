@@ -1,4 +1,4 @@
-# conformance: accept; spec=EXAMPLES.md §1-5, GRAMMAR.md §3, TYPES.md §7
+# conformance: accept; spec=docs/EXAMPLES.md §1-5, docs/GRAMMAR.md §3, docs/TYPES.md §7
 defmodule Main do
   def main() -> i32 do
     left: i32 = 20

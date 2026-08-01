@@ -15,4 +15,4 @@ line records whether the program must be accepted or rejected, its expected
 phase and stable diagnostic code when rejected, and the controlling
 specification section. Crate-local conformance tests continue to own the dense
 boundary matrices; the repository-level fixtures protect representative
-end-to-end behavior from `EXAMPLES.md`.
+end-to-end behavior from `../docs/EXAMPLES.md`.

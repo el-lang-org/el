@@ -1,4 +1,4 @@
-# conformance: accept; spec=EXAMPLES.md §6, TYPES.md §8
+# conformance: accept; spec=docs/EXAMPLES.md §6, docs/TYPES.md §8
 defmodule Main do
   @type Parsed = {:ok, i32} | :error
 
