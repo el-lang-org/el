@@ -31,6 +31,7 @@ defmodule Analysis.TextStats do
       text: text,
       byte_count: String.byte_size(text),
       codepoint_count: Enum.count(String.codepoint_view(text)),
+      # Use recursion for demo purpose
       grapheme_count: count_graphemes(graphemes),
       unique_graphemes: Map.size(frequencies),
       frequencies: frequencies
