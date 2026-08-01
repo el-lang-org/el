@@ -59,10 +59,9 @@ supported native target is currently Darwin arm64 (`aarch64-apple-darwin`), and
 native builds require the pinned LLVM and runtime prerequisites described in
 [BUILDING.md](BUILDING.md).
 
-EL is not yet published for distribution. The repository does not currently
-declare a project license, which is an explicit release blocker. See
-[LICENSE_POLICY.md](LICENSE_POLICY.md) before copying or distributing the source
-or compiler binaries.
+EL is available under the [MIT License](LICENSE). Distribution requirements for
+the project and its vendored components are documented in
+[LICENSE_POLICY.md](LICENSE_POLICY.md).
 
 ## Build the compiler
 

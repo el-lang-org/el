@@ -1,9 +1,7 @@
 # License policy
 
-The EL repository does not yet declare a project license. This is an explicit
-EL v1 release blocker: compiler binaries and source releases must not be
-published until the project owners select and add one. Milestone 9 technical
-conformance does not imply permission to distribute.
+EL source code and compiler binaries are licensed under the MIT License in
+[LICENSE](LICENSE). Source and binary distributions must include that notice.
 
 Third-party source may be added only when its exact version, source revision,
 archive checksum, upstream URL, and license notice are checked in. The CI

@@ -1260,9 +1260,9 @@ Boehm GC 8.2.12 revision, target, pointer width, and Unicode 17.0.0 in build
 metadata. Darwin arm64 is the sole supported native target and passes development
 and optimized workspace semantics, LLVM verification, the full Unicode corpus,
 and all native tests with collection at every managed allocation. The normative
-CLI and grammar reject audited post-v1 commands and syntax. Publication remains
-legally blocked, independently of technical conformance, until the project owners
-select the EL project license required by `LICENSE_POLICY.md`.
+CLI and grammar reject audited post-v1 commands and syntax. The project is
+licensed under MIT, and distributions must include the notices required by
+`LICENSE_POLICY.md`.
 
 ## 8. Test architecture
 

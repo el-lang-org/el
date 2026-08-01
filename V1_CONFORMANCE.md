@@ -54,7 +54,5 @@ Backend and collector types remain behind private Rust and C interfaces.
 
 Run the commands in `BUILDING.md` on every target listed as supported in
 `V1_DISTRIBUTION.md`. A target is removed from that list if any required command
-cannot run or any accepted/rejected fixture differs. The repository currently
-has an independent legal distribution blocker: no EL project license has been
-selected. `LICENSE_POLICY.md` therefore forbids publishing artifacts even after
-technical conformance passes.
+cannot run or any accepted/rejected fixture differs. Distributions must include
+the notices required by `LICENSE_POLICY.md`.

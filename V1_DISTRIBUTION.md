@@ -1,6 +1,6 @@
 # EL v1 distribution and host support
 
-Status: technical distribution contract; publication blocked pending a project license
+Status: technical distribution contract
 
 ## Supported target
 
@@ -43,8 +43,8 @@ install -m 0755 target/release/el /usr/local/bin/el
 el --version
 ```
 
-The repository currently forbids publishing this artifact because no project
-license has been selected. Local evaluation does not resolve that legal blocker.
+Distributions must include the project and third-party notices described in
+`LICENSE_POLICY.md`.
 
 ## Reproducibility metadata
 

@@ -120,8 +120,8 @@ cargo build --workspace --locked --offline
 ```
 
 Verify `/opt/homebrew/opt/llvm/bin/llvm-config --version` is `22.1.8` before the
-backend commands. Publication remains blocked until the project-license issue
-in `LICENSE_POLICY.md` is resolved.
+backend commands. Distribution license requirements are documented in
+`LICENSE_POLICY.md`.
 
 ## Unicode data regeneration
 
