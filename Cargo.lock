@@ -55,6 +55,7 @@ dependencies = [
 name = "el-driver"
 version = "0.1.0"
 dependencies = [
+ "el-ast",
  "el-codegen",
  "el-ir",
  "el-parser",

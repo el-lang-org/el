@@ -1369,7 +1369,19 @@ fn parse_type(
             }
             if matches!(
                 written.as_str(),
-                "Buffer" | "String.Utf8Error" | "String.CodepointView" | "String.GraphemeView"
+                "Buffer"
+                    | "String.Utf8Error"
+                    | "String.CodepointView"
+                    | "String.GraphemeView"
+                    | "File.Reader"
+                    | "File.Writer"
+                    | "File.Error"
+                    | "IO.Stdin"
+                    | "IO.Stdout"
+                    | "IO.Stderr"
+                    | "IO.Error"
+                    | "IO.ErrorKind"
+                    | "IO.Operation"
             ) {
                 if node.children.len() != 1 {
                     diagnostics.push(Diagnostic::error(

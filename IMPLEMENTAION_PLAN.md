@@ -1172,44 +1172,60 @@ provide recoverable process/file boundaries.
 
 **Deliverable groups**
 
-1. [ ] Strict `el.toml` parsing for package ID, namespace, semantic version,
+1. [x] Strict `el.toml` parsing for package ID, namespace, semantic version,
    dependencies, and optional single executable target; unknown keys are errors.
-2. [ ] Strict `src/` discovery and mechanical path-to-module validation.
-3. [ ] Package-relative, dependency-qualified, and prelude name resolution with
+2. [x] Strict `src/` discovery and mechanical path-to-module validation.
+3. [x] Package-relative, dependency-qualified, and prelude name resolution with
    collision and ambiguity diagnostics.
-4. [ ] Exact path dependency resolution and full-commit Git dependency resolution.
-5. [ ] Graph-wide package/source/version/revision uniqueness, namespace uniqueness,
+4. [x] Exact path dependency resolution and full-commit Git dependency resolution.
+5. [x] Graph-wide package/source/version/revision uniqueness, namespace uniqueness,
    dependency cycle detection, and deterministic traversal.
-6. [ ] Deterministic `el.lock` generation/refresh and non-mutating `--locked`
+6. [x] Deterministic `el.lock` generation/refresh and non-mutating `--locked`
    verification.
-7. [ ] Full `el check`, `el build`, and `el emit llvm-ir --module ...` behavior,
+7. [x] Full `el check`, `el build`, and `el emit llvm-ir --module ...` behavior,
    output paths, streams, and status classes.
-8. [ ] `Reader` and `Writer` with associated errors and tagged result values.
-9. [ ] Console conveniences constrained by `Show`, plus recoverable standard stream
+8. [x] `Reader` and `Writer` with associated errors and tagged result values.
+9. [x] Console conveniences constrained by `Show`, plus recoverable standard stream
    handles.
-10. [ ] Typed file reader/writer handles, shared external identity, close-through-
+10. [x] Typed file reader/writer handles, shared external identity, close-through-
     alias behavior, tagged closed-handle errors, and explicit `defer` cleanup.
-11. [ ] Stable error kind/operation/code inspection, internal interrupted-call
+11. [x] Stable error kind/operation/code inspection, internal interrupted-call
     retry, and exact protocol laws.
-12. [ ] Launch-time process arguments/environment snapshots with strict native
+12. [x] Launch-time process arguments/environment snapshots with strict native
     UTF conversion and exact platform-specific string path conversion.
-13. [ ] Complete reserved prelude and standard modules with no implicit functions.
+13. [x] Complete reserved prelude and standard modules with no implicit functions.
 
 **Tests**
 
-- [ ] Manifest keys, module mapping, visibility, package ownership, dependency
+- [x] Manifest keys, module mapping, visibility, package ownership, dependency
   conflicts, cycles, namespaces, exact versions, Git pins, and lock stability.
-- [ ] `--locked` missing/stale behavior without filesystem mutation.
-- [ ] CLI option orders, duplicate/unknown options, streams, statuses 0/1/2, output
+- [x] `--locked` missing/stale behavior without filesystem mutation.
+- [x] CLI option orders, duplicate/unknown options, streams, statuses 0/1/2, output
   locations, library-only behavior, and absence of deferred commands.
-- [ ] Complete writes, EOF, flush, console newline behavior, typed file modes,
+- [x] Complete writes, EOF, flush, console newline behavior, typed file modes,
   error mappings/accessors, alias/close behavior, and interrupted calls.
-- [ ] Argument ordering, executable-name exclusion, environment snapshots, invalid
+- [x] Argument ordering, executable-name exclusion, environment snapshots, invalid
   native text, embedded NULs, and exact Unix/Windows path conversion.
-- [ ] Multi-package and multi-module end-to-end builds using only source packages.
+- [x] Multi-package and multi-module end-to-end builds using only source packages.
 
-- [ ] **Exit gate:** build a multi-module manifest target that reads, transforms, and
+- [x] **Exit gate:** build a multi-module manifest target that reads, transforms, and
   writes data while handling every recoverable error through exhaustive `match`.
+
+**Progress:** strict manifests, deterministic source discovery, globally qualified
+package namespaces, exact path/commit dependency graphs, and deterministic lockfiles
+now drive `check`, native `build`, and per-module LLVM emission. The language/runtime
+boundary exposes typed reader and writer handles, recoverable console streams,
+portable error inspection, interrupted-call retry, complete writes, EOF, flushing,
+and shared close-through-alias state. Process entry snapshots arguments and the
+environment before `Main.main`, validates native text without replacement, and
+preserves exact host path bytes on the initial Unix host path.
+
+Native GC-stress coverage exercises file creation, write/flush/close, reopen/read,
+console newline and error reporting, process argument/environment results, and
+portable error matching. The combined manifest exit fixture qualifies two modules
+under their package namespace, reads and transforms input, exhaustively handles
+every tagged I/O result with explicit deferred cleanup, writes the output, and
+passes in development and optimized builds. This completes Milestone 8.
 
 ### Milestone 9 — V1 stabilization
 

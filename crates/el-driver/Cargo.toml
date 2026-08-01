@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+el-ast = { path = "../el-ast", version = "=0.1.0" }
 el-codegen = { path = "../el-codegen", version = "=0.1.0" }
 el-ir = { path = "../el-ir", version = "=0.1.0" }
 el-parser = { path = "../el-parser", version = "=0.1.0" }

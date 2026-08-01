@@ -25,7 +25,7 @@ mod llvm;
 #[cfg(any(feature = "llvm", feature = "llvm-api-check"))]
 pub use llvm::{
     BackendError, VerifiedLlvmIr, emit_host_object, emit_host_object_with_profile,
-    host_target_metadata, lower_to_llvm_ir,
+    host_target_metadata, lower_module_to_llvm_ir, lower_to_llvm_ir,
 };
 
 /// The allocation size and ABI alignment of a concrete value, in bytes.
@@ -181,6 +181,7 @@ pub fn compute_primitive_layouts(module: &ConcreteModule, abi: PrimitiveAbi) -> 
             Type::F64 => Some(abi.f64),
             Type::Isize | Type::Usize => Some(abi.usize),
             Type::Function { .. } => Some(abi.usize),
+            Type::Opaque(_) => Some(abi.usize),
             Type::Bool => Some(abi.boolean),
             Type::Unit => Some(abi.unit),
             Type::String

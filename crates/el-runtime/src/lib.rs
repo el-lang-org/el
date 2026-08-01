@@ -4,6 +4,13 @@
 //! details, including Boehm types, stay in the private C wrapper built by the
 //! `boehm` feature.
 
+mod standard;
+pub use standard::{
+    ErrorKind, FileError, FileReader, FileStream, FileWriter, IoError, IoOperation,
+    ProcessSnapshot, ReadResult, Reader, Stderr, Stdin, Stdout, Writer, append_file, create_file,
+    open_file, stderr, stdin, stdout,
+};
+
 #[cfg(feature = "boehm")]
 use std::path::{Path, PathBuf};
 
@@ -31,6 +38,22 @@ pub const UTF8_VALIDATE_SYMBOL: &str = "__el_runtime_utf8_validate";
 pub const GRAPHEME_NEXT_SYMBOL: &str = "__el_runtime_grapheme_next";
 /// Counts Unicode extended grapheme clusters in valid UTF-8.
 pub const GRAPHEME_COUNT_SYMBOL: &str = "__el_runtime_grapheme_count";
+pub const FILE_OPEN_SYMBOL: &str = "__el_runtime_file_open";
+pub const FILE_CLOSE_SYMBOL: &str = "__el_runtime_file_close";
+pub const READER_READ_SYMBOL: &str = "__el_runtime_reader_read";
+pub const WRITER_WRITE_SYMBOL: &str = "__el_runtime_writer_write";
+pub const WRITER_FLUSH_SYMBOL: &str = "__el_runtime_writer_flush";
+pub const STDIN_SYMBOL: &str = "__el_runtime_stdin";
+pub const STDOUT_SYMBOL: &str = "__el_runtime_stdout";
+pub const STDERR_SYMBOL: &str = "__el_runtime_stderr";
+pub const ERROR_KIND_SYMBOL: &str = "__el_runtime_error_kind";
+pub const ERROR_OPERATION_SYMBOL: &str = "__el_runtime_error_operation";
+pub const ERROR_CODE_SYMBOL: &str = "__el_runtime_error_code";
+pub const PROCESS_SNAPSHOT_SYMBOL: &str = "__el_runtime_process_snapshot";
+pub const PROCESS_ARGUMENTS_SYMBOL: &str = "__el_runtime_process_arguments";
+pub const PROCESS_GET_ENV_SYMBOL: &str = "__el_runtime_process_get_env";
+pub const CONSOLE_WRITE_SYMBOL: &str = "__el_runtime_console_write";
+pub const CONSOLE_ERROR_SYMBOL: &str = "__el_runtime_console_error";
 
 /// Static archives required when linking a managed EL executable.
 #[cfg(feature = "boehm")]
@@ -79,7 +102,22 @@ pub fn runtime_call_effect(symbol: &str) -> Option<RuntimeCallEffect> {
         | UTF8_VALIDATE_SYMBOL
         | GRAPHEME_NEXT_SYMBOL
         | GRAPHEME_COUNT_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
-        ALLOCATE_SCANNED_SYMBOL | ALLOCATE_ATOMIC_SYMBOL => Some(RuntimeCallEffect::Allocating),
+        ALLOCATE_SCANNED_SYMBOL
+        | ALLOCATE_ATOMIC_SYMBOL
+        | FILE_OPEN_SYMBOL
+        | FILE_CLOSE_SYMBOL
+        | READER_READ_SYMBOL
+        | WRITER_WRITE_SYMBOL
+        | WRITER_FLUSH_SYMBOL
+        | STDIN_SYMBOL
+        | STDOUT_SYMBOL
+        | STDERR_SYMBOL => Some(RuntimeCallEffect::Allocating),
+        ERROR_KIND_SYMBOL
+        | ERROR_OPERATION_SYMBOL
+        | ERROR_CODE_SYMBOL
+        | PROCESS_SNAPSHOT_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
+        PROCESS_ARGUMENTS_SYMBOL | PROCESS_GET_ENV_SYMBOL => Some(RuntimeCallEffect::Allocating),
+        CONSOLE_WRITE_SYMBOL | CONSOLE_ERROR_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         FAILURE_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         _ => None,
     }

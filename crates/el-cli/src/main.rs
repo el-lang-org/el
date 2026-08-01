@@ -29,7 +29,7 @@ fn run() -> u8 {
                 }
             };
             match el_driver::run_project_command(command.driver_command(), &current_directory) {
-                Ok(()) => 0,
+                Ok(output) => write_stdout(output.stdout()),
                 Err(error) => {
                     eprintln!("error: {error}");
                     1

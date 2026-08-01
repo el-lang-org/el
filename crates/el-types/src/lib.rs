@@ -11,6 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeId(pub u32);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OpaqueType {
+    FileReader,
+    FileWriter,
+    FileError,
+    IoStdin,
+    IoStdout,
+    IoStderr,
+    IoError,
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Type {
     I8,
@@ -27,6 +38,7 @@ pub enum Type {
     Buffer,
     Rune,
     Utf8Error,
+    Opaque(OpaqueType),
     CodepointView,
     GraphemeView,
     U8,
@@ -279,6 +291,10 @@ pub enum TypedExprKind {
     String(String),
     Rune(char),
     Atom(String),
+    StandardCall {
+        operation: StandardOperation,
+        arguments: Vec<TypedExpr>,
+    },
     List {
         elements: Vec<TypedExpr>,
         tail: Option<Box<TypedExpr>>,
@@ -437,6 +453,28 @@ pub enum TypedExprKind {
         member: TypeId,
         value: Box<TypedExpr>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StandardOperation {
+    FileOpenRead,
+    FileCreate,
+    FileAppend,
+    FileClose,
+    ReaderRead,
+    WriterWrite,
+    WriterFlush,
+    IoStdin,
+    IoStdout,
+    IoStderr,
+    ErrorKind,
+    ErrorOperation,
+    ErrorCode,
+    ProcessArguments,
+    ProcessGetEnv,
+    IoPrint,
+    IoPrintln,
+    IoReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -854,6 +892,40 @@ impl<'a> Checker<'a> {
                 "Buffer" => Some(self.intern(Type::Buffer)),
                 "rune" => Some(self.intern(Type::Rune)),
                 "String.Utf8Error" => Some(self.intern(Type::Utf8Error)),
+                "File.Reader" => Some(self.intern(Type::Opaque(OpaqueType::FileReader))),
+                "File.Writer" => Some(self.intern(Type::Opaque(OpaqueType::FileWriter))),
+                "File.Error" => Some(self.intern(Type::Opaque(OpaqueType::FileError))),
+                "IO.Stdin" => Some(self.intern(Type::Opaque(OpaqueType::IoStdin))),
+                "IO.Stdout" => Some(self.intern(Type::Opaque(OpaqueType::IoStdout))),
+                "IO.Stderr" => Some(self.intern(Type::Opaque(OpaqueType::IoStderr))),
+                "IO.Error" => Some(self.intern(Type::Opaque(OpaqueType::IoError))),
+                "IO.ErrorKind" => self.closed_atom_union(
+                    &[
+                        "not_found",
+                        "permission_denied",
+                        "already_exists",
+                        "invalid_input",
+                        "is_directory",
+                        "not_directory",
+                        "closed",
+                        "broken_pipe",
+                        "out_of_space",
+                        "other",
+                    ],
+                    *span,
+                ),
+                "IO.Operation" => self.closed_atom_union(
+                    &[
+                        "open_read",
+                        "create",
+                        "append",
+                        "read",
+                        "write",
+                        "flush",
+                        "close",
+                    ],
+                    *span,
+                ),
                 "String.CodepointView" => Some(self.intern(Type::CodepointView)),
                 "String.GraphemeView" => Some(self.intern(Type::GraphemeView)),
                 "u8" => Some(self.intern(Type::U8)),
@@ -1479,7 +1551,20 @@ impl<'a> Checker<'a> {
                         span: node.span,
                     });
                 }
-                if written == "String.Utf8Error" && node.children.len() == 1 {
+                if matches!(
+                    written.as_str(),
+                    "String.Utf8Error"
+                        | "File.Reader"
+                        | "File.Writer"
+                        | "File.Error"
+                        | "IO.Stdin"
+                        | "IO.Stdout"
+                        | "IO.Stderr"
+                        | "IO.Error"
+                        | "IO.ErrorKind"
+                        | "IO.Operation"
+                ) && node.children.len() == 1
+                {
                     return Some(TypeSyntax::Primitive {
                         name: written,
                         span: node.span,
@@ -2191,15 +2276,32 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let expected = self.intern(Type::Atom(name.clone()));
-                if expected != subject {
-                    self.type_mismatch(node.span, subject, expected);
-                    return None;
+                if matches!(
+                    self.types.get(subject.0 as usize),
+                    Some(Type::Union(members)) if members.contains(&expected)
+                ) {
+                    let symbol = SymbolId(self.next_symbol);
+                    self.next_symbol += 1;
+                    (
+                        TypedPatternKind::UnionMember {
+                            member: expected,
+                            symbol,
+                            name: String::new(),
+                        },
+                        false,
+                        PatternShape::Union(expected),
+                    )
+                } else {
+                    if expected != subject {
+                        self.type_mismatch(node.span, subject, expected);
+                        return None;
+                    }
+                    (
+                        TypedPatternKind::Atom(name.clone()),
+                        true,
+                        PatternShape::Atom(name.clone()),
+                    )
                 }
-                (
-                    TypedPatternKind::Atom(name.clone()),
-                    true,
-                    PatternShape::Atom(name.clone()),
-                )
             }
             "integer" if is_integer_type(&self.types[subject.0 as usize]) => {
                 let value = integer_value(node)?;
@@ -4267,6 +4369,48 @@ impl<'a> Checker<'a> {
         if written.as_deref().is_some_and(|name| {
             matches!(
                 name,
+                "File.open_read"
+                    | "File.create"
+                    | "File.append"
+                    | "File.close"
+                    | "Reader.read"
+                    | "Writer.write"
+                    | "Writer.flush"
+                    | "IO.stdin"
+                    | "IO.stdout"
+                    | "IO.stderr"
+                    | "IO.error_kind"
+                    | "IO.error_operation"
+                    | "IO.error_code"
+                    | "File.error_kind"
+                    | "File.error_operation"
+                    | "File.error_code"
+                    | "Process.arguments"
+                    | "Process.get_env"
+                    | "IO.print"
+                    | "IO.println"
+                    | "IO.report"
+            )
+        }) {
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let arguments = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            return self.check_standard_intrinsic(
+                written.as_deref()?,
+                &arguments,
+                span,
+                owner,
+                scopes,
+            );
+        }
+        if written.as_deref().is_some_and(|name| {
+            matches!(
+                name,
                 "Array.length"
                     | "List.reverse"
                     | "Map.put"
@@ -4457,6 +4601,247 @@ impl<'a> Checker<'a> {
             ty: result,
             span,
         })
+    }
+
+    fn check_standard_intrinsic(
+        &mut self,
+        name: &str,
+        argument_nodes: &[&Node],
+        span: Span,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let (operation, expected_arguments) = match name {
+            "File.open_read" => (StandardOperation::FileOpenRead, 1),
+            "File.create" => (StandardOperation::FileCreate, 1),
+            "File.append" => (StandardOperation::FileAppend, 1),
+            "File.close" => (StandardOperation::FileClose, 1),
+            "Reader.read" => (StandardOperation::ReaderRead, 2),
+            "Writer.write" => (StandardOperation::WriterWrite, 2),
+            "Writer.flush" => (StandardOperation::WriterFlush, 1),
+            "IO.stdin" => (StandardOperation::IoStdin, 0),
+            "IO.stdout" => (StandardOperation::IoStdout, 0),
+            "IO.stderr" => (StandardOperation::IoStderr, 0),
+            "IO.error_kind" | "File.error_kind" => (StandardOperation::ErrorKind, 1),
+            "IO.error_operation" | "File.error_operation" => (StandardOperation::ErrorOperation, 1),
+            "IO.error_code" | "File.error_code" => (StandardOperation::ErrorCode, 1),
+            "Process.arguments" => (StandardOperation::ProcessArguments, 0),
+            "Process.get_env" => (StandardOperation::ProcessGetEnv, 1),
+            "IO.print" => (StandardOperation::IoPrint, 1),
+            "IO.println" => (StandardOperation::IoPrintln, 1),
+            "IO.report" => (StandardOperation::IoReport, 1),
+            _ => return None,
+        };
+        if argument_nodes.len() != expected_arguments {
+            self.diagnostics.push(Diagnostic::error(
+                "E2111",
+                span,
+                format!(
+                    "function `{name}` expects {expected_arguments} arguments but received {}",
+                    argument_nodes.len()
+                ),
+            ));
+            return None;
+        }
+        let string_ty = self.intern(Type::String);
+        let usize_ty = self.intern(Type::Usize);
+        let bytes_ty = self.intern(Type::Bytes);
+        let unit_ty = self.intern(Type::Unit);
+        let i64_ty = self.intern(Type::I64);
+        let reader_ty = self.intern(Type::Opaque(OpaqueType::FileReader));
+        let writer_ty = self.intern(Type::Opaque(OpaqueType::FileWriter));
+        let file_error_ty = self.intern(Type::Opaque(OpaqueType::FileError));
+        let stdin_ty = self.intern(Type::Opaque(OpaqueType::IoStdin));
+        let stdout_ty = self.intern(Type::Opaque(OpaqueType::IoStdout));
+        let stderr_ty = self.intern(Type::Opaque(OpaqueType::IoStderr));
+        let io_error_ty = self.intern(Type::Opaque(OpaqueType::IoError));
+        let mut arguments = Vec::new();
+        for (index, node) in argument_nodes.iter().enumerate() {
+            let expected = match operation {
+                StandardOperation::FileOpenRead
+                | StandardOperation::FileCreate
+                | StandardOperation::FileAppend => Some(string_ty),
+                StandardOperation::ReaderRead if index == 1 => Some(usize_ty),
+                StandardOperation::WriterWrite if index == 1 => Some(bytes_ty),
+                StandardOperation::ProcessGetEnv => Some(string_ty),
+                _ => None,
+            };
+            arguments.push(self.check_expr(node, expected, owner, scopes)?);
+        }
+        let result = match operation {
+            StandardOperation::FileOpenRead
+            | StandardOperation::FileCreate
+            | StandardOperation::FileAppend => {
+                let handle = if matches!(operation, StandardOperation::FileOpenRead) {
+                    reader_ty
+                } else {
+                    writer_ty
+                };
+                self.tagged_result_type(handle, file_error_ty, span)?
+            }
+            StandardOperation::FileClose => {
+                let argument = arguments[0].ty;
+                if !matches!(
+                    self.types.get(argument.0 as usize),
+                    Some(Type::Opaque(
+                        OpaqueType::FileReader | OpaqueType::FileWriter
+                    ))
+                ) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        "File.close requires File.Reader or File.Writer",
+                    ));
+                    return None;
+                }
+                self.tagged_result_type(unit_ty, file_error_ty, span)?
+            }
+            StandardOperation::ReaderRead => {
+                let error = match self.types.get(arguments[0].ty.0 as usize) {
+                    Some(Type::Opaque(OpaqueType::FileReader)) => file_error_ty,
+                    Some(Type::Opaque(OpaqueType::IoStdin)) => io_error_ty,
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2108",
+                            arguments[0].span,
+                            "Reader.read requires a standard Reader handle",
+                        ));
+                        return None;
+                    }
+                };
+                let ok = self.tagged_tuple_type("ok", bytes_ty);
+                let eof = self.intern(Type::Atom("eof".to_owned()));
+                let error = self.tagged_tuple_type("error", error);
+                self.normalize_union(vec![ok, eof, error], span)?
+            }
+            StandardOperation::WriterWrite | StandardOperation::WriterFlush => {
+                let error = match self.types.get(arguments[0].ty.0 as usize) {
+                    Some(Type::Opaque(OpaqueType::FileWriter)) => file_error_ty,
+                    Some(Type::Opaque(OpaqueType::IoStdout | OpaqueType::IoStderr)) => io_error_ty,
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2108",
+                            arguments[0].span,
+                            "Writer operation requires a standard Writer handle",
+                        ));
+                        return None;
+                    }
+                };
+                self.tagged_result_type(unit_ty, error, span)?
+            }
+            StandardOperation::IoStdin => stdin_ty,
+            StandardOperation::IoStdout => stdout_ty,
+            StandardOperation::IoStderr => stderr_ty,
+            StandardOperation::ErrorKind
+            | StandardOperation::ErrorOperation
+            | StandardOperation::ErrorCode => {
+                if !matches!(
+                    self.types.get(arguments[0].ty.0 as usize),
+                    Some(Type::Opaque(OpaqueType::FileError | OpaqueType::IoError))
+                ) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        "error inspection requires File.Error or IO.Error",
+                    ));
+                    return None;
+                }
+                match operation {
+                    StandardOperation::ErrorKind => self.closed_atom_union(
+                        &[
+                            "not_found",
+                            "permission_denied",
+                            "already_exists",
+                            "invalid_input",
+                            "is_directory",
+                            "not_directory",
+                            "closed",
+                            "broken_pipe",
+                            "out_of_space",
+                            "other",
+                        ],
+                        span,
+                    )?,
+                    StandardOperation::ErrorOperation => self.closed_atom_union(
+                        &[
+                            "open_read",
+                            "create",
+                            "append",
+                            "read",
+                            "write",
+                            "flush",
+                            "close",
+                        ],
+                        span,
+                    )?,
+                    StandardOperation::ErrorCode => {
+                        let some = self.tagged_tuple_type("some", i64_ty);
+                        let none = self.intern(Type::Atom("none".to_owned()));
+                        self.normalize_union(vec![some, none], span)?
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            StandardOperation::ProcessArguments => {
+                let arguments = self.intern(Type::List(string_ty));
+                let ok = self.tagged_tuple_type("ok", arguments);
+                let invalid = self.tagged_tuple_type("invalid_text", usize_ty);
+                let error = self.tagged_tuple_type("error", invalid);
+                self.normalize_union(vec![ok, error], span)?
+            }
+            StandardOperation::ProcessGetEnv => {
+                let ok = self.tagged_tuple_type("ok", string_ty);
+                let not_found = self.intern(Type::Atom("not_found".to_owned()));
+                let invalid_name = self.intern(Type::Atom("invalid_name".to_owned()));
+                let invalid_text = self.intern(Type::Atom("invalid_text".to_owned()));
+                let reason = self.normalize_union(vec![invalid_name, invalid_text], span)?;
+                let error = self.tagged_tuple_type("error", reason);
+                self.normalize_union(vec![ok, not_found, error], span)?
+            }
+            StandardOperation::IoPrint
+            | StandardOperation::IoPrintln
+            | StandardOperation::IoReport => {
+                if !self.type_satisfies(arguments[0].ty, "Show", owner) {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2120",
+                        arguments[0].span,
+                        format!(
+                            "type `{}` does not satisfy `Show`",
+                            self.type_name(arguments[0].ty)
+                        ),
+                    ));
+                    return None;
+                }
+                unit_ty
+            }
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::StandardCall {
+                operation,
+                arguments,
+            },
+            ty: result,
+            span,
+        })
+    }
+
+    fn tagged_tuple_type(&mut self, tag: &str, value: TypeId) -> TypeId {
+        let tag = self.intern(Type::Atom(tag.to_owned()));
+        self.intern(Type::Tuple(vec![tag, value]))
+    }
+
+    fn closed_atom_union(&mut self, names: &[&str], span: Span) -> Option<TypeId> {
+        let members = names
+            .iter()
+            .map(|name| self.intern(Type::Atom((*name).to_owned())))
+            .collect();
+        self.normalize_union(members, span)
+    }
+
+    fn tagged_result_type(&mut self, ok: TypeId, error: TypeId, span: Span) -> Option<TypeId> {
+        let ok = self.tagged_tuple_type("ok", ok);
+        let error = self.tagged_tuple_type("error", error);
+        self.normalize_union(vec![ok, error], span)
     }
 
     fn check_collection_intrinsic(
@@ -5329,6 +5714,15 @@ impl<'a> Checker<'a> {
             Type::Buffer => false,
             Type::F32 | Type::F64 => false,
             Type::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
+            Type::Opaque(kind) => match kind {
+                OpaqueType::FileReader | OpaqueType::IoStdin => protocol == "Reader",
+                OpaqueType::FileWriter | OpaqueType::IoStdout | OpaqueType::IoStderr => {
+                    protocol == "Writer"
+                }
+                OpaqueType::FileError | OpaqueType::IoError => {
+                    matches!(protocol, "Eq" | "Show" | "Hash")
+                }
+            },
             Type::CodepointView | Type::GraphemeView => protocol == "Iterable",
             Type::List(item) => match protocol {
                 "Iterable" | "Concat" => true,
@@ -5436,6 +5830,28 @@ impl<'a> Checker<'a> {
         associated: &str,
         argument: TypeId,
     ) -> Option<TypeId> {
+        if protocol == "Reader" && associated == "Error" {
+            return match self.types[argument.0 as usize] {
+                Type::Opaque(OpaqueType::FileReader) => {
+                    Some(self.intern(Type::Opaque(OpaqueType::FileError)))
+                }
+                Type::Opaque(OpaqueType::IoStdin) => {
+                    Some(self.intern(Type::Opaque(OpaqueType::IoError)))
+                }
+                _ => None,
+            };
+        }
+        if protocol == "Writer" && associated == "Error" {
+            return match self.types[argument.0 as usize] {
+                Type::Opaque(OpaqueType::FileWriter) => {
+                    Some(self.intern(Type::Opaque(OpaqueType::FileError)))
+                }
+                Type::Opaque(OpaqueType::IoStdout | OpaqueType::IoStderr) => {
+                    Some(self.intern(Type::Opaque(OpaqueType::IoError)))
+                }
+                _ => None,
+            };
+        }
         if protocol != "Iterable" {
             return None;
         }
@@ -5517,6 +5933,7 @@ impl<'a> Checker<'a> {
             Type::Buffer => "Buffer".to_owned(),
             Type::Rune => "rune".to_owned(),
             Type::Utf8Error => "String.Utf8Error".to_owned(),
+            Type::Opaque(kind) => opaque_type_name(*kind).to_owned(),
             Type::CodepointView => "String.CodepointView".to_owned(),
             Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
@@ -5600,6 +6017,7 @@ impl<'a> Checker<'a> {
             Type::Buffer => "00:Buffer".to_owned(),
             Type::Rune => "00:rune".to_owned(),
             Type::Utf8Error => "00:String.Utf8Error".to_owned(),
+            Type::Opaque(kind) => format!("00:{}", opaque_type_name(*kind)),
             Type::CodepointView => "00:String.CodepointView".to_owned(),
             Type::GraphemeView => "00:String.GraphemeView".to_owned(),
             Type::U8 => "00:u8".to_owned(),
@@ -5781,6 +6199,18 @@ fn resolved_type_id_for_conformance(
     }
 }
 
+fn opaque_type_name(ty: OpaqueType) -> &'static str {
+    match ty {
+        OpaqueType::FileReader => "File.Reader",
+        OpaqueType::FileWriter => "File.Writer",
+        OpaqueType::FileError => "File.Error",
+        OpaqueType::IoStdin => "IO.Stdin",
+        OpaqueType::IoStdout => "IO.Stdout",
+        OpaqueType::IoStderr => "IO.Stderr",
+        OpaqueType::IoError => "IO.Error",
+    }
+}
+
 fn primitive_type_name(ty: &Type) -> Option<&'static str> {
     Some(match ty {
         Type::I8 => "i8",
@@ -5797,6 +6227,7 @@ fn primitive_type_name(ty: &Type) -> Option<&'static str> {
         Type::Buffer => "Buffer",
         Type::Rune => "rune",
         Type::Utf8Error => "String.Utf8Error",
+        Type::Opaque(kind) => opaque_type_name(*kind),
         Type::CodepointView => "String.CodepointView",
         Type::GraphemeView => "String.GraphemeView",
         Type::U8 => "u8",
@@ -6915,6 +7346,11 @@ fn collect_block_locals(block: &TypedBlock, output: &mut BTreeSet<SymbolId>) {
 
 fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) {
     match &expression.kind {
+        TypedExprKind::StandardCall { arguments, .. } => {
+            for argument in arguments {
+                collect_expr_locals(argument, output);
+            }
+        }
         TypedExprKind::Local(symbol) => {
             output.insert(*symbol);
         }
@@ -9081,6 +9517,7 @@ impl TypedProgram {
             Type::Buffer => "Buffer".to_owned(),
             Type::Rune => "rune".to_owned(),
             Type::Utf8Error => "String.Utf8Error".to_owned(),
+            Type::Opaque(kind) => opaque_type_name(*kind).to_owned(),
             Type::CodepointView => "String.CodepointView".to_owned(),
             Type::GraphemeView => "String.GraphemeView".to_owned(),
             Type::U8 => "u8".to_owned(),
@@ -9244,6 +9681,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::String(value) => format!("string {value:?}"),
         TypedExprKind::Rune(value) => format!("rune {value:?}"),
         TypedExprKind::Atom(name) => format!("atom :{name}"),
+        TypedExprKind::StandardCall { operation, .. } => format!("standard {operation:?}"),
         TypedExprKind::List { .. } => "list".to_owned(),
         TypedExprKind::ListReverse(_) => "list reverse".to_owned(),
         TypedExprKind::Array(_) => "array".to_owned(),

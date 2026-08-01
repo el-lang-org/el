@@ -1688,3 +1688,14 @@ fn checks_composite_map_keys_structural_equality_and_insertion_order_view() {
     assert!(debug.contains("comparison Equal: bool"), "{debug}");
     verify(&typed).expect("map equality and insertion-order view verify");
 }
+
+#[test]
+fn checks_typed_file_reader_writer_and_exhaustive_results() {
+    let source = "defmodule Main do\n  def consume_ok(value: {:ok, bytes}) -> i32 do\n    match value do\n      {:ok, data} -> if Bytes.byte_size(data) > 0 do 1 else 0 end\n    end\n  end\n  def consume(reader: File.Reader) -> i32 do\n    match Reader.read(reader, 1024) do\n      value: {:ok, bytes} -> consume_ok(value)\n      _ -> 0\n    end\n  end\n  def produce(writer: File.Writer, data: bytes) -> i32 do\n    match Writer.write(writer, data) do\n      value: {:ok, unit} -> 0\n      value: {:error, File.Error} -> 1\n    end\n  end\n  def cleanup(reader: File.Reader) -> unit do\n    match File.close(reader) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def opened(value: {:ok, File.Reader}) -> i32 do\n    match value do\n      {:ok, reader} ->\n        defer cleanup(reader)\n        consume(reader)\n    end\n  end\n  def main() -> i32 do\n    match File.open_read(\"input.txt\") do\n      value: {:ok, File.Reader} -> opened(value)\n      value: {:error, File.Error} -> 0\n    end\n  end\nend\n";
+    let typed = checked(source).expect("standard file results type check exhaustively");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("standard ReaderRead"), "{debug}");
+    assert!(debug.contains("standard WriterWrite"), "{debug}");
+    assert!(debug.contains("standard FileOpenRead"), "{debug}");
+    verify(&typed).expect("standard-call Typed AST verifies");
+}

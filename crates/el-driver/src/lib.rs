@@ -1,11 +1,18 @@
 //! Project discovery and compiler pipeline orchestration.
 
+use el_ast::{Node, Program, Value};
 use el_codegen::{CodegenProfile, MetadataWriteError, TargetMetadata};
 use el_ir::GenericModule;
 use el_span::{Diagnostic, FileId};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+mod package;
+pub use package::{
+    DependencySource, Manifest, Package, PackageGraph, PackageId, PackageVersion,
+    ResolvedDependency, SourceModule, load_package_graph,
+};
 
 pub const MANIFEST_FILE_NAME: &str = "el.toml";
 
@@ -219,20 +226,20 @@ pub fn discover_project(start: &Path) -> Result<ProjectRoot, ProjectError> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectCommand {
     Check { locked: bool },
     Build { release: bool, locked: bool },
-    EmitLlvmIr,
+    EmitLlvmIr { module: String },
 }
 
 impl ProjectCommand {
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Check { .. } => "check",
             Self::Build { .. } => "build",
-            Self::EmitLlvmIr => "emit llvm-ir",
+            Self::EmitLlvmIr { .. } => "emit llvm-ir",
         }
     }
 }
@@ -242,12 +249,188 @@ impl ProjectCommand {
 /// Language compilation is deliberately unavailable until its first vertical
 /// slice; reaching this error proves that invocation and project discovery
 /// completed without crossing an unimplemented compiler stage.
-pub fn run_project_command(command: ProjectCommand, start: &Path) -> Result<(), ProjectError> {
+pub fn run_project_command(
+    command: ProjectCommand,
+    start: &Path,
+) -> Result<ProjectOutput, ProjectError> {
     let project = discover_project(start)?;
-    Err(ProjectError::CommandNotImplemented {
-        command: command.name(),
-        manifest: project.manifest_path,
-    })
+    let locked = match &command {
+        ProjectCommand::Check { locked } | ProjectCommand::Build { locked, .. } => *locked,
+        ProjectCommand::EmitLlvmIr { .. } => false,
+    };
+    let graph = load_package_graph(project.directory(), locked).map_err(ProjectError::Package)?;
+    let mut source_map = el_span::SourceMap::new();
+    let mut programs = Vec::new();
+    for package in graph.packages() {
+        let package_modules = package
+            .modules()
+            .iter()
+            .map(|module| module.name().to_owned())
+            .collect::<Vec<_>>();
+        for module in package.modules() {
+            let display = if package.id() == graph.root().id() {
+                module.relative_path().to_path_buf()
+            } else {
+                PathBuf::from(package.namespace()).join(module.relative_path())
+            };
+            let file = source_map.add_file(display, module.source().to_owned());
+            let mut program = el_parser::parse(file, module.source()).map_err(|error| {
+                ProjectError::Diagnostics(vec![Diagnostic::error(
+                    "E1000",
+                    error.span,
+                    error.message,
+                )])
+            })?;
+            qualify_dependency_program(&mut program, package.namespace(), &package_modules);
+            programs.push(program);
+        }
+    }
+    let resolved = el_resolve::resolve_package(&programs).map_err(ProjectError::Diagnostics)?;
+    let typed = el_types::check_package(&resolved).map_err(ProjectError::Diagnostics)?;
+    let core = el_ir::lower(&typed);
+
+    match command {
+        ProjectCommand::Check { .. } => Ok(ProjectOutput::default()),
+        ProjectCommand::Build { release, .. } => {
+            if graph.root().manifest().target().is_none() {
+                return Err(ProjectError::NoExecutableTarget {
+                    package: graph.root().id().as_str().to_owned(),
+                });
+            }
+            build_project(&core, graph.root(), BuildProfile::from_release(release))?;
+            Ok(ProjectOutput::default())
+        }
+        ProjectCommand::EmitLlvmIr { module } => {
+            if !graph
+                .root()
+                .modules()
+                .iter()
+                .any(|candidate| candidate.name() == module)
+            {
+                return Err(ProjectError::UnknownEmitModule(module));
+            }
+            Ok(ProjectOutput {
+                stdout: emit_module(&core, graph.root().namespace(), &module)?,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "llvm")]
+fn build_project(
+    core: &GenericModule,
+    package: &Package,
+    profile: BuildProfile,
+) -> Result<(), ProjectError> {
+    let target_module = package.manifest().target().expect("build target checked");
+    let qualified_target = format!("{}.{}", package.namespace(), target_module);
+    let roots = el_ir::executable_reachability_roots_for(core, &qualified_target)
+        .map_err(|error| ProjectError::Backend(format!("invalid executable target: {error:?}")))?;
+    let concrete = el_ir::monomorphize(core, &roots)
+        .map_err(|error| ProjectError::Backend(format!("monomorphization failed: {error:?}")))?;
+    let target = el_codegen::host_target_metadata()
+        .map_err(|error| ProjectError::Backend(error.to_string()))?;
+    let paths = prepare_build_output(package.root(), package.id().as_str(), &target, profile)
+        .map_err(|error| ProjectError::Backend(error.to_string()))?;
+    el_codegen::emit_host_object_with_profile(&concrete, paths.object(), profile.codegen_profile())
+        .map_err(|error| ProjectError::Backend(error.to_string()))?;
+    #[cfg(feature = "managed-runtime")]
+    el_codegen::link_host_managed_executable(&[paths.object()], paths.executable())
+        .map_err(|error| ProjectError::Backend(error.to_string()))?;
+    #[cfg(not(feature = "managed-runtime"))]
+    el_codegen::link_host_executable(paths.object(), paths.executable())
+        .map_err(|error| ProjectError::Backend(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "llvm"))]
+fn build_project(_: &GenericModule, _: &Package, _: BuildProfile) -> Result<(), ProjectError> {
+    Err(ProjectError::BackendUnavailable)
+}
+
+#[cfg(feature = "llvm")]
+fn emit_module(
+    core: &GenericModule,
+    namespace: &str,
+    module: &str,
+) -> Result<String, ProjectError> {
+    let qualified_module = format!("{namespace}.{module}");
+    let functions = core
+        .functions
+        .iter()
+        .filter(|function| {
+            function.module_name == qualified_module
+                && function.type_parameters.is_empty()
+                && function.constraints.is_empty()
+        })
+        .map(|function| function.id)
+        .collect::<Vec<_>>();
+    if functions.is_empty() {
+        return Err(ProjectError::Backend(format!(
+            "module `{module}` has no monomorphic functions to emit"
+        )));
+    }
+    let concrete = el_ir::monomorphize(core, &el_ir::ReachabilityRoots { functions })
+        .map_err(|error| ProjectError::Backend(format!("monomorphization failed: {error:?}")))?;
+    el_codegen::lower_module_to_llvm_ir(&concrete)
+        .map(|llvm| llvm.as_str().to_owned())
+        .map_err(|error| ProjectError::Backend(error.to_string()))
+}
+
+#[cfg(not(feature = "llvm"))]
+fn emit_module(_: &GenericModule, _: &str, _: &str) -> Result<String, ProjectError> {
+    Err(ProjectError::BackendUnavailable)
+}
+
+fn qualify_dependency_program(program: &mut Program, namespace: &str, modules: &[String]) {
+    qualify_dependency_node(&mut program.root, namespace, modules, true);
+}
+
+fn qualify_dependency_node(
+    node: &mut Node,
+    namespace: &str,
+    modules: &[String],
+    mut module_declaration: bool,
+) {
+    if matches!(node.kind.as_str(), "type_path" | "qualified_value") {
+        let path = node
+            .children
+            .iter()
+            .filter_map(|component| match &component.value {
+                Some(Value::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let written = path.join(".");
+        let internal = module_declaration
+            || modules
+                .iter()
+                .any(|module| written == *module || written.starts_with(&format!("{module}.")));
+        if internal && path.first().copied() != Some(namespace) {
+            let template = node.children.first().cloned();
+            if let Some(mut component) = template {
+                component.value = Some(Value::Text(namespace.to_owned()));
+                node.children.insert(0, component);
+            }
+        }
+        module_declaration = false;
+    }
+    for child in &mut node.children {
+        qualify_dependency_node(child, namespace, modules, module_declaration);
+        module_declaration = false;
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectOutput {
+    stdout: String,
+}
+
+impl ProjectOutput {
+    #[must_use]
+    pub fn stdout(&self) -> &str {
+        &self.stdout
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +442,14 @@ pub enum ProjectError {
         command: &'static str,
         manifest: PathBuf,
     },
+    Package(package::PackageError),
+    Diagnostics(Vec<Diagnostic>),
+    NoExecutableTarget {
+        package: String,
+    },
+    UnknownEmitModule(String),
+    BackendUnavailable,
+    Backend(String),
 }
 
 impl fmt::Display for ProjectError {
@@ -274,6 +465,33 @@ impl fmt::Display for ProjectError {
                 "`el {command}` is not implemented in Milestone 0 (project `{}`)",
                 manifest.display()
             ),
+            Self::Package(error) => write!(formatter, "{error}"),
+            Self::Diagnostics(diagnostics) => {
+                write!(
+                    formatter,
+                    "compilation failed with {} diagnostic(s)",
+                    diagnostics.len()
+                )?;
+                for diagnostic in diagnostics {
+                    write!(
+                        formatter,
+                        "\nerror[{}]: {}",
+                        diagnostic.code, diagnostic.message
+                    )?;
+                }
+                Ok(())
+            }
+            Self::NoExecutableTarget { package } => write!(
+                formatter,
+                "package `{package}` has no executable target; use `el check`"
+            ),
+            Self::UnknownEmitModule(module) => {
+                write!(formatter, "package does not contain module `{module}`")
+            }
+            Self::BackendUnavailable => formatter.write_str(
+                "native project builds require an EL compiler built with the LLVM backend",
+            ),
+            Self::Backend(message) => formatter.write_str(message),
         }
     }
 }
@@ -425,14 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn known_command_fails_as_an_ordinary_project_error() {
+    fn malformed_manifest_fails_as_an_ordinary_project_error() {
         let temp = TempDir::new();
         fs::write(temp.path().join(MANIFEST_FILE_NAME), "").expect("write manifest");
 
         let error = run_project_command(ProjectCommand::Check { locked: false }, temp.path())
-            .expect_err("Milestone 0 command remains unavailable");
+            .expect_err("invalid project manifest must fail");
 
-        assert!(matches!(error, ProjectError::CommandNotImplemented { .. }));
+        assert!(matches!(error, ProjectError::Package(_)));
     }
 
     #[test]
@@ -495,5 +713,116 @@ mod tests {
             private.primary.start(),
             main.find("Library.hidden").unwrap()
         );
+    }
+
+    #[test]
+    fn checks_a_manifest_project_with_a_namespaced_path_dependency_and_stable_lock() {
+        let temp = TempDir::new();
+        let dependency = temp.path().join("dep");
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::create_dir_all(dependency.join("src")).unwrap();
+        fs::write(
+            temp.path().join("el.toml"),
+            "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps.dep]\npath = \"dep\"\nversion = \"2.0.0\"\n\n[target]\nmain = \"Main\"\n",
+        ).unwrap();
+        fs::write(
+            temp.path().join("src/main.el"),
+            "defmodule Main do\n  def main() -> i32 do\n    Dep.Utility.answer()\n  end\nend\n",
+        )
+        .unwrap();
+        fs::write(
+            dependency.join("el.toml"),
+            "[package]\nname = \"dep\"\nnamespace = \"Dep\"\nversion = \"2.0.0\"\n\n[deps]\n",
+        )
+        .unwrap();
+        fs::write(
+            dependency.join("src/utility.el"),
+            "defmodule Utility do\n  def answer() -> i32 do\n    42\n  end\nend\n",
+        )
+        .unwrap();
+
+        run_project_command(ProjectCommand::Check { locked: false }, temp.path())
+            .expect("multi-package check succeeds");
+        let first = fs::read_to_string(temp.path().join("el.lock")).unwrap();
+        run_project_command(ProjectCommand::Check { locked: true }, temp.path())
+            .expect("generated lock verifies");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("el.lock")).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn locked_check_never_creates_a_missing_lockfile() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("el.toml"),
+            "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps]\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("src/main.el"),
+            "defmodule Main do\n  def main() -> i32 do\n    0\n  end\nend\n",
+        )
+        .unwrap();
+
+        let error = run_project_command(ProjectCommand::Check { locked: true }, temp.path())
+            .expect_err("missing locked file fails");
+        assert!(matches!(
+            error,
+            ProjectError::Package(package::PackageError::Lockfile(_))
+        ));
+        assert!(!temp.path().join("el.lock").exists());
+    }
+
+    #[cfg(feature = "llvm")]
+    #[test]
+    fn manifest_build_and_emit_use_the_selected_target_module() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(
+            temp.path().join("el.toml"),
+            "[package]\nname = \"app\"\nnamespace = \"App\"\nversion = \"1.0.0\"\n\n[deps]\n\n[target]\nmain = \"Command\"\n",
+        ).unwrap();
+        fs::write(
+            temp.path().join("src/command.el"),
+            "defmodule Command do\n  def main() -> i32 do\n    42\n  end\nend\n",
+        )
+        .unwrap();
+
+        run_project_command(
+            ProjectCommand::Build {
+                release: false,
+                locked: false,
+            },
+            temp.path(),
+        )
+        .expect("manifest target builds");
+        let target = el_codegen::host_target_metadata().unwrap();
+        let executable = temp
+            .path()
+            .join("build")
+            .join(target.llvm_target_triple())
+            .join("debug")
+            .join(format!("app{}", std::env::consts::EXE_SUFFIX));
+        assert!(executable.is_file());
+        assert_eq!(
+            std::process::Command::new(executable)
+                .status()
+                .unwrap()
+                .code(),
+            Some(42)
+        );
+
+        let output = run_project_command(
+            ProjectCommand::EmitLlvmIr {
+                module: "Command".to_owned(),
+            },
+            temp.path(),
+        )
+        .expect("module emits LLVM IR");
+        assert!(output.stdout().contains("define i32 @el.f"));
+        assert!(!output.stdout().contains("define i32 @main"));
     }
 }

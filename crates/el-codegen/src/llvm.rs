@@ -5,8 +5,8 @@ use crate::{CodegenProfile, InvalidTargetMetadata, TargetMetadata};
 use el_ir::{
     ArithmeticOperator, Block, BlockId, ComparisonOperator, ConcreteModule, Constant,
     CoreFailureCategory, CoreFunction, FunctionId, IntegerBinaryOperator, IntegerUnaryOperator,
-    Operation, SlotId, SwitchValue, Terminator, Type, TypeId, ValueId, WrappingIntegerOperator,
-    collection_point_roots, verify_concrete,
+    OpaqueType, Operation, SlotId, StandardOperation, SwitchValue, Terminator, Type, TypeId,
+    ValueId, WrappingIntegerOperator, collection_point_roots, verify_concrete,
 };
 #[cfg(feature = "managed-runtime")]
 use el_ir::{
@@ -14,8 +14,11 @@ use el_ir::{
 };
 #[cfg(feature = "managed-runtime")]
 use el_runtime::{
-    ALLOCATE_ATOMIC_SYMBOL, ALLOCATE_SCANNED_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL,
-    UTF8_VALIDATE_SYMBOL,
+    ALLOCATE_ATOMIC_SYMBOL, ALLOCATE_SCANNED_SYMBOL, CONSOLE_ERROR_SYMBOL, CONSOLE_WRITE_SYMBOL,
+    ERROR_CODE_SYMBOL, ERROR_KIND_SYMBOL, ERROR_OPERATION_SYMBOL, FILE_CLOSE_SYMBOL,
+    FILE_OPEN_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL, PROCESS_ARGUMENTS_SYMBOL,
+    PROCESS_GET_ENV_SYMBOL, PROCESS_SNAPSHOT_SYMBOL, READER_READ_SYMBOL, STDERR_SYMBOL,
+    STDIN_SYMBOL, STDOUT_SYMBOL, UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL, WRITER_WRITE_SYMBOL,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory, GRAPHEME_COUNT_SYMBOL, GRAPHEME_NEXT_SYMBOL};
 use inkwell::AddressSpace;
@@ -199,7 +202,14 @@ impl std::error::Error for BackendError {}
 /// and verifies the resulting LLVM module before returning deterministic text.
 pub fn lower_to_llvm_ir(core: &ConcreteModule) -> Result<VerifiedLlvmIr, BackendError> {
     let context = Context::create();
-    let module = lower_verified_module(&context, core)?;
+    let module = lower_verified_module(&context, core, true)?;
+    Ok(VerifiedLlvmIr(module.print_to_string().to_string()))
+}
+
+/// Lowers one diagnostic module without synthesizing a host process entry.
+pub fn lower_module_to_llvm_ir(core: &ConcreteModule) -> Result<VerifiedLlvmIr, BackendError> {
+    let context = Context::create();
+    let module = lower_verified_module(&context, core, false)?;
     Ok(VerifiedLlvmIr(module.print_to_string().to_string()))
 }
 
@@ -253,7 +263,7 @@ pub fn emit_host_object_with_profile(
         .map_err(BackendError::InvalidTargetMetadata)?;
 
     let context = Context::create();
-    let module = lower_verified_module(&context, core)?;
+    let module = lower_verified_module(&context, core, true)?;
     module.set_triple(&triple);
     module.set_data_layout(&target_data.get_data_layout());
     module
@@ -318,9 +328,10 @@ fn optimization_pipeline(profile: CodegenProfile) -> &'static str {
 fn lower_verified_module<'ctx>(
     context: &'ctx Context,
     core: &ConcreteModule,
+    process_entry: bool,
 ) -> Result<Module<'ctx>, BackendError> {
     verify_concrete(core).map_err(BackendError::InvalidConcrete)?;
-    let module = ModuleLowerer::new(context, core).lower()?;
+    let module = ModuleLowerer::new(context, core).lower(process_entry)?;
     module
         .verify()
         .map_err(|error| BackendError::Verification(error.to_string()))?;
@@ -338,6 +349,12 @@ struct ModuleLowerer<'ctx, 'core> {
     #[cfg(feature = "managed-runtime")]
     initialize_runtime: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
+    process_snapshot: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    console_write: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    console_error: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
     allocate_scanned: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     allocate_atomic: FunctionValue<'ctx>,
@@ -345,6 +362,8 @@ struct ModuleLowerer<'ctx, 'core> {
     hash_seed: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     utf8_validate: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    standard_calls: BTreeMap<StandardOperation, FunctionValue<'ctx>>,
     grapheme_count: FunctionValue<'ctx>,
     grapheme_next: FunctionValue<'ctx>,
 }
@@ -685,6 +704,48 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             None,
         );
         #[cfg(feature = "managed-runtime")]
+        let process_snapshot = module.add_function(
+            PROCESS_SNAPSHOT_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.i32_type().into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let console_write = module.add_function(
+            CONSOLE_WRITE_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.i32_type().into(),
+                    context.i32_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let console_error = module.add_function(
+            CONSOLE_ERROR_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.i32_type().into(),
+                    context.i32_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
         let allocate_scanned = module.add_function(
             ALLOCATE_SCANNED_SYMBOL,
             context.ptr_type(AddressSpace::default()).fn_type(
@@ -739,6 +800,142 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ),
             None,
         );
+        #[cfg(feature = "managed-runtime")]
+        let standard_calls = {
+            let pointer = context.ptr_type(AddressSpace::default());
+            let usize_ty = context
+                .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                .expect("host usize type");
+            let mut calls = BTreeMap::new();
+            calls.insert(
+                StandardOperation::FileOpenRead,
+                module.add_function(
+                    FILE_OPEN_SYMBOL,
+                    pointer.fn_type(
+                        &[
+                            pointer.into(),
+                            usize_ty.into(),
+                            context.i32_type().into(),
+                            pointer.into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                ),
+            );
+            let open = calls[&StandardOperation::FileOpenRead];
+            calls.insert(StandardOperation::FileCreate, open);
+            calls.insert(StandardOperation::FileAppend, open);
+            calls.insert(
+                StandardOperation::FileClose,
+                module.add_function(
+                    FILE_CLOSE_SYMBOL,
+                    pointer.fn_type(&[pointer.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::ReaderRead,
+                module.add_function(
+                    READER_READ_SYMBOL,
+                    pointer.fn_type(
+                        &[
+                            pointer.into(),
+                            usize_ty.into(),
+                            pointer.into(),
+                            pointer.into(),
+                            pointer.into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::WriterWrite,
+                module.add_function(
+                    WRITER_WRITE_SYMBOL,
+                    pointer.fn_type(&[pointer.into(), pointer.into(), usize_ty.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::WriterFlush,
+                module.add_function(
+                    WRITER_FLUSH_SYMBOL,
+                    pointer.fn_type(&[pointer.into()], false),
+                    None,
+                ),
+            );
+            for (operation, symbol) in [
+                (StandardOperation::IoStdin, STDIN_SYMBOL),
+                (StandardOperation::IoStdout, STDOUT_SYMBOL),
+                (StandardOperation::IoStderr, STDERR_SYMBOL),
+            ] {
+                calls.insert(
+                    operation,
+                    module.add_function(symbol, pointer.fn_type(&[], false), None),
+                );
+            }
+            calls.insert(
+                StandardOperation::ErrorKind,
+                module.add_function(
+                    ERROR_KIND_SYMBOL,
+                    context.i32_type().fn_type(&[pointer.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::ErrorOperation,
+                module.add_function(
+                    ERROR_OPERATION_SYMBOL,
+                    context.i32_type().fn_type(&[pointer.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::ErrorCode,
+                module.add_function(
+                    ERROR_CODE_SYMBOL,
+                    context
+                        .i64_type()
+                        .fn_type(&[pointer.into(), pointer.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::ProcessArguments,
+                module.add_function(
+                    PROCESS_ARGUMENTS_SYMBOL,
+                    pointer.fn_type(&[pointer.into()], false),
+                    None,
+                ),
+            );
+            calls.insert(
+                StandardOperation::ProcessGetEnv,
+                module.add_function(
+                    PROCESS_GET_ENV_SYMBOL,
+                    context.i32_type().fn_type(
+                        &[
+                            pointer.into(),
+                            usize_ty.into(),
+                            pointer.into(),
+                            pointer.into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                ),
+            );
+            for operation in [
+                StandardOperation::IoPrint,
+                StandardOperation::IoPrintln,
+                StandardOperation::IoReport,
+            ] {
+                calls.insert(operation, console_write);
+            }
+            calls
+        };
         let grapheme_count = module.add_function(
             GRAPHEME_COUNT_SYMBOL,
             context
@@ -788,6 +985,12 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             #[cfg(feature = "managed-runtime")]
             initialize_runtime,
             #[cfg(feature = "managed-runtime")]
+            process_snapshot,
+            #[cfg(feature = "managed-runtime")]
+            console_write,
+            #[cfg(feature = "managed-runtime")]
+            console_error,
+            #[cfg(feature = "managed-runtime")]
             allocate_scanned,
             #[cfg(feature = "managed-runtime")]
             allocate_atomic,
@@ -795,12 +998,14 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             hash_seed,
             #[cfg(feature = "managed-runtime")]
             utf8_validate,
+            #[cfg(feature = "managed-runtime")]
+            standard_calls,
             grapheme_count,
             grapheme_next,
         }
     }
 
-    fn lower(mut self) -> Result<Module<'ctx>, BackendError> {
+    fn lower(mut self, process_entry: bool) -> Result<Module<'ctx>, BackendError> {
         let mut functions = self.core.functions.iter().collect::<Vec<_>>();
         functions.sort_by_key(|function| function.id);
         for function in &functions {
@@ -822,7 +1027,9 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         for function in functions {
             self.lower_function(function)?;
         }
-        self.lower_process_entry()?;
+        if process_entry {
+            self.lower_process_entry()?;
+        }
         Ok(self.module)
     }
 
@@ -838,7 +1045,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     .iter()
                     .find(|function| function.id == *root)
             })
-            .find(|function| function.module_name == "Main" && function.name == "main")
+            .find(|function| function.name == "main")
             .ok_or(BackendError::MissingExecutableEntry)?;
         if !entry.is_exported()
             || !entry.parameters.is_empty()
@@ -857,6 +1064,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             .get(&entry.id)
             .copied()
             .ok_or(BackendError::MissingFunction(entry.id))?;
+        #[cfg(feature = "managed-runtime")]
+        let shim_type = self.context.i32_type().fn_type(
+            &[
+                self.context.i32_type().into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        );
+        #[cfg(not(feature = "managed-runtime"))]
         let shim_type = self.context.i32_type().fn_type(&[], false);
         let shim = self.module.add_function("main", shim_type, None);
         let block = self.context.append_basic_block(shim, "entry");
@@ -864,6 +1080,15 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         builder.position_at_end(block);
         #[cfg(feature = "managed-runtime")]
         built(builder.build_call(self.initialize_runtime, &[], ""))?;
+        #[cfg(feature = "managed-runtime")]
+        built(builder.build_call(
+            self.process_snapshot,
+            &[
+                shim.get_nth_param(0).expect("argc parameter").into(),
+                shim.get_nth_param(1).expect("argv parameter").into(),
+            ],
+            "",
+        ))?;
         let call = built(builder.build_call(target, &[], "el.exit_status"))?;
         let status = call
             .try_as_basic_value()
@@ -933,6 +1158,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 )
                 .into()),
             Some(Type::List(_)) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
+            Some(Type::Opaque(_)) => Ok(self.context.ptr_type(AddressSpace::default()).into()),
             Some(Type::Array { item, length }) => {
                 let item = self.basic_type(*item)?;
                 let fields = (0..*length).map(|_| item).collect::<Vec<_>>();
@@ -1138,6 +1364,714 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         Ok(output.into_struct_value())
     }
 
+    fn tagged_union_value(
+        &self,
+        union: TypeId,
+        tag_name: &str,
+        payload: BasicValueEnum<'ctx>,
+        name: &str,
+        builder: &Builder<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let Some(Type::Union(members)) = self.core.types.get(union.0 as usize) else {
+            return Err(BackendError::UnsupportedType(union));
+        };
+        let member = members
+            .iter()
+            .copied()
+            .find(|member| {
+                matches!(
+                    self.core.types.get(member.0 as usize),
+                    Some(Type::Tuple(fields))
+                        if matches!(
+                            fields.first().and_then(|field| self.core.types.get(field.0 as usize)),
+                            Some(Type::Atom(tag)) if tag == tag_name
+                        )
+                )
+            })
+            .ok_or(BackendError::UnsupportedType(union))?;
+        let mut tuple = AggregateValueEnum::StructValue(
+            self.basic_type(member)?.into_struct_type().get_undef(),
+        );
+        tuple = built(builder.build_insert_value(
+            tuple,
+            self.context.i8_type().const_zero(),
+            0,
+            &format!("{name}.atom"),
+        ))?;
+        tuple = built(builder.build_insert_value(tuple, payload, 1, &format!("{name}.payload")))?;
+        let tag = self.union_tag(union, member)?;
+        let mut output =
+            AggregateValueEnum::StructValue(self.basic_type(union)?.into_struct_type().get_undef());
+        output = built(builder.build_insert_value(
+            output,
+            self.context.i32_type().const_int(u64::from(tag), false),
+            0,
+            &format!("{name}.tag"),
+        ))?;
+        output = built(builder.build_insert_value(
+            output,
+            tuple.into_struct_value(),
+            tag + 1,
+            &format!("{name}.member"),
+        ))?;
+        Ok(output.into_struct_value())
+    }
+
+    fn tagged_union_payload_type(
+        &self,
+        union: TypeId,
+        tag_name: &str,
+    ) -> Result<TypeId, BackendError> {
+        let Some(Type::Union(members)) = self.core.types.get(union.0 as usize) else {
+            return Err(BackendError::UnsupportedType(union));
+        };
+        members
+            .iter()
+            .find_map(|member| match self.core.types.get(member.0 as usize) {
+                Some(Type::Tuple(fields))
+                    if matches!(
+                        fields.first().and_then(|field| self.core.types.get(field.0 as usize)),
+                        Some(Type::Atom(tag)) if tag == tag_name
+                    ) =>
+                {
+                    fields.get(1).copied()
+                }
+                _ => None,
+            })
+            .ok_or(BackendError::UnsupportedType(union))
+    }
+
+    fn atom_union_value(
+        &self,
+        union: TypeId,
+        atom_name: &str,
+        name: &str,
+        builder: &Builder<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let Some(Type::Union(members)) = self.core.types.get(union.0 as usize) else {
+            return Err(BackendError::UnsupportedType(union));
+        };
+        let member = members.iter().copied().find(|member| {
+            matches!(self.core.types.get(member.0 as usize), Some(Type::Atom(atom)) if atom == atom_name)
+        }).ok_or(BackendError::UnsupportedType(union))?;
+        let tag = self.union_tag(union, member)?;
+        let mut output =
+            AggregateValueEnum::StructValue(self.basic_type(union)?.into_struct_type().get_undef());
+        output = built(builder.build_insert_value(
+            output,
+            self.context.i32_type().const_int(u64::from(tag), false),
+            0,
+            &format!("{name}.tag"),
+        ))?;
+        output = built(builder.build_insert_value(
+            output,
+            self.context.i8_type().const_zero(),
+            tag + 1,
+            &format!("{name}.atom"),
+        ))?;
+        Ok(output.into_struct_value())
+    }
+
+    fn indexed_atom_union_value(
+        &self,
+        union: TypeId,
+        index: IntValue<'ctx>,
+        atoms: &[&str],
+        name: &str,
+        builder: &Builder<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let Some((last, prefix)) = atoms.split_last() else {
+            return Err(BackendError::UnsupportedType(union));
+        };
+        let mut value: BasicValueEnum<'ctx> =
+            self.atom_union_value(union, last, name, builder)?.into();
+        for (ordinal, atom) in prefix.iter().enumerate().rev() {
+            let matches = built(builder.build_int_compare(
+                IntPredicate::EQ,
+                index,
+                index.get_type().const_int(ordinal as u64, false),
+                &format!("{name}.{atom}.matches"),
+            ))?;
+            let candidate: BasicValueEnum<'ctx> = self
+                .atom_union_value(union, atom, &format!("{name}.{atom}"), builder)?
+                .into();
+            value = built(builder.build_select(
+                matches,
+                candidate,
+                value,
+                &format!("{name}.{atom}.select"),
+            ))?;
+        }
+        Ok(value)
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    fn lower_standard_call(
+        &self,
+        function: FunctionId,
+        block: BlockId,
+        builder: &Builder<'ctx>,
+        result: ValueId,
+        operation: StandardOperation,
+        arguments: &[ValueId],
+        ty: TypeId,
+        values: &mut BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+        slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
+        roots: Option<&el_ir::CollectionPointRoots>,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        value_types: &BTreeMap<ValueId, TypeId>,
+        slot_types: &BTreeMap<SlotId, TypeId>,
+    ) -> Result<(), BackendError> {
+        let roots = roots.ok_or_else(|| {
+            BackendError::InvalidConcrete(vec![format!(
+                "missing live-root set for standard call {function:?} {block:?}"
+            )])
+        })?;
+        self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+        let runtime = self.standard_calls[&operation];
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let usize_ty = self.usize_type()?;
+        if matches!(
+            operation,
+            StandardOperation::IoStdin | StandardOperation::IoStdout | StandardOperation::IoStderr
+        ) {
+            let handle = built(builder.build_call(runtime, &[], &format!("v{}.handle", result.0)))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::MissingValue(result))?;
+            self.clear_value_roots(roots, builder, root_slots, value_types)?;
+            values.insert(result, handle);
+            return Ok(());
+        }
+
+        if matches!(
+            operation,
+            StandardOperation::ErrorKind
+                | StandardOperation::ErrorOperation
+                | StandardOperation::ErrorCode
+        ) {
+            let error = pointer_value(values, arguments[0])?;
+            let value = match operation {
+                StandardOperation::ErrorKind | StandardOperation::ErrorOperation => {
+                    let index = built(builder.build_call(
+                        runtime,
+                        &[error.into()],
+                        &format!("v{}.error.field", result.0),
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::MissingValue(result))?
+                    .into_int_value();
+                    let atoms: &[&str] = if matches!(operation, StandardOperation::ErrorKind) {
+                        &[
+                            "not_found",
+                            "permission_denied",
+                            "already_exists",
+                            "invalid_input",
+                            "is_directory",
+                            "not_directory",
+                            "closed",
+                            "broken_pipe",
+                            "out_of_space",
+                            "other",
+                        ]
+                    } else {
+                        &[
+                            "open_read",
+                            "create",
+                            "append",
+                            "read",
+                            "write",
+                            "flush",
+                            "close",
+                        ]
+                    };
+                    self.indexed_atom_union_value(
+                        ty,
+                        index,
+                        atoms,
+                        &format!("v{}.error.field", result.0),
+                        builder,
+                    )?
+                }
+                StandardOperation::ErrorCode => {
+                    let has_slot =
+                        built(builder.build_alloca(self.context.i32_type(), "error.has_code"))?;
+                    let code = built(builder.build_call(
+                        runtime,
+                        &[error.into(), has_slot.into()],
+                        &format!("v{}.error.code", result.0),
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::MissingValue(result))?;
+                    let has = built(builder.build_load(
+                        self.context.i32_type(),
+                        has_slot,
+                        "error.has_code.value",
+                    ))?
+                    .into_int_value();
+                    let some: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(ty, "some", code, "error.code.some", builder)?
+                        .into();
+                    let none: BasicValueEnum<'ctx> = self
+                        .atom_union_value(ty, "none", "error.code.none", builder)?
+                        .into();
+                    let present = built(builder.build_int_compare(
+                        IntPredicate::NE,
+                        has,
+                        self.context.i32_type().const_zero(),
+                        "error.code.present",
+                    ))?;
+                    built(builder.build_select(present, some, none, "error.code.option"))?
+                }
+                _ => unreachable!(),
+            };
+            self.clear_value_roots(roots, builder, root_slots, value_types)?;
+            values.insert(result, value);
+            return Ok(());
+        }
+        if matches!(
+            operation,
+            StandardOperation::ProcessArguments | StandardOperation::ProcessGetEnv
+        ) {
+            let value = match operation {
+                StandardOperation::ProcessArguments => {
+                    let invalid_slot =
+                        built(builder.build_alloca(usize_ty, "process.arguments.invalid"))?;
+                    let list = built(builder.build_call(
+                        runtime,
+                        &[invalid_slot.into()],
+                        &format!("v{}.process.arguments", result.0),
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::MissingValue(result))?;
+                    let invalid = built(builder.build_load(
+                        usize_ty,
+                        invalid_slot,
+                        "process.arguments.invalid.value",
+                    ))?
+                    .into_int_value();
+                    let ok: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(ty, "ok", list, "process.arguments.ok", builder)?
+                        .into();
+                    let invalid_ty = self.tagged_union_payload_type(ty, "error")?;
+                    let mut detail = AggregateValueEnum::StructValue(
+                        self.basic_type(invalid_ty)?.into_struct_type().get_undef(),
+                    );
+                    detail = built(builder.build_insert_value(
+                        detail,
+                        self.context.i8_type().const_zero(),
+                        0,
+                        "process.arguments.invalid.atom",
+                    ))?;
+                    detail = built(builder.build_insert_value(
+                        detail,
+                        invalid,
+                        1,
+                        "process.arguments.invalid.index",
+                    ))?;
+                    let error: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(
+                            ty,
+                            "error",
+                            detail.into_struct_value().into(),
+                            "process.arguments.error",
+                            builder,
+                        )?
+                        .into();
+                    let valid = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        invalid,
+                        usize_ty.const_all_ones(),
+                        "process.arguments.valid",
+                    ))?;
+                    built(builder.build_select(valid, ok, error, "process.arguments.result"))?
+                }
+                StandardOperation::ProcessGetEnv => {
+                    let name = struct_value(values, arguments[0])?;
+                    let name_data = built(builder.build_extract_value(name, 0, "env.name.data"))?
+                        .into_pointer_value();
+                    let name_size = built(builder.build_extract_value(name, 1, "env.name.size"))?
+                        .into_int_value();
+                    let data_slot = built(builder.build_alloca(pointer_ty, "env.value.data"))?;
+                    let size_slot = built(builder.build_alloca(usize_ty, "env.value.size"))?;
+                    let status = built(builder.build_call(
+                        runtime,
+                        &[
+                            name_data.into(),
+                            name_size.into(),
+                            data_slot.into(),
+                            size_slot.into(),
+                        ],
+                        &format!("v{}.process.env", result.0),
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::MissingValue(result))?
+                    .into_int_value();
+                    let data =
+                        built(builder.build_load(pointer_ty, data_slot, "env.value.data.value"))?;
+                    let size =
+                        built(builder.build_load(usize_ty, size_slot, "env.value.size.value"))?;
+                    let string_ty = self.tagged_union_payload_type(ty, "ok")?;
+                    let mut string = AggregateValueEnum::StructValue(
+                        self.basic_type(string_ty)?.into_struct_type().get_undef(),
+                    );
+                    string = built(builder.build_insert_value(
+                        string,
+                        data,
+                        0,
+                        "env.value.string.data",
+                    ))?;
+                    string = built(builder.build_insert_value(
+                        string,
+                        size,
+                        1,
+                        "env.value.string.size",
+                    ))?;
+                    let ok: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(
+                            ty,
+                            "ok",
+                            string.into_struct_value().into(),
+                            "env.ok",
+                            builder,
+                        )?
+                        .into();
+                    let not_found: BasicValueEnum<'ctx> = self
+                        .atom_union_value(ty, "not_found", "env.not_found", builder)?
+                        .into();
+                    let reason_ty = self.tagged_union_payload_type(ty, "error")?;
+                    let invalid_name = self.atom_union_value(
+                        reason_ty,
+                        "invalid_name",
+                        "env.invalid_name.reason",
+                        builder,
+                    )?;
+                    let invalid_text = self.atom_union_value(
+                        reason_ty,
+                        "invalid_text",
+                        "env.invalid_text.reason",
+                        builder,
+                    )?;
+                    let invalid_name: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(
+                            ty,
+                            "error",
+                            invalid_name.into(),
+                            "env.invalid_name",
+                            builder,
+                        )?
+                        .into();
+                    let invalid_text: BasicValueEnum<'ctx> = self
+                        .tagged_union_value(
+                            ty,
+                            "error",
+                            invalid_text.into(),
+                            "env.invalid_text",
+                            builder,
+                        )?
+                        .into();
+                    let is_ok = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.context.i32_type().const_zero(),
+                        "env.is_ok",
+                    ))?;
+                    let is_missing = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.context.i32_type().const_int(1, false),
+                        "env.is_missing",
+                    ))?;
+                    let is_invalid_name = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        self.context.i32_type().const_int(2, false),
+                        "env.is_invalid_name",
+                    ))?;
+                    let invalid = built(builder.build_select(
+                        is_invalid_name,
+                        invalid_name,
+                        invalid_text,
+                        "env.invalid",
+                    ))?;
+                    let absent =
+                        built(builder.build_select(is_missing, not_found, invalid, "env.absent"))?;
+                    built(builder.build_select(is_ok, ok, absent, "env.result"))?
+                }
+                _ => unreachable!(),
+            };
+            self.clear_value_roots(roots, builder, root_slots, value_types)?;
+            values.insert(result, value);
+            return Ok(());
+        }
+        if matches!(
+            operation,
+            StandardOperation::IoPrint | StandardOperation::IoPrintln | StandardOperation::IoReport
+        ) {
+            let argument_ty = value_types
+                .get(&arguments[0])
+                .copied()
+                .ok_or(BackendError::MissingValue(arguments[0]))?;
+            let use_stderr = matches!(operation, StandardOperation::IoReport);
+            let newline = !matches!(operation, StandardOperation::IoPrint);
+            let flag = |value: bool| self.context.i32_type().const_int(u64::from(value), false);
+            match self.core.types.get(argument_ty.0 as usize) {
+                Some(Type::String) => {
+                    let string = struct_value(values, arguments[0])?;
+                    let data = built(builder.build_extract_value(string, 0, "console.data"))?;
+                    let size = built(builder.build_extract_value(string, 1, "console.size"))?;
+                    built(builder.build_call(
+                        self.console_write,
+                        &[
+                            data.into(),
+                            size.into(),
+                            flag(use_stderr).into(),
+                            flag(newline).into(),
+                        ],
+                        "",
+                    ))?;
+                }
+                Some(Type::Opaque(OpaqueType::FileError | OpaqueType::IoError)) => {
+                    built(builder.build_call(
+                        self.console_error,
+                        &[
+                            pointer_value(values, arguments[0])?.into(),
+                            flag(use_stderr).into(),
+                            flag(newline).into(),
+                        ],
+                        "",
+                    ))?;
+                }
+                _ => {
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "Show.show for console output",
+                    });
+                }
+            }
+            self.clear_value_roots(roots, builder, root_slots, value_types)?;
+            values.insert(
+                result,
+                self.context.struct_type(&[], false).const_zero().into(),
+            );
+            return Ok(());
+        }
+
+        let error_slot = built(builder.build_alloca(pointer_ty, &format!("v{}.error", result.0)))?;
+        built(builder.build_store(error_slot, pointer_ty.const_null()))?;
+        let returned = match operation {
+            StandardOperation::FileOpenRead
+            | StandardOperation::FileCreate
+            | StandardOperation::FileAppend => {
+                let path = struct_value(values, arguments[0])?;
+                let data = built(builder.build_extract_value(path, 0, "file.path.data"))?
+                    .into_pointer_value();
+                let length = built(builder.build_extract_value(path, 1, "file.path.length"))?
+                    .into_int_value();
+                let length = built(builder.build_int_cast(length, usize_ty, "file.path.size"))?;
+                let mode = match operation {
+                    StandardOperation::FileOpenRead => 0,
+                    StandardOperation::FileCreate => 1,
+                    StandardOperation::FileAppend => 2,
+                    _ => unreachable!(),
+                };
+                built(builder.build_call(
+                    runtime,
+                    &[
+                        data.into(),
+                        length.into(),
+                        self.context.i32_type().const_int(mode, false).into(),
+                        error_slot.into(),
+                    ],
+                    &format!("v{}.open", result.0),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::MissingValue(result))?
+            }
+            StandardOperation::FileClose | StandardOperation::WriterFlush => {
+                built(builder.build_call(
+                    runtime,
+                    &[pointer_value(values, arguments[0])?.into()],
+                    &format!("v{}.io", result.0),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::MissingValue(result))?
+            }
+            StandardOperation::WriterWrite => {
+                let bytes = struct_value(values, arguments[1])?;
+                let data = built(builder.build_extract_value(bytes, 1, "write.data"))?
+                    .into_pointer_value();
+                let length =
+                    built(builder.build_extract_value(bytes, 2, "write.length"))?.into_int_value();
+                built(builder.build_call(
+                    runtime,
+                    &[
+                        pointer_value(values, arguments[0])?.into(),
+                        data.into(),
+                        length.into(),
+                    ],
+                    &format!("v{}.write", result.0),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::MissingValue(result))?
+            }
+            StandardOperation::ReaderRead => {
+                let size_slot = built(builder.build_alloca(usize_ty, "read.size"))?;
+                let eof_slot = built(builder.build_alloca(self.context.i32_type(), "read.eof"))?;
+                built(builder.build_store(size_slot, usize_ty.const_zero()))?;
+                built(builder.build_store(eof_slot, self.context.i32_type().const_zero()))?;
+                let data = built(builder.build_call(
+                    runtime,
+                    &[
+                        pointer_value(values, arguments[0])?.into(),
+                        integer_value(values, arguments[1])?.into(),
+                        size_slot.into(),
+                        eof_slot.into(),
+                        error_slot.into(),
+                    ],
+                    &format!("v{}.read", result.0),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::MissingValue(result))?
+                .into_pointer_value();
+                let error = built(builder.build_load(pointer_ty, error_slot, "read.error"))?
+                    .into_pointer_value();
+                let size =
+                    built(builder.build_load(usize_ty, size_slot, "read.size"))?.into_int_value();
+                let eof = built(builder.build_load(self.context.i32_type(), eof_slot, "read.eof"))?
+                    .into_int_value();
+                let llvm_function = builder
+                    .get_insert_block()
+                    .and_then(|value| value.get_parent())
+                    .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+                let error_block = self
+                    .context
+                    .append_basic_block(llvm_function, "read.error.block");
+                let eof_check = self
+                    .context
+                    .append_basic_block(llvm_function, "read.eof.check");
+                let eof_block = self
+                    .context
+                    .append_basic_block(llvm_function, "read.eof.block");
+                let ok_block = self
+                    .context
+                    .append_basic_block(llvm_function, "read.ok.block");
+                let done = self.context.append_basic_block(llvm_function, "read.done");
+                let failed = built(builder.build_is_not_null(error, "read.failed"))?;
+                built(builder.build_conditional_branch(failed, error_block, eof_check))?;
+                builder.position_at_end(error_block);
+                let error_value =
+                    self.tagged_union_value(ty, "error", error.into(), "read.error", builder)?;
+                let error_end = builder.get_insert_block().expect("error block exists");
+                built(builder.build_unconditional_branch(done))?;
+                builder.position_at_end(eof_check);
+                let at_eof = built(builder.build_int_compare(
+                    IntPredicate::NE,
+                    eof,
+                    self.context.i32_type().const_zero(),
+                    "read.at_eof",
+                ))?;
+                built(builder.build_conditional_branch(at_eof, eof_block, ok_block))?;
+                builder.position_at_end(eof_block);
+                let eof_value = self.atom_union_value(ty, "eof", "read.eof", builder)?;
+                let eof_end = builder.get_insert_block().expect("EOF block exists");
+                built(builder.build_unconditional_branch(done))?;
+                builder.position_at_end(ok_block);
+                let bytes_ty = match self.core.types.get(ty.0 as usize) {
+                    Some(Type::Union(members)) => members.iter().find_map(|member| match self.core.types.get(member.0 as usize) {
+                        Some(Type::Tuple(fields)) if matches!(fields.first().and_then(|field| self.core.types.get(field.0 as usize)), Some(Type::Atom(tag)) if tag == "ok") => fields.get(1).copied(),
+                        _ => None,
+                    }),
+                    _ => None,
+                }.ok_or(BackendError::UnsupportedType(ty))?;
+                let mut bytes = AggregateValueEnum::StructValue(
+                    self.basic_type(bytes_ty)?.into_struct_type().get_undef(),
+                );
+                bytes = built(builder.build_insert_value(bytes, data, 0, "read.base"))?;
+                bytes = built(builder.build_insert_value(bytes, data, 1, "read.data"))?;
+                bytes = built(builder.build_insert_value(bytes, size, 2, "read.length"))?;
+                let ok_value = self.tagged_union_value(
+                    ty,
+                    "ok",
+                    bytes.into_struct_value().into(),
+                    "read.ok",
+                    builder,
+                )?;
+                let ok_end = builder.get_insert_block().expect("ok block exists");
+                built(builder.build_unconditional_branch(done))?;
+                builder.position_at_end(done);
+                let phi =
+                    built(builder.build_phi(self.basic_type(ty)?, &format!("v{}", result.0)))?;
+                phi.add_incoming(&[
+                    (&error_value, error_end),
+                    (&eof_value, eof_end),
+                    (&ok_value, ok_end),
+                ]);
+                self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                values.insert(result, phi.as_basic_value());
+                return Ok(());
+            }
+            _ => unreachable!("zero-argument standard calls returned above"),
+        };
+
+        let error = if matches!(
+            operation,
+            StandardOperation::FileOpenRead
+                | StandardOperation::FileCreate
+                | StandardOperation::FileAppend
+        ) {
+            built(builder.build_load(pointer_ty, error_slot, "io.error"))?.into_pointer_value()
+        } else {
+            returned.into_pointer_value()
+        };
+        let llvm_function = builder
+            .get_insert_block()
+            .and_then(|value| value.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let ok_block = self.context.append_basic_block(llvm_function, "io.ok");
+        let error_block = self
+            .context
+            .append_basic_block(llvm_function, "io.error.block");
+        let done = self.context.append_basic_block(llvm_function, "io.done");
+        let failed = built(builder.build_is_not_null(error, "io.failed"))?;
+        built(builder.build_conditional_branch(failed, error_block, ok_block))?;
+        builder.position_at_end(ok_block);
+        let ok_payload: BasicValueEnum<'ctx> = if matches!(
+            operation,
+            StandardOperation::FileOpenRead
+                | StandardOperation::FileCreate
+                | StandardOperation::FileAppend
+        ) {
+            returned
+        } else {
+            self.context.struct_type(&[], false).const_zero().into()
+        };
+        let ok_value = self.tagged_union_value(ty, "ok", ok_payload, "io.ok", builder)?;
+        let ok_end = builder.get_insert_block().expect("ok block exists");
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(error_block);
+        let error_value =
+            self.tagged_union_value(ty, "error", error.into(), "io.error", builder)?;
+        let error_end = builder.get_insert_block().expect("error block exists");
+        built(builder.build_unconditional_branch(done))?;
+        builder.position_at_end(done);
+        let phi = built(builder.build_phi(self.basic_type(ty)?, &format!("v{}", result.0)))?;
+        phi.add_incoming(&[(&ok_value, ok_end), (&error_value, error_end)]);
+        self.clear_value_roots(roots, builder, root_slots, value_types)?;
+        values.insert(result, phi.as_basic_value());
+        Ok(())
+    }
+
     fn list_node_type(&self, list: TypeId) -> Result<StructType<'ctx>, BackendError> {
         let Some(Type::List(item)) = self.core.types.get(list.0 as usize) else {
             return Err(BackendError::UnsupportedType(list));
@@ -1198,6 +2132,105 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 name,
             )),
             Some(Type::Unit) => Ok(self.context.bool_type().const_all_ones()),
+            Some(Type::Opaque(OpaqueType::FileError | OpaqueType::IoError)) => {
+                let field = |operation: StandardOperation,
+                             pointer: PointerValue<'ctx>,
+                             suffix: &str|
+                 -> Result<IntValue<'ctx>, BackendError> {
+                    Ok(built(builder.build_call(
+                        self.standard_calls[&operation],
+                        &[pointer.into()],
+                        &format!("{name}.{suffix}"),
+                    ))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or(BackendError::UnsupportedType(ty))?
+                    .into_int_value())
+                };
+                let left = left.into_pointer_value();
+                let right = right.into_pointer_value();
+                let mut equal = self.context.bool_type().const_all_ones();
+                for (operation, suffix) in [
+                    (StandardOperation::ErrorKind, "kind"),
+                    (StandardOperation::ErrorOperation, "operation"),
+                ] {
+                    let component = built(builder.build_int_compare(
+                        IntPredicate::EQ,
+                        field(operation, left, &format!("left_{suffix}"))?,
+                        field(operation, right, &format!("right_{suffix}"))?,
+                        &format!("{name}.{suffix}_equal"),
+                    ))?;
+                    equal = built(builder.build_and(
+                        equal,
+                        component,
+                        &format!("{name}.{suffix}_and"),
+                    ))?;
+                }
+                // Compare the optional codes with direct accessor calls to keep the
+                // exposed operation/kind/code triple as the complete equality key.
+                let left_has = built(
+                    builder.build_alloca(self.context.i32_type(), &format!("{name}.left_has")),
+                )?;
+                let right_has = built(
+                    builder.build_alloca(self.context.i32_type(), &format!("{name}.right_has")),
+                )?;
+                let left_code = built(builder.build_call(
+                    self.standard_calls[&StandardOperation::ErrorCode],
+                    &[left.into(), left_has.into()],
+                    &format!("{name}.left_code_value"),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::UnsupportedType(ty))?
+                .into_int_value();
+                let right_code = built(builder.build_call(
+                    self.standard_calls[&StandardOperation::ErrorCode],
+                    &[right.into(), right_has.into()],
+                    &format!("{name}.right_code_value"),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::UnsupportedType(ty))?
+                .into_int_value();
+                let left_has = built(builder.build_load(
+                    self.context.i32_type(),
+                    left_has,
+                    &format!("{name}.left_has_value"),
+                ))?
+                .into_int_value();
+                let right_has = built(builder.build_load(
+                    self.context.i32_type(),
+                    right_has,
+                    &format!("{name}.right_has_value"),
+                ))?
+                .into_int_value();
+                let same_presence = built(builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left_has,
+                    right_has,
+                    &format!("{name}.same_code_presence"),
+                ))?;
+                let same_code = built(builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left_code,
+                    right_code,
+                    &format!("{name}.same_code"),
+                ))?;
+                let no_code = built(builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left_has,
+                    self.context.i32_type().const_zero(),
+                    &format!("{name}.no_code"),
+                ))?;
+                let code_equal =
+                    built(builder.build_or(no_code, same_code, &format!("{name}.code_equal")))?;
+                equal = built(builder.build_and(
+                    equal,
+                    same_presence,
+                    &format!("{name}.presence_and"),
+                ))?;
+                built(builder.build_and(equal, code_equal, name))
+            }
             Some(Type::Union(members))
                 if members.iter().all(|member| {
                     matches!(self.core.types.get(member.0 as usize), Some(Type::Atom(_)))
@@ -2939,6 +3972,49 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 mix(builder, seed, integer, "scalar")
             }
             Some(Type::Unit) => mix(builder, seed, usize_ty.const_int(1, false), "unit"),
+            Some(Type::Opaque(OpaqueType::FileError | OpaqueType::IoError)) => {
+                let pointer = value.into_pointer_value();
+                let kind = built(builder.build_call(
+                    self.standard_calls[&StandardOperation::ErrorKind],
+                    &[pointer.into()],
+                    &format!("{name}.kind"),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::UnsupportedType(ty))?
+                .into_int_value();
+                let operation = built(builder.build_call(
+                    self.standard_calls[&StandardOperation::ErrorOperation],
+                    &[pointer.into()],
+                    &format!("{name}.operation"),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::UnsupportedType(ty))?
+                .into_int_value();
+                let has_slot = built(
+                    builder.build_alloca(self.context.i32_type(), &format!("{name}.has_code")),
+                )?;
+                let code = built(builder.build_call(
+                    self.standard_calls[&StandardOperation::ErrorCode],
+                    &[pointer.into(), has_slot.into()],
+                    &format!("{name}.code"),
+                ))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or(BackendError::UnsupportedType(ty))?
+                .into_int_value();
+                let has = built(builder.build_load(
+                    self.context.i32_type(),
+                    has_slot,
+                    &format!("{name}.has_code_value"),
+                ))?
+                .into_int_value();
+                let hash = mix(builder, seed, operation, "operation")?;
+                let hash = mix(builder, hash, kind, "kind")?;
+                let hash = mix(builder, hash, has, "has_code")?;
+                mix(builder, hash, code, "code")
+            }
             Some(Type::Tuple(elements)) => {
                 let aggregate = value.into_struct_value();
                 let mut hash = seed;
@@ -4455,6 +5531,39 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         _partial_list_root: Option<PointerValue<'ctx>>,
     ) -> Result<(), BackendError> {
         match operation {
+            Operation::StandardCall {
+                result,
+                operation,
+                arguments,
+                ty,
+                ..
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, operation, arguments, ty);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "standard_call",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                self.lower_standard_call(
+                    function,
+                    block,
+                    builder,
+                    *result,
+                    *operation,
+                    arguments,
+                    *ty,
+                    values,
+                    slots,
+                    roots,
+                    root_slots,
+                    value_types,
+                    slot_types,
+                )?;
+            }
             Operation::Constant {
                 result,
                 constant,
@@ -11991,7 +13100,8 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                 .operations
                 .iter()
                 .filter_map(|operation| match operation {
-                    Operation::Constant { result, ty, .. }
+                    Operation::StandardCall { result, ty, .. }
+                    | Operation::Constant { result, ty, .. }
                     | Operation::List { result, ty, .. }
                     | Operation::ListReverse { result, ty, .. }
                     | Operation::Array { result, ty, .. }
@@ -12172,7 +13282,7 @@ mod tests {
         assert!(llvm.as_str().contains("call i32 @el.f0"));
         assert!(llvm.as_str().contains("phi i32"));
         assert!(llvm.as_str().contains("ret i32"));
-        assert!(llvm.as_str().contains("define i32 @main()"));
+        assert!(llvm.as_str().contains("define i32 @main(i32"));
         assert!(llvm.as_str().contains("call i32 @el.f1()"));
         #[cfg(feature = "managed-runtime")]
         assert!(llvm.as_str().contains("call void @__el_runtime_init()"));
@@ -12920,7 +14030,7 @@ mod tests {
         let llvm = lower_to_llvm_ir(&core).expect("entry shim lowers and verifies");
         let text = llvm.as_str();
 
-        assert!(text.contains("define i32 @main()"));
+        assert!(text.contains("define i32 @main(i32"));
         assert!(text.contains("%el.exit_status = call i32 @el.f0()"));
         assert!(text.contains("ret i32 %el.exit_status"));
     }

@@ -66,7 +66,7 @@ fn project_command_without_manifest_is_status_one() {
 }
 
 #[test]
-fn known_unimplemented_command_is_status_one_without_panicking() {
+fn malformed_project_is_status_one_without_panicking() {
     let temp = TempDir::new();
     fs::write(temp.path().join("el.toml"), "").expect("write manifest");
     let output = run(&["build", "--locked", "--release"], temp.path());
@@ -74,6 +74,6 @@ fn known_unimplemented_command_is_status_one_without_panicking() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not implemented in Milestone 0"));
+    assert!(stderr.contains("manifest error"));
     assert!(!stderr.contains("panicked"));
 }

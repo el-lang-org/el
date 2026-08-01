@@ -37,14 +37,16 @@ pub enum ProjectInvocation {
 
 impl ProjectInvocation {
     #[must_use]
-    pub const fn driver_command(&self) -> ProjectCommand {
+    pub fn driver_command(&self) -> ProjectCommand {
         match self {
             Self::Check { locked } => ProjectCommand::Check { locked: *locked },
             Self::Build { release, locked } => ProjectCommand::Build {
                 release: *release,
                 locked: *locked,
             },
-            Self::EmitLlvmIr { .. } => ProjectCommand::EmitLlvmIr,
+            Self::EmitLlvmIr { module } => ProjectCommand::EmitLlvmIr {
+                module: module.clone(),
+            },
         }
     }
 }

@@ -4,7 +4,8 @@ use el_resolve::{DeclId, ImplId, SymbolId, Visibility};
 use el_span::Span;
 pub use el_types::{
     ArithmeticOperator, BitstringByteOrder, BufferAppendKind, ComparisonOperator, EnumVisitKind,
-    IntegerBinaryOperator, IntegerUnaryOperator, Type, TypeId, WrappingIntegerOperator,
+    IntegerBinaryOperator, IntegerUnaryOperator, OpaqueType, StandardOperation, Type, TypeId,
+    WrappingIntegerOperator,
 };
 use el_types::{
     LogicalOperator, TypedBitstringPatternSegmentKind, TypedBitstringSegmentKind, TypedExpr,
@@ -137,6 +138,13 @@ pub struct Block {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Operation {
+    StandardCall {
+        result: ValueId,
+        operation: StandardOperation,
+        arguments: Vec<ValueId>,
+        ty: TypeId,
+        origin: Span,
+    },
     Constant {
         result: ValueId,
         constant: Constant,
@@ -1068,6 +1076,24 @@ impl<'a> Lowerer<'a> {
             }
             TypedExprKind::Atom(name) => {
                 self.constant(Constant::Atom(name.clone()), expression.ty, expression.span)
+            }
+            TypedExprKind::StandardCall {
+                operation,
+                arguments,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| self.lower_expr(argument))
+                    .collect::<Option<Vec<_>>>()?;
+                let result = self.value();
+                self.operations.push(Operation::StandardCall {
+                    result,
+                    operation: *operation,
+                    arguments,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
             }
             TypedExprKind::List { elements, tail } => {
                 let elements = elements
@@ -3218,6 +3244,7 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
                 | Operation::BufferAppend { .. }
                 | Operation::BufferToBytes { .. }
                 | Operation::BitsToBytes { .. }
+                | Operation::StandardCall { .. }
         )
         || matches!(
             operation,
@@ -3415,6 +3442,7 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         live.values.remove(&result);
     }
     match operation {
+        Operation::StandardCall { arguments, .. } => live.values.extend(arguments),
         Operation::Constant { .. } => {}
         Operation::List { elements, tail, .. } => {
             live.values.extend(elements);
@@ -3639,7 +3667,8 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
 
 fn operation_result(operation: &Operation) -> Option<ValueId> {
     match operation {
-        Operation::Constant { result, .. }
+        Operation::StandardCall { result, .. }
+        | Operation::Constant { result, .. }
         | Operation::List { result, .. }
         | Operation::ListReverse { result, .. }
         | Operation::Array { result, .. }
@@ -3745,7 +3774,7 @@ fn classify_managed_type(
         | Type::Slice(_)
         | Type::CodepointView
         | Type::GraphemeView => ManagedValueClass::ContainsBaseReferences,
-        Type::List(_) | Type::Map { .. } => ManagedValueClass::BaseReference,
+        Type::List(_) | Type::Map { .. } | Type::Opaque(_) => ManagedValueClass::BaseReference,
         Type::Array { item, .. } => aggregate_managed_class(module, [*item], visiting)?,
         Type::Tuple(elements) | Type::Union(elements) => {
             aggregate_managed_class(module, elements.iter().copied(), visiting)?
@@ -3818,6 +3847,7 @@ enum NormalizedType {
     Buffer,
     Rune,
     Utf8Error,
+    Opaque(OpaqueType),
     CodepointView,
     GraphemeView,
     U8,
@@ -3878,10 +3908,18 @@ pub enum EntryPointError {
 pub fn executable_reachability_roots(
     module: &GenericModule,
 ) -> Result<ReachabilityRoots, EntryPointError> {
+    executable_reachability_roots_for(module, "Main")
+}
+
+/// Selects the executable entry declared by a manifest's package-relative target module.
+pub fn executable_reachability_roots_for(
+    module: &GenericModule,
+    target_module: &str,
+) -> Result<ReachabilityRoots, EntryPointError> {
     let Some(entry) = module
         .functions
         .iter()
-        .find(|function| function.module_name == "Main" && function.name == "main")
+        .find(|function| function.module_name == target_module && function.name == "main")
     else {
         return Err(EntryPointError::Missing);
     };
@@ -4261,6 +4299,7 @@ impl<'a> Monomorphizer<'a> {
             Type::Buffer => NormalizedType::Buffer,
             Type::Rune => NormalizedType::Rune,
             Type::Utf8Error => NormalizedType::Utf8Error,
+            Type::Opaque(kind) => NormalizedType::Opaque(*kind),
             Type::CodepointView => NormalizedType::CodepointView,
             Type::GraphemeView => NormalizedType::GraphemeView,
             Type::U8 => NormalizedType::U8,
@@ -4616,7 +4655,8 @@ impl<'a> Monomorphizer<'a> {
         ids: &BTreeMap<FunctionSpecializationKey, FunctionId>,
     ) -> Result<(), MonomorphizationError> {
         match operation {
-            Operation::Constant { ty, .. }
+            Operation::StandardCall { ty, .. }
+            | Operation::Constant { ty, .. }
             | Operation::List { ty, .. }
             | Operation::ListReverse { ty, .. }
             | Operation::Array { ty, .. }
@@ -4848,6 +4888,7 @@ impl<'a> Monomorphizer<'a> {
             NormalizedType::Buffer => Type::Buffer,
             NormalizedType::Rune => Type::Rune,
             NormalizedType::Utf8Error => Type::Utf8Error,
+            NormalizedType::Opaque(kind) => Type::Opaque(*kind),
             NormalizedType::CodepointView => Type::CodepointView,
             NormalizedType::GraphemeView => Type::GraphemeView,
             NormalizedType::U8 => Type::U8,
@@ -4950,6 +4991,28 @@ fn normalize_standard_projection(
     associated: &str,
     argument: NormalizedType,
 ) -> Option<NormalizedType> {
+    if protocol == "Reader" && associated == "Error" {
+        return match argument {
+            NormalizedType::Opaque(OpaqueType::FileReader) => {
+                Some(NormalizedType::Opaque(OpaqueType::FileError))
+            }
+            NormalizedType::Opaque(OpaqueType::IoStdin) => {
+                Some(NormalizedType::Opaque(OpaqueType::IoError))
+            }
+            _ => None,
+        };
+    }
+    if protocol == "Writer" && associated == "Error" {
+        return match argument {
+            NormalizedType::Opaque(OpaqueType::FileWriter) => {
+                Some(NormalizedType::Opaque(OpaqueType::FileError))
+            }
+            NormalizedType::Opaque(OpaqueType::IoStdout | OpaqueType::IoStderr) => {
+                Some(NormalizedType::Opaque(OpaqueType::IoError))
+            }
+            _ => None,
+        };
+    }
     if protocol != "Iterable" {
         return None;
     }
@@ -5007,6 +5070,15 @@ fn normalized_type_satisfies(ty: &NormalizedType, protocol: &str) -> bool {
                     )
         }
         NormalizedType::Utf8Error => matches!(protocol, "Eq" | "Show" | "Hash"),
+        NormalizedType::Opaque(kind) => match kind {
+            OpaqueType::FileReader | OpaqueType::IoStdin => protocol == "Reader",
+            OpaqueType::FileWriter | OpaqueType::IoStdout | OpaqueType::IoStderr => {
+                protocol == "Writer"
+            }
+            OpaqueType::FileError | OpaqueType::IoError => {
+                matches!(protocol, "Eq" | "Show" | "Hash")
+            }
+        },
         NormalizedType::CodepointView | NormalizedType::GraphemeView => protocol == "Iterable",
         NormalizedType::List(item) => match protocol {
             "Iterable" | "Concat" => true,
@@ -5090,6 +5162,7 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
         | NormalizedType::Buffer
         | NormalizedType::Rune
         | NormalizedType::Utf8Error
+        | NormalizedType::Opaque(_)
         | NormalizedType::CodepointView
         | NormalizedType::GraphemeView
         | NormalizedType::U8
@@ -5104,7 +5177,8 @@ fn collect_layout_keys(ty: &NormalizedType, layouts: &mut BTreeSet<LayoutSpecial
 
 fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
     match operation {
-        Operation::Constant { ty, .. }
+        Operation::StandardCall { ty, .. }
+        | Operation::Constant { ty, .. }
         | Operation::List { ty, .. }
         | Operation::ListReverse { ty, .. }
         | Operation::Array { ty, .. }
@@ -5541,7 +5615,8 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                 .operations
                 .iter()
                 .filter_map(|operation| match operation {
-                    Operation::Constant { result, ty, .. }
+                    Operation::StandardCall { result, ty, .. }
+                    | Operation::Constant { result, ty, .. }
                     | Operation::List { result, ty, .. }
                     | Operation::ListReverse { result, ty, .. }
                     | Operation::Array { result, ty, .. }
@@ -6171,6 +6246,47 @@ fn verify_operation(
         }
     };
     match operation {
+        Operation::StandardCall {
+            result,
+            operation,
+            arguments,
+            ty,
+            ..
+        } => {
+            let expected = match operation {
+                StandardOperation::IoStdin
+                | StandardOperation::IoStdout
+                | StandardOperation::IoStderr
+                | StandardOperation::ProcessArguments => 0,
+                StandardOperation::FileOpenRead
+                | StandardOperation::FileCreate
+                | StandardOperation::FileAppend
+                | StandardOperation::FileClose
+                | StandardOperation::WriterFlush
+                | StandardOperation::ErrorKind
+                | StandardOperation::ErrorOperation
+                | StandardOperation::ErrorCode
+                | StandardOperation::ProcessGetEnv
+                | StandardOperation::IoPrint
+                | StandardOperation::IoPrintln
+                | StandardOperation::IoReport => 1,
+                StandardOperation::ReaderRead | StandardOperation::WriterWrite => 2,
+            };
+            if arguments.len() != expected {
+                errors.push(format!(
+                    "standard call {result:?} has {} arguments, expected {expected}",
+                    arguments.len()
+                ));
+            }
+            for argument in arguments {
+                if !values.contains_key(argument) {
+                    errors.push(format!(
+                        "standard call {result:?} uses undefined value {argument:?}"
+                    ));
+                }
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::Constant {
             result,
             constant,
@@ -8200,6 +8316,22 @@ impl GenericModule {
 
 fn display_operation(operation: &Operation) -> String {
     match operation {
+        Operation::StandardCall {
+            result,
+            operation,
+            arguments,
+            ty,
+            ..
+        } => format!(
+            "v{} = standard {operation:?}({}): t{}",
+            result.0,
+            arguments
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            ty.0
+        ),
         Operation::Constant {
             result,
             constant,

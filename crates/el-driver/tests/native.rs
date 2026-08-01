@@ -3,7 +3,7 @@
 #[cfg(feature = "managed-runtime")]
 use el_codegen::link_host_managed_executable;
 use el_codegen::{emit_host_object_with_profile, link_host_objects};
-use el_driver::{BuildProfile, analyze_source};
+use el_driver::{BuildProfile, ProjectCommand, analyze_source, run_project_command};
 use el_ir::{executable_reachability_roots, monomorphize};
 use el_span::SourceMap;
 use std::ffi::OsString;
@@ -41,7 +41,7 @@ fn compile_runtime_failure_stub(directory: &Path) -> PathBuf {
     let object = directory.join("runtime.o");
     fs::write(
         &source,
-        "#include <stdint.h>\n#include <stdlib.h>\nvoid __el_runtime_init(void) {}\nvoid __el_runtime_fail(uint32_t category, uint32_t file, uint64_t start, uint64_t end) {\n  (void)file; (void)start; (void)end;\n  _Exit((int)(100u + category));\n}\n",
+        "#include <stdint.h>\n#include <stdlib.h>\nvoid __el_runtime_init(void) {}\nvoid __el_runtime_process_snapshot(int argc, const char *const *argv) { (void)argc; (void)argv; }\nvoid __el_runtime_fail(uint32_t category, uint32_t file, uint64_t start, uint64_t end) {\n  (void)file; (void)start; (void)end;\n  _Exit((int)(100u + category));\n}\n",
     )
     .expect("write runtime test support");
     let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
@@ -239,6 +239,101 @@ fn build_managed_executable(
     link_host_managed_executable(&[object.as_path()], &executable)
         .expect("link managed native executable");
     executable
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn recoverable_file_io_executes_with_deferred_cleanup_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def cleanup_writer(writer: File.Writer) -> unit do\n    match File.close(writer) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def cleanup_reader(reader: File.Reader) -> unit do\n    match File.close(reader) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def write_opened(value: {:ok, File.Writer}) -> i32 do\n    match value do\n      {:ok, writer} ->\n        defer cleanup_writer(writer)\n        match Writer.write(writer, String.bytes(\"hello\")) do\n          value: {:ok, unit} ->\n            match Writer.flush(writer) do\n              value: {:ok, unit} -> 0\n              value: {:error, File.Error} -> 2\n            end\n          value: {:error, File.Error} -> 1\n        end\n    end\n  end\n  def write_file() -> i32 do\n    match File.create(\"milestone8.txt\") do\n      value: {:ok, File.Writer} -> write_opened(value)\n      value: {:error, File.Error} -> 3\n    end\n  end\n  def read_ok(value: {:ok, bytes}) -> usize do\n    match value do\n      {:ok, data} -> Bytes.byte_size(data)\n    end\n  end\n  def read_opened(value: {:ok, File.Reader}) -> usize do\n    match value do\n      {:ok, reader} ->\n        defer cleanup_reader(reader)\n        match Reader.read(reader, 32) do\n          value: {:ok, bytes} -> read_ok(value)\n          _ -> 0\n        end\n    end\n  end\n  def read_file() -> usize do\n    match File.open_read(\"milestone8.txt\") do\n      value: {:ok, File.Reader} -> read_opened(value)\n      value: {:error, File.Error} -> 0\n    end\n  end\n  def main() -> i32 do\n    if write_file() == 0 and read_file() == 5 do\n      42\n    else\n      1\n    end\n  end\nend\n";
+    let executable = build_managed_executable(
+        &temp.0,
+        "milestone8-file-io",
+        source,
+        BuildProfile::Development,
+    );
+    let status = Command::new(executable)
+        .current_dir(&temp.0)
+        .status()
+        .expect("run recoverable file I/O fixture");
+    assert_eq!(status.code(), Some(42));
+    assert_eq!(
+        std::fs::read(temp.0.join("milestone8.txt")).unwrap(),
+        b"hello"
+    );
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn process_snapshots_error_accessors_and_console_output_run_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def args_ok(value: {:ok, [string]}) -> bool do\n    match value do\n      {:ok, args} -> args == [\"first\", \"🙂\"]\n    end\n  end\n  def env_ok(value: {:ok, string}) -> bool do\n    match value do\n      {:ok, text} -> text == \"snapshot\"\n    end\n  end\n  def expected_kind(error: File.Error) -> bool do\n    match File.error_kind(error) do\n      :not_found -> true\n      _ -> false\n    end\n  end\n  def expected_operation(error: File.Error) -> bool do\n    match File.error_operation(error) do\n      :open_read -> true\n      _ -> false\n    end\n  end\n  def inspect_error(value: {:error, File.Error}) -> bool do\n    match value do\n      {:error, error} ->\n        IO.report(error)\n        expected_kind(error) and expected_operation(error)\n    end\n  end\n  def main() -> i32 do\n    IO.print(\"out\")\n    IO.println(\"put\")\n    args_valid = match Process.arguments() do\n      value: {:ok, [string]} -> args_ok(value)\n      value: {:error, {:invalid_text, usize}} -> false\n    end\n    env_valid = match Process.get_env(\"EL_MILESTONE8_VALUE\") do\n      value: {:ok, string} -> env_ok(value)\n      _ -> false\n    end\n    missing = match Process.get_env(\"EL_MILESTONE8_MISSING\") do\n      :not_found -> true\n      _ -> false\n    end\n    invalid = match Process.get_env(\"BAD=NAME\") do\n      value: {:error, :invalid_name | :invalid_text} -> true\n      _ -> false\n    end\n    file_error = match File.open_read(\"definitely-missing-milestone8-file\") do\n      value: {:error, File.Error} -> inspect_error(value)\n      value: {:ok, File.Reader} -> false\n    end\n    if args_valid and env_valid and missing and invalid and file_error do 42 else 1 end\n  end\nend\n";
+    let executable = build_managed_executable(
+        &temp.0,
+        "milestone8-process-console",
+        source,
+        BuildProfile::Development,
+    );
+    let output = Command::new(executable)
+        .current_dir(&temp.0)
+        .args(["first", "🙂"])
+        .env("EL_MILESTONE8_VALUE", "snapshot")
+        .env_remove("EL_MILESTONE8_MISSING")
+        .output()
+        .expect("run process and console fixture");
+    assert_eq!(output.status.code(), Some(42));
+    assert_eq!(output.stdout, b"output\n");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostic output");
+    assert!(stderr.starts_with("open_read: not_found"), "{stderr:?}");
+    assert!(stderr.ends_with('\n'));
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
+fn milestone_eight_manifest_exit_gate_handles_every_recoverable_file_result() {
+    let temp = TempDir::new();
+    fs::create_dir(temp.0.join("src")).expect("create project source directory");
+    fs::write(
+        temp.0.join("el.toml"),
+        "[package]\nname = \"milestone_eight\"\nnamespace = \"MilestoneEight\"\nversion = \"1.0.0\"\n\n[deps]\n\n[target]\nmain = \"Main\"\n",
+    )
+    .expect("write project manifest");
+    fs::write(
+        temp.0.join("src/transform.el"),
+        "defmodule Transform do\n  def apply(data: bytes) -> bytes do\n    data ++ String.bytes(\"!\")\n  end\nend\n",
+    )
+    .expect("write transform module");
+    fs::write(
+        temp.0.join("src/main.el"),
+        "defmodule Main do\n  def close_reader(reader: File.Reader) -> unit do\n    match File.close(reader) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def close_writer(writer: File.Writer) -> unit do\n    match File.close(writer) do\n      value: {:ok, unit} -> unit\n      value: {:error, File.Error} -> unit\n    end\n  end\n  def flushed(value: {:ok, unit}) -> bool do\n    true\n  end\n  def wrote(writer: File.Writer, value: {:ok, unit}) -> bool do\n    match Writer.flush(writer) do\n      value: {:ok, unit} -> flushed(value)\n      value: {:error, File.Error} -> false\n    end\n  end\n  def created(data: bytes, value: {:ok, File.Writer}) -> bool do\n    match value do\n      {:ok, writer} ->\n        defer close_writer(writer)\n        match Writer.write(writer, data) do\n          value: {:ok, unit} -> wrote(writer, value)\n          value: {:error, File.Error} -> false\n        end\n    end\n  end\n  def write_data(data: bytes) -> bool do\n    match File.create(\"output.bin\") do\n      value: {:ok, File.Writer} -> created(data, value)\n      value: {:error, File.Error} -> false\n    end\n  end\n  def read_ok(value: {:ok, bytes}) -> bool do\n    match value do {:ok, data} -> write_data(Transform.apply(data)) end\n  end\n  def read_data(reader: File.Reader) -> bool do\n    match Reader.read(reader, 1024) do\n      value: {:ok, bytes} -> read_ok(value)\n      :eof -> write_data(String.bytes(\"!\"))\n      value: {:error, File.Error} -> false\n    end\n  end\n  def opened(value: {:ok, File.Reader}) -> bool do\n    match value do\n      {:ok, reader} ->\n        defer close_reader(reader)\n        read_data(reader)\n    end\n  end\n  def main() -> i32 do\n    success = match File.open_read(\"input.bin\") do\n      value: {:ok, File.Reader} -> opened(value)\n      value: {:error, File.Error} -> false\n    end\n    if success do 42 else 1 end\n  end\nend\n",
+    )
+    .expect("write main module");
+    fs::write(temp.0.join("input.bin"), b"hello").expect("write input fixture");
+
+    let target = el_codegen::host_target_metadata().expect("host target metadata");
+    for (release, directory) in [(false, "debug"), (true, "release")] {
+        run_project_command(
+            ProjectCommand::Build {
+                release,
+                locked: false,
+            },
+            &temp.0,
+        )
+        .expect("build manifest target");
+        let executable = temp
+            .0
+            .join("build")
+            .join(target.llvm_target_triple())
+            .join(directory)
+            .join(format!("milestone_eight{}", std::env::consts::EXE_SUFFIX));
+        let status = Command::new(executable)
+            .current_dir(&temp.0)
+            .status()
+            .expect("run milestone eight exit fixture");
+        assert_eq!(status.code(), Some(42));
+        assert_eq!(fs::read(temp.0.join("output.bin")).unwrap(), b"hello!");
+    }
+    assert!(temp.0.join("el.lock").is_file());
 }
 
 #[cfg(feature = "gc-stress-test")]

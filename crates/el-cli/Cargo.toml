@@ -12,6 +12,10 @@ path = "src/main.rs"
 [dependencies]
 el-driver = { path = "../el-driver", version = "=0.1.0" }
 
+[features]
+default = []
+llvm = ["el-driver/llvm"]
+managed-runtime = ["llvm", "el-driver/managed-runtime"]
+
 [lints]
 workspace = true
-
