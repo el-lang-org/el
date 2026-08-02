@@ -1156,6 +1156,31 @@ fn checks_unicode_grapheme_length() {
 }
 
 #[test]
+fn checks_basic_string_operations() {
+    let source = "defmodule Main do\n  def fields(text: string) -> [string] do\n    String.split(text, \",\")\n  end\n  def main() -> i32 do\n    if String.empty(\"\") and String.contains(\"café\", \"fé\") and fields(\"a,,b,\") == [\"a\", \"\", \"b\", \"\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("basic String operations type-check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string empty: bool"), "{debug}");
+    assert!(debug.contains("string contains: bool"), "{debug}");
+    assert!(debug.contains("string split: [string]"), "{debug}");
+    verify(&typed).expect("basic String operations Typed AST verifies");
+
+    for invalid in [
+        "String.empty(1)",
+        "String.contains(\"abc\", 1)",
+        "String.split(\"abc\", 1)",
+    ] {
+        let invalid_source = format!(
+            "defmodule Main do\n  def main() -> i32 do\n    {invalid}\n    0\n  end\nend\n"
+        );
+        assert!(
+            checked(&invalid_source).is_err(),
+            "{invalid} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn checks_eager_graphemes_and_lazy_string_views() {
     let source = "defmodule Main do\n  def graphemes(text: string) -> [string] do\n    String.graphemes(text)\n  end\n  def codepoint_view(text: string) -> String.CodepointView do\n    String.codepoint_view(text)\n  end\n  def grapheme_view(text: string) -> String.GraphemeView do\n    String.grapheme_view(text)\n  end\n  def main() -> i32 do\n    if graphemes(\"é🇸🇬\") == [\"é\", \"🇸🇬\"] and Enum.to_list(codepoint_view(\"A🙂\")) == ['A', '🙂'] and Enum.to_list(grapheme_view(\"é🇸🇬\")) == [\"é\", \"🇸🇬\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("grapheme APIs and lazy views type-check");

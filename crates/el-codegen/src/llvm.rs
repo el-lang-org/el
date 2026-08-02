@@ -18,8 +18,8 @@ use el_runtime::{
     ERROR_CODE_SYMBOL, ERROR_KIND_SYMBOL, ERROR_OPERATION_SYMBOL, FILE_CLOSE_SYMBOL,
     FILE_OPEN_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL, INTEGER_TO_STRING_SYMBOL,
     PROCESS_ARGUMENTS_SYMBOL, PROCESS_GET_ENV_SYMBOL, PROCESS_SNAPSHOT_SYMBOL, READER_READ_SYMBOL,
-    STDERR_SYMBOL, STDIN_SYMBOL, STDOUT_SYMBOL, UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL,
-    WRITER_WRITE_SYMBOL,
+    STDERR_SYMBOL, STDIN_SYMBOL, STDOUT_SYMBOL, STRING_CONTAINS_SYMBOL, STRING_SPLIT_SYMBOL,
+    UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL, WRITER_WRITE_SYMBOL,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory, GRAPHEME_COUNT_SYMBOL, GRAPHEME_NEXT_SYMBOL};
 use inkwell::AddressSpace;
@@ -357,6 +357,10 @@ struct ModuleLowerer<'ctx, 'core> {
     console_error: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     integer_to_string: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    string_contains: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    string_split: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     allocate_scanned: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
@@ -794,6 +798,49 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             None,
         );
         #[cfg(feature = "managed-runtime")]
+        let string_contains = module.add_function(
+            STRING_CONTAINS_SYMBOL,
+            context.i32_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let string_split = module.add_function(
+            STRING_SPLIT_SYMBOL,
+            context.ptr_type(AddressSpace::default()).fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
         let hash_seed = module.add_function(
             HASH_SEED_SYMBOL,
             context
@@ -1012,6 +1059,10 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             console_error,
             #[cfg(feature = "managed-runtime")]
             integer_to_string,
+            #[cfg(feature = "managed-runtime")]
+            string_contains,
+            #[cfg(feature = "managed-runtime")]
+            string_split,
             #[cfg(feature = "managed-runtime")]
             allocate_scanned,
             #[cfg(feature = "managed-runtime")]
@@ -7833,6 +7884,144 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     let _ = origin;
                 }
             }
+            Operation::StringEmpty {
+                result,
+                string,
+                ty: _,
+                origin: _,
+            } => {
+                let source = struct_value(values, *string)?;
+                let length = built(builder.build_extract_value(
+                    source,
+                    1,
+                    &format!("v{}.string_empty_length", result.0),
+                ))?
+                .into_int_value();
+                let empty = built(builder.build_int_compare(
+                    IntPredicate::EQ,
+                    length,
+                    length.get_type().const_zero(),
+                    &format!("v{}", result.0),
+                ))?;
+                values.insert(*result, empty.into());
+            }
+            Operation::StringContains {
+                result,
+                string,
+                pattern,
+                ty: _,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, string, pattern, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_contains",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let source = struct_value(values, *string)?;
+                    let needle = struct_value(values, *pattern)?;
+                    let data = built(builder.build_extract_value(source, 0, "contains.data"))?;
+                    let length = built(builder.build_extract_value(source, 1, "contains.length"))?;
+                    let pattern_data =
+                        built(builder.build_extract_value(needle, 0, "contains.pattern_data"))?;
+                    let pattern_length =
+                        built(builder.build_extract_value(needle, 1, "contains.pattern_length"))?;
+                    let call = built(builder.build_call(
+                        self.string_contains,
+                        &[
+                            data.into(),
+                            length.into(),
+                            pattern_data.into(),
+                            pattern_length.into(),
+                        ],
+                        &format!("v{}.contains", result.0),
+                    ))?;
+                    let found = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?
+                        .into_int_value();
+                    let value = built(builder.build_int_compare(
+                        IntPredicate::NE,
+                        found,
+                        found.get_type().const_zero(),
+                        &format!("v{}", result.0),
+                    ))?;
+                    values.insert(*result, value.into());
+                    let _ = origin;
+                }
+            }
+            Operation::StringSplit {
+                result,
+                string,
+                separator,
+                ty: _,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, string, separator, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_split",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *string)?;
+                    let delimiter = struct_value(values, *separator)?;
+                    let data = built(builder.build_extract_value(source, 0, "split.data"))?;
+                    let length = built(builder.build_extract_value(source, 1, "split.length"))?;
+                    let separator_data =
+                        built(builder.build_extract_value(delimiter, 0, "split.separator_data"))?;
+                    let separator_length =
+                        built(builder.build_extract_value(delimiter, 1, "split.separator_length"))?;
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    let call = built(
+                        builder.build_call(
+                            self.string_split,
+                            &[
+                                data.into(),
+                                length.into(),
+                                separator_data.into(),
+                                separator_length.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            &format!("v{}", result.0),
+                        ),
+                    )?;
+                    let output = call
+                        .try_as_basic_value()
+                        .basic()
+                        .ok_or(BackendError::MissingValue(*result))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    values.insert(*result, output);
+                }
+            }
             Operation::Bitstring {
                 result,
                 segments,
@@ -13307,6 +13496,9 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringCodepointView { result, ty, .. }
                     | Operation::StringGraphemeView { result, ty, .. }
                     | Operation::StringLength { result, ty, .. }
+                    | Operation::StringEmpty { result, ty, .. }
+                    | Operation::StringContains { result, ty, .. }
+                    | Operation::StringSplit { result, ty, .. }
                     | Operation::Bitstring { result, ty, .. }
                     | Operation::BitstringPatternInteger { result, ty, .. }
                     | Operation::BitstringPatternBytes { result, ty, .. }
@@ -14137,6 +14329,19 @@ mod tests {
             text.contains("call i64 @__el_runtime_grapheme_count"),
             "{text}"
         );
+    }
+
+    #[cfg(feature = "managed-runtime")]
+    #[test]
+    fn lowers_basic_string_operations_through_the_private_runtime() {
+        let core = concrete(
+            "defmodule Main do\n  def is_empty(text: string) -> bool do\n    String.empty(text)\n  end\n  def main() -> i32 do\n    fields = String.split(\"a,,b,\", \",\")\n    if is_empty(\"\") and String.contains(\"café\", \"fé\") and fields == [\"a\", \"\", \"b\", \"\"] do\n      42\n    else\n      0\n    end\n  end\nend\n",
+        );
+        let llvm = lower_to_llvm_ir(&core).expect("basic String operations lower and verify");
+        let text = llvm.as_str();
+        assert!(text.contains("string_empty_length"), "{text}");
+        assert!(text.contains(STRING_CONTAINS_SYMBOL), "{text}");
+        assert!(text.contains(STRING_SPLIT_SYMBOL), "{text}");
     }
 
     #[cfg(feature = "managed-runtime")]

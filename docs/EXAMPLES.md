@@ -804,6 +804,10 @@ end
 codepoints: [rune] = String.codepoints(text)
 graphemes: [string] = String.graphemes(text)
 
+if String.empty(text) == false and String.contains(text, "@") do
+  fields: [string] = String.split(text, "@")
+end
+
 for grapheme in graphemes do
   IO.println(grapheme)
 end
@@ -824,6 +828,11 @@ end
 
 Integer indexing such as `text[i]` is invalid. `String.length` counts Unicode
 grapheme clusters, not bytes or code points.
+
+`String.split` retains empty fields: splitting `"a,,b,"` on `","` yields
+`["a", "", "b", ""]`. An empty separator performs no split and returns the
+source as a one-element list. Use `String.graphemes` when the desired unit is a
+Unicode extended grapheme cluster.
 
 All grapheme APIs use EL v1's bundled Unicode 17.0.0 data and the untailored
 default extended-grapheme rules from UAX #29 revision 47. Their results do not

@@ -1252,6 +1252,9 @@ Programs use these `String` functions instead:
 ```el
 String.byte_size(text)
 String.length(text)
+String.empty(text)
+String.contains(text, pattern)
+String.split(text, separator)
 String.bytes(text)
 String.codepoints(text)
 String.graphemes(text)
@@ -1266,6 +1269,13 @@ Their semantics are:
 - `length(s) -> usize` returns the number of Unicode grapheme clusters. It is
   generally O(n), matching Elixir's human-text-oriented meaning of length. Its
   boundaries are exactly those used by `graphemes` and `grapheme_view`.
+- `empty(s) -> bool` is equivalent to `byte_size(s) == 0`.
+- `contains(s, pattern) -> bool` performs an exact, case-sensitive substring
+  search over UTF-8 bytes. The empty pattern is contained in every string.
+- `split(s, separator) -> [string]` separates from left to right at exact,
+  non-overlapping separator matches and preserves leading, trailing, and
+  adjacent empty fields. An empty separator performs no split and returns
+  `[s]`.
 - `bytes(s) -> bytes` returns the first-class immutable UTF-8 byte sequence and
   may share the string's immutable storage.
 - `codepoints(s) -> [rune]` eagerly returns Unicode scalar values in source
@@ -3801,6 +3811,26 @@ These require explicit decisions before the affected implementation begins:
 - Reason: Diagnostics and ordinary presentation should not require manual
   `Buffer` construction or repeated concatenation while EL retains explicit,
   statically selected conversion semantics.
+
+### D-068 — Basic standard-library string operations
+
+- Date: 2026-08-02
+- Status: accepted
+- API: `String.empty(string) -> bool`,
+  `String.contains(string, string) -> bool`, and
+  `String.split(string, string) -> [string]` are part of the v1 `String`
+  surface.
+- Matching: `contains` and `split` use exact, case-sensitive UTF-8 byte
+  matching without normalization, case folding, or locale tailoring. The empty
+  pattern is always contained.
+- Splitting: Matches are consumed left to right without overlap. Empty fields
+  at the beginning, end, and between adjacent separators are retained. An empty
+  separator performs no split and returns a one-element list containing the
+  source string.
+- Reason: Common validation and parsing should state their intent directly
+  without hand-written recursive grapheme traversal. Keeping Unicode-aware
+  segmentation under the distinct `graphemes` API makes the matching unit
+  explicit.
 
 ## 21. Next design checkpoint
 

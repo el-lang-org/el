@@ -770,6 +770,17 @@ evaluated eagerly, exactly once, and from left to right. Interpolation performs
 human-readable conversion only; it is not serialization and provides no
 format-specifier syntax in v1.
 
+The basic text predicates and separator operation have these fixed signatures:
+
+```el
+String.empty(text: string) -> bool
+String.contains(text: string, pattern: string) -> bool
+String.split(text: string, separator: string) -> [string]
+```
+
+Both arguments to `contains` and `split` must be `string`; these operations do
+not accept raw `bytes` or implicit conversions.
+
 Files expose statically separated byte reader and writer handles:
 
 ```el

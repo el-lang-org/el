@@ -1,0 +1,16 @@
+# conformance: accept; spec=docs/DESIGN.md §7, docs/EXAMPLES.md §13
+defmodule Main do
+  def main() -> i32 do
+    fields = String.split("a,,é,", ",")
+    if String.empty("") and
+      String.empty("a") == false and
+      String.contains("café", "fé") and
+      String.contains("abc", "") and
+      fields == ["a", "", "é", ""] and
+      String.split("abc", "") == ["abc"] do
+      0
+    else
+      1
+    end
+  end
+end

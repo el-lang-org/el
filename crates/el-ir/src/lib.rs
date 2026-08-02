@@ -231,6 +231,26 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    StringEmpty {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringContains {
+        result: ValueId,
+        string: ValueId,
+        pattern: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringSplit {
+        result: ValueId,
+        string: ValueId,
+        separator: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
     Bitstring {
         result: ValueId,
         segments: Vec<BitstringSegment>,
@@ -1317,6 +1337,43 @@ impl<'a> Lowerer<'a> {
                 self.operations.push(Operation::StringLength {
                     result,
                     string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringEmpty(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringEmpty {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringContains { string, pattern } => {
+                let string = self.lower_expr(string)?;
+                let pattern = self.lower_expr(pattern)?;
+                let result = self.value();
+                self.operations.push(Operation::StringContains {
+                    result,
+                    string,
+                    pattern,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringSplit { string, separator } => {
+                let string = self.lower_expr(string)?;
+                let separator = self.lower_expr(separator)?;
+                let result = self.value();
+                self.operations.push(Operation::StringSplit {
+                    result,
+                    string,
+                    separator,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -3303,6 +3360,7 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
                 | Operation::Concat { .. }
                 | Operation::MapToList { .. }
                 | Operation::StringCodepoints { .. }
+                | Operation::StringSplit { .. }
                 | Operation::Bitstring { .. }
                 | Operation::StringFromBytes { .. }
                 | Operation::BytesFromList { .. }
@@ -3552,8 +3610,18 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         | Operation::StringGraphemeView { string, .. } => {
             live.values.insert(*string);
         }
-        Operation::StringLength { string, .. } => {
+        Operation::StringLength { string, .. } | Operation::StringEmpty { string, .. } => {
             live.values.insert(*string);
+        }
+        Operation::StringContains {
+            string, pattern, ..
+        } => {
+            live.values.extend([*string, *pattern]);
+        }
+        Operation::StringSplit {
+            string, separator, ..
+        } => {
+            live.values.extend([*string, *separator]);
         }
         Operation::Bitstring { segments, .. } => {
             for segment in segments {
@@ -3757,6 +3825,9 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::StringCodepointView { result, .. }
         | Operation::StringGraphemeView { result, .. }
         | Operation::StringLength { result, .. }
+        | Operation::StringEmpty { result, .. }
+        | Operation::StringContains { result, .. }
+        | Operation::StringSplit { result, .. }
         | Operation::Bitstring { result, .. }
         | Operation::BitstringPatternInteger { result, .. }
         | Operation::BitstringPatternBytes { result, .. }
@@ -4747,6 +4818,9 @@ impl<'a> Monomorphizer<'a> {
             | Operation::StringCodepointView { ty, .. }
             | Operation::StringGraphemeView { ty, .. }
             | Operation::StringLength { ty, .. }
+            | Operation::StringEmpty { ty, .. }
+            | Operation::StringContains { ty, .. }
+            | Operation::StringSplit { ty, .. }
             | Operation::BitstringPatternInteger { ty, .. }
             | Operation::BitstringPatternBytes { ty, .. }
             | Operation::StringFromBytes { ty, .. }
@@ -5271,6 +5345,9 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::StringCodepointView { ty, .. }
         | Operation::StringGraphemeView { ty, .. }
         | Operation::StringLength { ty, .. }
+        | Operation::StringEmpty { ty, .. }
+        | Operation::StringContains { ty, .. }
+        | Operation::StringSplit { ty, .. }
         | Operation::BitstringPatternInteger { ty, .. }
         | Operation::BitstringPatternBytes { ty, .. }
         | Operation::StringFromBytes { ty, .. }
@@ -5711,6 +5788,9 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringCodepointView { result, ty, .. }
                     | Operation::StringGraphemeView { result, ty, .. }
                     | Operation::StringLength { result, ty, .. }
+                    | Operation::StringEmpty { result, ty, .. }
+                    | Operation::StringContains { result, ty, .. }
+                    | Operation::StringSplit { result, ty, .. }
                     | Operation::Bitstring { result, ty, .. }
                     | Operation::BitstringPatternInteger { result, ty, .. }
                     | Operation::BitstringPatternBytes { result, ty, .. }
@@ -6703,6 +6783,69 @@ fn verify_operation(
                 errors.push(format!(
                     "string grapheme length {result:?} has invalid types"
                 ));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringEmpty {
+            result, string, ty, ..
+        } => {
+            if !matches!(
+                values
+                    .get(string)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::String)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::Bool))
+            {
+                errors.push(format!("string empty {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringContains {
+            result,
+            string,
+            pattern,
+            ty,
+            ..
+        } => {
+            let string_value = |value: &ValueId| {
+                matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::String)
+                )
+            };
+            if !string_value(string)
+                || !string_value(pattern)
+                || !matches!(types.get(ty.0 as usize), Some(Type::Bool))
+            {
+                errors.push(format!("string contains {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringSplit {
+            result,
+            string,
+            separator,
+            ty,
+            ..
+        } => {
+            let string_value = |value: &ValueId| {
+                matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::String)
+                )
+            };
+            if !string_value(string)
+                || !string_value(separator)
+                || !matches!(
+                    types.get(ty.0 as usize),
+                    Some(Type::List(item)) if matches!(types.get(item.0 as usize), Some(Type::String))
+                )
+            {
+                errors.push(format!("string split {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -8653,6 +8796,29 @@ fn display_operation(operation: &Operation) -> String {
         Operation::StringLength {
             result, string, ty, ..
         } => format!("v{} = string_length v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringEmpty {
+            result, string, ty, ..
+        } => format!("v{} = string_empty v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringContains {
+            result,
+            string,
+            pattern,
+            ty,
+            ..
+        } => format!(
+            "v{} = string_contains v{} v{}: t{}",
+            result.0, string.0, pattern.0, ty.0
+        ),
+        Operation::StringSplit {
+            result,
+            string,
+            separator,
+            ty,
+            ..
+        } => format!(
+            "v{} = string_split v{} v{}: t{}",
+            result.0, string.0, separator.0, ty.0
+        ),
         Operation::StringFromBytes {
             result, bytes, ty, ..
         } => format!("v{} = string_from_bytes v{}: t{}", result.0, bytes.0, ty.0),

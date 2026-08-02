@@ -351,6 +351,15 @@ pub enum TypedExprKind {
     StringCodepointView(Box<TypedExpr>),
     StringGraphemeView(Box<TypedExpr>),
     StringLength(Box<TypedExpr>),
+    StringEmpty(Box<TypedExpr>),
+    StringContains {
+        string: Box<TypedExpr>,
+        pattern: Box<TypedExpr>,
+    },
+    StringSplit {
+        string: Box<TypedExpr>,
+        separator: Box<TypedExpr>,
+    },
     Bitstring(Vec<TypedBitstringSegment>),
     StringFromBytes(Box<TypedExpr>),
     Utf8ErrorOffset(Box<TypedExpr>),
@@ -4651,6 +4660,9 @@ impl<'a> Checker<'a> {
                     | "Slice.length"
                     | "String.byte_size"
                     | "String.length"
+                    | "String.empty"
+                    | "String.contains"
+                    | "String.split"
                     | "String.bytes"
                     | "String.codepoints"
                     | "String.graphemes"
@@ -5152,6 +5164,7 @@ impl<'a> Checker<'a> {
             | "Buffer.append_byte"
             | "Buffer.append_bytes"
             | "Buffer.append_string" => 2,
+            "String.contains" | "String.split" => 2,
             _ => 1,
         };
         if arguments.len() != required {
@@ -5247,6 +5260,34 @@ impl<'a> Checker<'a> {
             ),
             ("String.length", Type::String) => {
                 (TypedExprKind::StringLength(Box::new(first)), usize_ty)
+            }
+            ("String.empty", Type::String) => {
+                let ty = self.intern(Type::Bool);
+                (TypedExprKind::StringEmpty(Box::new(first)), ty)
+            }
+            ("String.contains", Type::String) => {
+                let string_ty = self.intern(Type::String);
+                let pattern = self.check_expr(arguments[1], Some(string_ty), owner, scopes)?;
+                let ty = self.intern(Type::Bool);
+                (
+                    TypedExprKind::StringContains {
+                        string: Box::new(first),
+                        pattern: Box::new(pattern),
+                    },
+                    ty,
+                )
+            }
+            ("String.split", Type::String) => {
+                let string_ty = self.intern(Type::String);
+                let separator = self.check_expr(arguments[1], Some(string_ty), owner, scopes)?;
+                let ty = self.intern(Type::List(string_ty));
+                (
+                    TypedExprKind::StringSplit {
+                        string: Box::new(first),
+                        separator: Box::new(separator),
+                    },
+                    ty,
+                )
             }
             ("String.bytes", Type::String) => {
                 let ty = self.intern(Type::Bytes);
@@ -7651,6 +7692,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::StringCodepointView(value)
         | TypedExprKind::StringGraphemeView(value)
         | TypedExprKind::StringLength(value)
+        | TypedExprKind::StringEmpty(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -7664,6 +7706,14 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::EnumToList(value)
         | TypedExprKind::CollectionLength { value, .. } => collect_expr_locals(value, output),
+        TypedExprKind::StringContains { string, pattern } => {
+            collect_expr_locals(string, output);
+            collect_expr_locals(pattern, output);
+        }
+        TypedExprKind::StringSplit { string, separator } => {
+            collect_expr_locals(string, output);
+            collect_expr_locals(separator, output);
+        }
         TypedExprKind::EnumAt { value, index } => {
             collect_expr_locals(value, output);
             collect_expr_locals(index, output);
@@ -10012,6 +10062,9 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::StringCodepointView(_) => "string codepoint view".to_owned(),
         TypedExprKind::StringGraphemeView(_) => "string grapheme view".to_owned(),
         TypedExprKind::StringLength(_) => "string grapheme length".to_owned(),
+        TypedExprKind::StringEmpty(_) => "string empty".to_owned(),
+        TypedExprKind::StringContains { .. } => "string contains".to_owned(),
+        TypedExprKind::StringSplit { .. } => "string split".to_owned(),
         TypedExprKind::Bitstring(_) => "bitstring".to_owned(),
         TypedExprKind::StringFromBytes(_) => "string from bytes".to_owned(),
         TypedExprKind::Utf8ErrorOffset(_) => "UTF-8 error offset".to_owned(),
@@ -10153,6 +10206,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::StringBytes(value)
         | TypedExprKind::StringCodepoints(value)
         | TypedExprKind::StringLength(value)
+        | TypedExprKind::StringEmpty(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -10167,6 +10221,14 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::EnumToList(value)
         | TypedExprKind::CollectionLength { value, .. } => {
             write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::StringContains { string, pattern } => {
+            write_expr(program, output, string, depth + 1);
+            write_expr(program, output, pattern, depth + 1);
+        }
+        TypedExprKind::StringSplit { string, separator } => {
+            write_expr(program, output, string, depth + 1);
+            write_expr(program, output, separator, depth + 1);
         }
         TypedExprKind::ShowConstant { value, .. } => {
             write_expr(program, output, value, depth + 1);

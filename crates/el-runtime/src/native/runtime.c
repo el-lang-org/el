@@ -552,6 +552,73 @@ void __el_runtime_integer_to_string(uint64_t value, uint32_t kind,
   *size = (size_t)length;
 }
 
+static size_t el_string_find(const uint8_t *data, size_t size,
+                             const uint8_t *pattern, size_t pattern_size,
+                             size_t offset) {
+  if (pattern_size == 0) return offset <= size ? offset : SIZE_MAX;
+  if (offset > size || pattern_size > size - offset) return SIZE_MAX;
+  const size_t last = size - pattern_size;
+  for (size_t index = offset; index <= last; index += 1) {
+    if (data[index] == pattern[0] &&
+        memcmp(data + index, pattern, pattern_size) == 0) {
+      return index;
+    }
+  }
+  return SIZE_MAX;
+}
+
+uint32_t __el_runtime_string_contains(const uint8_t *data, size_t size,
+                                      const uint8_t *pattern,
+                                      size_t pattern_size) {
+  return el_string_find(data, size, pattern, pattern_size, 0) != SIZE_MAX;
+}
+
+static void el_string_split_append(ElRuntimeStringList **head,
+                                   ElRuntimeStringList **tail,
+                                   const uint8_t *data, size_t size,
+                                   uint32_t file, uint64_t start,
+                                   uint64_t end) {
+  uint8_t *copy = __el_runtime_alloc_atomic((uint64_t)(size == 0 ? 1 : size),
+                                            file, start, end);
+  if (size > 0) memcpy(copy, data, size);
+  ElRuntimeStringList *node = __el_runtime_alloc_scanned(
+      (uint64_t)sizeof(ElRuntimeStringList), file, start, end);
+  node->item.data = copy;
+  node->item.size = size;
+  node->next = NULL;
+  if (*tail == NULL) {
+    *head = node;
+  } else {
+    (*tail)->next = node;
+  }
+  *tail = node;
+}
+
+void *__el_runtime_string_split(const uint8_t *data, size_t size,
+                                const uint8_t *separator,
+                                size_t separator_size, uint32_t file,
+                                uint64_t start, uint64_t end) {
+  ElRuntimeStringList *head = NULL;
+  ElRuntimeStringList *tail = NULL;
+  if (separator_size == 0) {
+    el_string_split_append(&head, &tail, data, size, file, start, end);
+    return head;
+  }
+  size_t offset = 0;
+  for (;;) {
+    const size_t found =
+        el_string_find(data, size, separator, separator_size, offset);
+    if (found == SIZE_MAX) {
+      el_string_split_append(&head, &tail, data + offset, size - offset, file,
+                             start, end);
+      return head;
+    }
+    el_string_split_append(&head, &tail, data + offset, found - offset, file,
+                           start, end);
+    offset = found + separator_size;
+  }
+}
+
 static ElFileStream *el_stream(FILE *file, int owned, int readable,
                                int writable) {
   ElFileStream *stream = (ElFileStream *)GC_malloc(sizeof(ElFileStream));

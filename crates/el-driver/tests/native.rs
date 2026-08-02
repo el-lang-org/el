@@ -692,6 +692,30 @@ fn string_codepoints_decode_eagerly_in_order_under_gc_stress() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn basic_string_operations_preserve_fields_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def pressure(count: i32) -> unit do\n    mut remaining: i32 = count\n    while remaining > 0 do\n      String.split(\"a,,b,\", \",\")\n      remaining := remaining - 1\n    end\n  end\n  def main() -> i32 do\n    fields = String.split(\"a,,é,\", \",\")\n    absent = String.split(\"abc\", \"/\")\n    unchanged = String.split(\"abc\", \"\")\n    pressure(256)\n    if String.empty(\"\") and String.empty(\"a\") == false and String.contains(\"café\", \"fé\") and String.contains(\"abc\", \"\") and String.contains(\"abc\", \"z\") == false and fields == [\"a\", \"\", \"é\", \"\"] and absent == [\"abc\"] and unchanged == [\"abc\"] do\n      42\n    else\n      0\n    end\n  end\nend\n";
+
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-basic-string-operations-stress"),
+                source,
+                profile,
+            )
+            .code(),
+            Some(42),
+            "basic String operations must preserve exact values and roots in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn string_length_uses_unicode_17_extended_graphemes() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def main() -> i32 do\n    if String.length(\"\") == 0 and String.length(\"A\") == 1 and String.length(\"é\") == 1 and String.length(\"🇸🇬\") == 1 and String.length(\"👩‍👩‍👧‍👦\") == 1 and String.length(\"Aé🇸🇬👩‍👩‍👧‍👦\") == 4 do\n      42\n    else\n      0\n    end\n  end\nend\n";

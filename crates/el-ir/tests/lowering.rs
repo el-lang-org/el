@@ -1754,6 +1754,51 @@ fn lowers_unicode_grapheme_length_as_a_noncollecting_operation() {
 }
 
 #[test]
+fn lowers_basic_string_operations_with_explicit_collection_effects() {
+    let module = lowered(
+        "defmodule Main do\n  def main() -> i32 do\n    String.empty(\"\")\n    String.contains(\"café\", \"fé\")\n    String.split(\"a,,b,\", \",\")\n    0\n  end\nend\n",
+    );
+    let operations = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.operations)
+        .collect::<Vec<_>>();
+    let empty = operations
+        .iter()
+        .find(|operation| matches!(operation, Operation::StringEmpty { .. }))
+        .expect("String.empty operation");
+    let contains = operations
+        .iter()
+        .find(|operation| matches!(operation, Operation::StringContains { .. }))
+        .expect("String.contains operation");
+    let split = operations
+        .iter()
+        .find(|operation| matches!(operation, Operation::StringSplit { .. }))
+        .expect("String.split operation");
+    assert_eq!(
+        operation_collection_effect(empty),
+        CollectionEffect::CannotCollect
+    );
+    assert_eq!(
+        operation_collection_effect(contains),
+        CollectionEffect::CannotCollect
+    );
+    assert_eq!(
+        operation_collection_effect(split),
+        CollectionEffect::MayCollect
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("string_empty"), "{debug}");
+    assert!(debug.contains("string_contains"), "{debug}");
+    assert!(debug.contains("string_split"), "{debug}");
+    verify(&module).expect("basic String Generic Core verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("basic String operations specialize");
+    verify_concrete(&concrete).expect("basic String Concrete Core verifies");
+}
+
+#[test]
 fn lowers_eager_graphemes_through_retained_lazy_views() {
     let module = lowered(
         "defmodule Main do\n  def main() -> i32 do\n    graphemes = String.graphemes(\"é🇸🇬\")\n    codepoints = Enum.to_list(String.codepoint_view(\"A🙂\"))\n    lazy_graphemes = Enum.to_list(String.grapheme_view(\"é🇸🇬\"))\n    if graphemes == lazy_graphemes and codepoints == ['A', '🙂'] do\n      0\n    else\n      1\n    end\n  end\nend\n",
