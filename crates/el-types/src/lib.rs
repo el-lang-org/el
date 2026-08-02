@@ -1780,6 +1780,9 @@ impl<'a> Checker<'a> {
             if node.kind.as_str() == "match_expr" {
                 return self.check_match(node, Some(expected), owner, scopes);
             }
+            if node.kind.as_str() == "with_expr" {
+                return self.check_with(node, Some(expected), owner, scopes);
+            }
             return self.check_union_injection(node, expected, owner, scopes);
         }
         let expression = match node.kind.as_str() {
@@ -1804,6 +1807,7 @@ impl<'a> Checker<'a> {
             "map_literal" => self.check_map(node, expected, owner, scopes),
             "if_expr" => self.check_if(node, expected, owner, scopes),
             "match_expr" => self.check_match(node, expected, owner, scopes),
+            "with_expr" => self.check_with(node, expected, owner, scopes),
             "tuple_literal" => self.check_tuple(node, expected, owner, scopes),
             "struct_literal" => self.check_struct_literal(node, expected, owner, scopes),
             "ascription_expr" => self.check_ascription(node, owner, scopes),
@@ -1922,7 +1926,12 @@ impl<'a> Checker<'a> {
                 ),
             ));
             return None;
-        } else if node.kind.as_str() == "postfix_expr" {
+        } else if node.kind.as_str() == "postfix_expr"
+            && node
+                .children
+                .iter()
+                .any(|child| child.kind.as_str() == "call_arguments")
+        {
             self.check_call(node, Some(union), owner, scopes)?
         } else {
             self.check_expr(node, None, owner, scopes)?
@@ -2252,6 +2261,226 @@ impl<'a> Checker<'a> {
             ty: result_type.unwrap_or(TypeId(3)),
             span: node.span,
         })
+    }
+
+    /// Desugars `with` into nested matches. The catch-all arm is only reachable
+    /// after the success pattern failed, so its internal propagation match may
+    /// intentionally be non-exhaustive over success-only union members.
+    fn check_with(
+        &mut self,
+        node: &Node,
+        expected: Option<TypeId>,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let (body_node, clause_nodes) = node.children.split_last()?;
+        let mut clause_scope_count = 0;
+        let checked = (|| {
+            let mut clauses = Vec::new();
+            for clause in clause_nodes {
+                let subject = self.check_expr(clause.children.get(1)?, None, owner, scopes)?;
+                let mut bindings = BTreeMap::new();
+                let (mut pattern, shape) = self.check_pattern(
+                    clause.children.first()?,
+                    subject.ty,
+                    owner,
+                    scopes,
+                    &mut bindings,
+                )?;
+                pattern.facts.reachable = true;
+                scopes.push(bindings);
+                clause_scope_count += 1;
+                clauses.push((subject, pattern, shape, clause.span));
+            }
+            let body = self.check_block(body_node, expected, owner, scopes)?;
+            Some((clauses, body))
+        })();
+        for _ in 0..clause_scope_count {
+            scopes.pop();
+        }
+        let (clauses, body) = checked?;
+        let result_ty = body.ty;
+
+        let mut success_body = body;
+        for (subject, pattern, shape, clause_span) in clauses.into_iter().rev() {
+            let failure_types = self.with_failure_types(subject.ty, &shape);
+            let mut arms = vec![TypedMatchArm {
+                pattern,
+                body: success_body,
+            }];
+            if !failure_types.is_empty() {
+                let failure_symbol = SymbolId(self.next_symbol);
+                self.next_symbol += 1;
+                let failure_pattern = TypedPattern {
+                    kind: TypedPatternKind::Binding {
+                        symbol: failure_symbol,
+                        name: String::new(),
+                    },
+                    ty: subject.ty,
+                    span: clause_span,
+                    facts: PatternFacts {
+                        reachable: true,
+                        irrefutable: true,
+                    },
+                };
+                let propagated = self.with_propagated_value(
+                    failure_symbol,
+                    subject.ty,
+                    &failure_types,
+                    result_ty,
+                    clause_span,
+                )?;
+                arms.push(TypedMatchArm {
+                    pattern: failure_pattern,
+                    body: TypedBlock {
+                        span: clause_span,
+                        ty: result_ty,
+                        items: vec![TypedItem::Expr(propagated)],
+                    },
+                });
+            }
+            let expression = TypedExpr {
+                kind: TypedExprKind::Match {
+                    subject: Box::new(subject),
+                    arms,
+                    exhaustive: true,
+                },
+                ty: result_ty,
+                span: node.span,
+            };
+            success_body = TypedBlock {
+                span: node.span,
+                ty: result_ty,
+                items: vec![TypedItem::Expr(expression)],
+            };
+        }
+        let TypedItem::Expr(expression) = success_body.items.pop()? else {
+            return None;
+        };
+        Some(expression)
+    }
+
+    fn with_failure_types(&self, subject: TypeId, success: &PatternShape) -> Vec<TypeId> {
+        let matrix = vec![vec![success.clone()]];
+        match &self.types[subject.0 as usize] {
+            Type::Union(members) => members
+                .iter()
+                .copied()
+                .filter(|member| {
+                    let candidate =
+                        PatternShape::Union(*member, Box::new((*member, PatternShape::Wildcard)));
+                    pattern_is_useful(&matrix, vec![candidate], vec![subject], &self.types)
+                })
+                .collect(),
+            _ => pattern_is_useful(
+                &matrix,
+                vec![PatternShape::Wildcard],
+                vec![subject],
+                &self.types,
+            )
+            .then_some(subject)
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    fn with_propagated_value(
+        &mut self,
+        failure_symbol: SymbolId,
+        subject: TypeId,
+        failure_types: &[TypeId],
+        result: TypeId,
+        span: Span,
+    ) -> Option<TypedExpr> {
+        if !matches!(self.types[subject.0 as usize], Type::Union(_)) {
+            let value = TypedExpr {
+                kind: TypedExprKind::Local(failure_symbol),
+                ty: subject,
+                span,
+            };
+            return self.inject_with_failure(value, result, span);
+        }
+
+        let mut arms = Vec::new();
+        for member in failure_types {
+            let symbol = SymbolId(self.next_symbol);
+            self.next_symbol += 1;
+            let value = TypedExpr {
+                kind: TypedExprKind::Local(symbol),
+                ty: *member,
+                span,
+            };
+            let value = self.inject_with_failure(value, result, span)?;
+            arms.push(TypedMatchArm {
+                pattern: TypedPattern {
+                    kind: TypedPatternKind::UnionMember {
+                        member: *member,
+                        symbol,
+                        name: String::new(),
+                    },
+                    ty: subject,
+                    span,
+                    facts: PatternFacts {
+                        reachable: true,
+                        irrefutable: false,
+                    },
+                },
+                body: TypedBlock {
+                    span,
+                    ty: result,
+                    items: vec![TypedItem::Expr(value)],
+                },
+            });
+        }
+        Some(TypedExpr {
+            kind: TypedExprKind::Match {
+                subject: Box::new(TypedExpr {
+                    kind: TypedExprKind::Local(failure_symbol),
+                    ty: subject,
+                    span,
+                }),
+                arms,
+                exhaustive: failure_types.len()
+                    == match &self.types[subject.0 as usize] {
+                        Type::Union(members) => members.len(),
+                        _ => 1,
+                    },
+            },
+            ty: result,
+            span,
+        })
+    }
+
+    fn inject_with_failure(
+        &mut self,
+        value: TypedExpr,
+        result: TypeId,
+        span: Span,
+    ) -> Option<TypedExpr> {
+        if value.ty == result {
+            return Some(value);
+        }
+        if matches!(&self.types[result.0 as usize], Type::Union(members) if members.contains(&value.ty))
+        {
+            return Some(TypedExpr {
+                kind: TypedExprKind::UnionInject {
+                    member: value.ty,
+                    value: Box::new(value),
+                },
+                ty: result,
+                span,
+            });
+        }
+        self.diagnostics.push(Diagnostic::error(
+            "E2164",
+            span,
+            format!(
+                "`with` can propagate `{}`, which is not a member of result type `{}`",
+                self.type_name(value.ty),
+                self.type_name(result)
+            ),
+        ));
+        None
     }
 
     fn check_pattern(

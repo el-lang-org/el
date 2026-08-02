@@ -34,6 +34,19 @@ fn lowered_package(sources: &[&str]) -> el_ir::GenericModule {
 }
 
 #[test]
+fn lowers_with_to_verified_pattern_control_flow() {
+    let source = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  @type Result = i32 | :error\n  def parse(value: i32) -> Parsed do\n    if value >= 0 do\n      {:ok, value}\n    else\n      :error\n    end\n  end\n  def add(left: i32, right: i32) -> Result do\n    with {:ok, first} <- parse(left),\n         {:ok, second} <- parse(right) do\n      first + second\n    end\n  end\n  def main() -> i32 do\n    match add(40, 2) do\n      value: i32 -> value\n      :error -> 1\n    end\n  end\nend\n";
+
+    let module = lowered(source);
+    let debug = module.debug_text();
+    assert!(debug.matches("switch").count() >= 4, "{debug}");
+    verify(&module).expect("with control flow verifies");
+    let roots = executable_reachability_roots(&module).expect("entry point");
+    let concrete = monomorphize(&module, &roots).expect("with control flow specializes");
+    verify_concrete(&concrete).expect("concrete with control flow verifies");
+}
+
+#[test]
 fn lowers_and_verifies_integer_unary_bitwise_and_shift_operations() {
     let source = "defmodule Main do\n  def transform(value: i16, count: usize) -> i16 do\n    ~ -value & 255 | value << count ^ value >> count\n  end\n  def main() -> i32 do\n    transform(4, 1)\n    0\n  end\nend\n";
     let mut generic = lowered(source);

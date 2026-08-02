@@ -232,7 +232,7 @@ fn accepts_every_primitive_operator_spelling_and_integer_bit_width() {
 fn rejects_token_boundaries_reserved_names_and_invalid_bitstring_combinations() {
     for body in [
         "0b", "0b102", "0o8", "0xG", "1e", "1._0", "1e_2", ":bad_", ":Bad", "@derive", "def", "if",
-        "while",
+        "while", "with",
     ] {
         let source = format!("defmodule Main do\n  def bad() do\n    {body}\n  end\nend\n");
         assert_rejected(&source);

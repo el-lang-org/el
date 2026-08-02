@@ -44,7 +44,7 @@ V1 reserved words:
 
 ```text
 def defer defimpl defmodule defp defprotocol defstruct do else end false for if in
-match mut return true type when while
+match mut return true type when while with
 ```
 
 `@derive` and `@type` are built-in attributes and are reserved as complete
@@ -199,7 +199,7 @@ call_expression  <- primary_expr non_call_postfix* call_arguments postfix_part*
 non_call_postfix <- "." ident / "[" expression "]"
 call_arguments   <- "(" (expression ("," expression)*)? ")"
 
-primary_expr     <- if_expr / match_expr / bitstring_expr / struct_literal
+primary_expr     <- if_expr / match_expr / with_expr / bitstring_expr / struct_literal
                   / map_literal / array_literal / list_literal / tuple_literal
                   / literal / qualified_value / "(" expression ")"
 qualified_value  <- ident / (type_name ".")+ ident
@@ -208,6 +208,9 @@ if_expr          <- "if" expression "do" body(block_item)
 match_expr       <- "match" expression "do" NL* match_arm
                     (NL+ match_arm)* NL* "end"
 match_arm        <- pattern "->" arm_body
+with_expr        <- "with" with_clause ("," with_clause)* "do"
+                    body(block_item) "end"
+with_clause      <- pattern "<-" expression
 tuple_literal    <- "{" expression "," expression
                     ("," expression)* "}"
 list_literal     <- "[" (expression ("," expression)*
@@ -258,7 +261,7 @@ decimal integer token satisfying the literal-length restriction in
 [TYPES.md §5](TYPES.md#5-composite-types).
 `integer`, `float`, `string`, `rune`, and `atom` are exactly the tokens defined
 in section 2.4; keyword tokens require an identifier boundary. The lexer uses
-longest-token matching for `::`, `:=`, `->`, `=>`, `==`, `!=`, `<=`, `>=`,
+longest-token matching for `::`, `:=`, `->`, `<-`, `=>`, `==`, `!=`, `<=`, `>=`,
 `<<`, `>>`, `++`, `|>`, and `#[` before their one-character prefixes or the
 line-comment rule.
 

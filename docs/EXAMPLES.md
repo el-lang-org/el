@@ -338,6 +338,24 @@ Arms are tried from top to bottom. An arm after a wildcard or general binding is
 unreachable and is rejected. Match guards, alternative patterns, pinning, and
 map patterns are not part of v1.
 
+Use `with` when several tagged-result operations should return the first failure
+unchanged:
+
+```el
+def validate(registration: Registration) -> ValidationResult do
+  with :ok <- validate_username(registration.username),
+       :ok <- validate_email(registration.email),
+       :ok <- validate_age(registration.age) do
+    {:ok, make_user(registration)}
+  end
+end
+```
+
+Each clause is evaluated once from left to right. A matching clause may bind
+values for later clauses and the body. The first non-matching value becomes the
+result; the body runs only when every clause matches. Each possible propagated
+value must fit the declared or otherwise expected result type.
+
 ## 7. Early return
 
 The normal result of a function is its final expression. Use `return expression`

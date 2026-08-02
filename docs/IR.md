@@ -105,6 +105,8 @@ span into a source file. Line and column numbers are derived for display.
 - `for pattern in value` lowers through the statically selected `Iterable`
   implementation.
 - `match` lowers to tests and branches after exhaustiveness checking.
+- `with` is absent from Core IR; it lowers to left-to-right pattern branches
+  whose first failed value flows directly to the enclosing result join.
 - A concrete structural union lowers to a hidden discriminant plus an aligned
   payload; typed injections construct a member and exhaustive matches switch on
   the discriminant before lowering the selected member pattern.

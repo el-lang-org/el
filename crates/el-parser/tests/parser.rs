@@ -68,3 +68,15 @@ fn parses_interpolated_strings() {
     let program = parse(file, escaped).expect("escaped interpolation marker parses");
     assert!(program.debug_tree().contains("escaped_interpolation"));
 }
+
+#[test]
+fn parses_with_clauses_and_body() {
+    let source = "defmodule Main do\n  def validate() -> :ok | :error do\n    with :ok <- first(),\n         {:ok, value} <- second() do\n      value\n    end\n  end\nend\n";
+    let mut sources = SourceMap::new();
+    let file = sources.add_file("src/main.ell", source);
+    let program = parse(file, source).expect("with expression parses");
+    let tree = program.debug_tree();
+
+    assert!(tree.contains("with_expr"), "{tree}");
+    assert_eq!(tree.matches("with_clause").count(), 2, "{tree}");
+}

@@ -612,6 +612,7 @@ fn is_ast_punctuation(rule: Rule) -> bool {
             | Rule::kw_type
             | Rule::kw_when
             | Rule::kw_while
+            | Rule::kw_with
             | Rule::kw_and
             | Rule::kw_or
             | Rule::kw_integer
@@ -623,6 +624,7 @@ fn is_ast_punctuation(rule: Rule) -> bool {
             | Rule::kw_bytes
             | Rule::kw_size
             | Rule::arrow
+            | Rule::left_arrow
             | Rule::fat_arrow
             | Rule::pipeline_operator
             | Rule::ascription_operator

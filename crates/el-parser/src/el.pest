@@ -95,13 +95,15 @@ index_access = { "[" ~ soft* ~ expression ~ soft* ~ "]" }
 call_expression = { primary_expr ~ non_call_postfix* ~ call_arguments ~ postfix_part* }
 call_arguments = { "(" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ ")" }
 
-primary_expr = { if_expr | match_expr | bitstring_expr | struct_literal | map_literal | array_literal | list_literal | tuple_literal | literal | qualified_value | grouped_expr }
+primary_expr = { if_expr | match_expr | with_expr | bitstring_expr | struct_literal | map_literal | array_literal | list_literal | tuple_literal | literal | qualified_value | grouped_expr }
 grouped_expr = { "(" ~ soft* ~ expression ~ soft* ~ ")" }
 qualified_value = { identifier | (type_name ~ ".")+ ~ identifier }
 if_expr = { kw_if ~ expression ~ kw_do ~ block ~ (kw_else ~ block)? ~ kw_end }
 match_expr = { kw_match ~ expression ~ kw_do ~ nl* ~ match_arm ~ (nl+ ~ match_arm)* ~ nl* ~ kw_end }
 match_arm = { pattern ~ arrow ~ arm_body }
 arm_body = { block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | nl+ ~ !(pattern ~ arrow) ~ block_item ~ (nl+ ~ !(pattern ~ arrow) ~ block_item)* | &(nl+ ~ (pattern ~ arrow | kw_end)) }
+with_expr = { kw_with ~ with_clause ~ (soft* ~ "," ~ continuation* ~ with_clause)* ~ kw_do ~ block ~ kw_end }
+with_clause = { pattern ~ left_arrow ~ continuation* ~ expression }
 
 tuple_literal = { "{" ~ soft* ~ expression ~ soft* ~ "," ~ soft* ~ expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ soft* ~ "}" }
 list_literal = { "[" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)* ~ (soft* ~ list_tail_separator ~ soft* ~ expression)?)? ~ soft* ~ "]" }
@@ -163,7 +165,7 @@ atom_identifier = { ASCII_ALPHA_LOWER ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)* ~ ("_
 
 identifier = @{ !keyword ~ ASCII_ALPHA_LOWER ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)* ~ ("_" ~ (ASCII_ALPHA_LOWER | ASCII_DIGIT)+)* }
 identifier_continue = _{ ASCII_ALPHA | ASCII_DIGIT | "_" }
-keyword = @{ ("defmodule" | "defprotocol" | "defstruct" | "defimpl" | "defp" | "def" | "defer" | "do" | "else" | "end" | "false" | "for" | "if" | "in" | "match" | "mut" | "return" | "true" | "type" | "when" | "while") ~ !identifier_continue }
+keyword = @{ ("defmodule" | "defprotocol" | "defstruct" | "defimpl" | "defp" | "def" | "defer" | "do" | "else" | "end" | "false" | "for" | "if" | "in" | "match" | "mut" | "return" | "true" | "type" | "when" | "while" | "with") ~ !identifier_continue }
 
 attr_derive = @{ "@derive" ~ !identifier_continue }
 attr_type = @{ "@type" ~ !identifier_continue }
@@ -186,6 +188,7 @@ kw_return = @{ "return" ~ !identifier_continue }
 kw_type = @{ "type" ~ !identifier_continue }
 kw_when = @{ "when" ~ !identifier_continue }
 kw_while = @{ "while" ~ !identifier_continue }
+kw_with = @{ "with" ~ !identifier_continue }
 kw_true = @{ "true" ~ !identifier_continue }
 kw_false = @{ "false" ~ !identifier_continue }
 kw_unit = @{ "unit" ~ !identifier_continue }
@@ -207,6 +210,7 @@ recovery_implementation_item = { !kw_end ~ (!newline ~ ANY)+ }
 
 array_open = _{ "#[" }
 arrow = @{ "->" }
+left_arrow = @{ "<-" }
 fat_arrow = @{ "=>" }
 type_colon = _{ ":" ~ !":" }
 continuation = _{ newline }

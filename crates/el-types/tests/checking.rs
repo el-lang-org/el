@@ -219,6 +219,33 @@ fn desugars_left_associative_pipelines_into_first_call_arguments() {
 }
 
 #[test]
+fn desugars_with_and_scopes_successful_pattern_bindings() {
+    let source = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  @type Result = i32 | :error\n  def parse(value: i32) -> Parsed do\n    if value >= 0 do\n      {:ok, value}\n    else\n      :error\n    end\n  end\n  def add(left: i32, right: i32) -> Result do\n    with {:ok, first} <- parse(left),\n         {:ok, second} <- parse(right) do\n      first + second\n    end\n  end\nend\n";
+
+    let typed = checked(source).expect("with expression type checks");
+    let debug = typed.debug_tree();
+    assert!(
+        debug.matches("match exhaustive=true").count() >= 2,
+        "{debug}"
+    );
+    assert!(debug.contains("local s"), "{debug}");
+    verify(&typed).expect("desugared with Typed AST verifies");
+}
+
+#[test]
+fn rejects_a_with_failure_outside_the_result_type() {
+    let source = "defmodule Main do\n  def step() -> :ok | :error do\n    :error\n  end\n  def run() -> i32 do\n    with :ok <- step() do\n      42\n    end\n  end\nend\n";
+
+    let diagnostics = checked(source).expect_err("unrepresentable propagation is rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2164"),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn records_immediate_deferred_call_inputs_and_immutable_block_captures() {
     let source = "defmodule Main do\n  def cleanup(value: i32) -> unit do\n    unit\n  end\n  def immediate() -> i32 do\n    1\n  end\n  def main(unused: i32) -> unit do\n    mut value: i32 = 10\n    defer cleanup(value + immediate())\n    defer do\n      cleanup(value)\n    end\n    value := 20\n    unit\n  end\nend\n";
 

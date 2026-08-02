@@ -1081,6 +1081,15 @@ all such arms must synthesize the same canonical type. Infinite scalar domains
 normally require a wildcard or binding catch-all; finite and structural domains
 are decomposed recursively.
 
+A `with` expression checks each clause pattern against the type of its
+right-hand expression. Bindings from a successful clause are visible in later
+clauses and in the body, but not outside the `with`. If a clause can fail, every
+value not covered by its pattern must be accepted by the `with` result type,
+either exactly or through unambiguous expected-union injection. The body is
+checked against the expected result type; without one, the body synthesizes the
+result type against which failures are checked. An irrefutable clause is valid
+and has no propagated failure case.
+
 ### 10.6 Source bitstrings
 
 A `<<...>>` construction has type `bytes`, and a bitstring pattern checks only

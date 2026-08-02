@@ -188,7 +188,7 @@ V1 reserved words:
 
 ```text
 def defer defimpl defmodule defp defprotocol defstruct do else end false for if in
-match mut return true type when while
+match mut return true type when while with
 ```
 
 `@derive` and `@type` are built-in attributes and are reserved as complete
@@ -1448,6 +1448,11 @@ replacing the old binding value. A `match` evaluates its subject once and then
 tests arms from top to bottom; pattern tests themselves have no user-visible
 side effects.
 
+A `with` evaluates clause expressions once from left to right. Each successful
+pattern makes its bindings available to subsequent clauses and the body. The
+first value that does not match its clause pattern becomes the result without
+evaluating later clauses or the body.
+
 Map literal entries are evaluated and inserted from left to right. If two
 evaluated keys are equal, the later entry replaces the earlier value, but every
 key and value expression is still evaluated.
@@ -1511,6 +1516,22 @@ arms. V1 has no match guards, alternative patterns, pinning, or map patterns.
 
 Unrecoverable runtime failures such as an internal invariant violation may abort
 the process. They are not catchable and must not be used for ordinary errors.
+
+For linear result propagation, `with` composes refutable operations without
+nested `match` expressions:
+
+```el
+with {:ok, left} <- parse_left(input),
+     {:ok, right} <- parse_right(input) do
+  {:ok, left + right}
+end
+```
+
+Clauses are comma-separated and use `pattern <- expression`. On success, clause
+bindings remain in scope for later clauses and the body. On failure, the
+unmatched value is returned unchanged and must fit the `with` result type under
+the normal expected-union injection rule. `with` has no `else` form; callers use
+an exhaustive `match` when failures need transformation.
 
 ### 8.4 Loops
 
@@ -3831,6 +3852,27 @@ These require explicit decisions before the affected implementation begins:
   without hand-written recursive grapheme traversal. Keeping Unicode-aware
   segmentation under the distinct `graphemes` API makes the matching unit
   explicit.
+
+### D-069 — `with` result propagation
+
+- Date: 2026-08-02
+- Status: accepted
+- Syntax: `with` contains one or more comma-separated
+  `pattern <- expression` clauses followed by `do`, a body, and `end`. There is
+  no `else` form in v1.
+- Evaluation: Clause expressions evaluate exactly once from left to right. A
+  successful pattern contributes bindings to later clauses and the body. The
+  first unmatched value is the result, and remaining clauses and the body are
+  skipped. If all patterns match, the body result is returned.
+- Types: Clause patterns use ordinary pattern checking. Every possible
+  unmatched value must equal the result type or be one of its normalized union
+  members. The usual expected-union injection applies; without an expected
+  type, the body establishes the result type.
+- Lowering: `with` is source sugar for nested pattern branches and is absent
+  from Core IR.
+- Reason: Tagged-result validation and resource pipelines should preserve
+  explicit failure values without requiring deeply nested exhaustive matches or
+  repeated early returns.
 
 ## 21. Next design checkpoint
 
