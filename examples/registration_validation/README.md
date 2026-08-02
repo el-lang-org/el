@@ -20,17 +20,15 @@ The email rule is intentionally illustrative rather than RFC 5322 validation.
 From this directory:
 
 ```sh
-el check --locked
-el build --locked
-executable="$(find build -type f -path '*/debug/registration_validation' -perm -111 -print -quit)"
-"$executable"
+elc -o registration_validation main.ell
+./registration_validation
 ```
 
 ## Run the Rust version
 
 ```sh
-rustc rust/main.rs -o /tmp/registration-validation-rust
-/tmp/registration-validation-rust
+rustc rust/main.rs -o registration_validation_rust
+./registration_validation_rust
 ```
 
 Both programs print:
