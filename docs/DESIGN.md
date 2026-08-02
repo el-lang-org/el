@@ -203,23 +203,27 @@ the preceding tokens form a complete construct at the current delimiter depth.
 Multiple statements cannot be placed on one line with a separator.
 
 A newline is treated as whitespace when continuation is unambiguous: inside an
-open `(...)`, `[...]`, or `{...}` delimiter, after a comma, or after an operator
-that still requires a right operand. No backslash or other explicit line-
-continuation token exists. For example:
+open `(...)`, `[...]`, or `{...}` delimiter, after a comma, after a non-pipeline
+operator that requires a right operand, or before a pipeline operator that
+begins the next line. No backslash or other explicit line-continuation token
+exists. For example:
 
 ```el
 total = left +
   right
 
-result = input |>
-  normalize() |>
-  validate()
+result = input
+  |> normalize()
+  |> validate()
 ```
 
-An operator at the beginning of a line does not retroactively continue a
-complete expression on the previous line. Blank and comment-only lines do not
-produce empty statements. A semicolon receives a syntax diagnostic rather than
-being treated as optional punctuation.
+The pipeline operator is the only operator that may continue a complete
+expression from the preceding line. In a multiline pipeline, each `|>` must be
+at the beginning of its continued line (after optional indentation) and its
+right operand must begin on that same line. Other operators at the beginning of
+a line do not retroactively continue a complete expression. Blank and
+comment-only lines do not produce empty statements. A semicolon receives a
+syntax diagnostic rather than being treated as optional punctuation.
 
 ### 4.4 Literals
 
@@ -3005,12 +3009,12 @@ These require explicit decisions before the affected implementation begins:
 - Decision: EL does not support semicolons. A newline separates expressions or
   statements after a complete construct and is whitespace only when the current
   construct is syntactically incomplete, including inside open delimiters,
-  after commas, and after operators requiring a right operand.
+  after commas, and after non-pipeline operators requiring a right operand.
 - Reason: One source-level separation rule keeps formatting and PEG parsing
   predictable and prevents compressed multi-statement lines.
 - Consequence: An operator at the start of a line does not continue a completed
-  previous line, so multiline pipelines place `|>` before the newline. There is
-  no explicit continuation token, and semicolons produce a syntax diagnostic.
+  previous line. D-071 adds a pipeline-specific exception. There is no explicit
+  continuation token, and semicolons produce a syntax diagnostic.
 
 ### D-031 — Final expressions with explicit early `return`
 
@@ -3916,6 +3920,19 @@ These require explicit decisions before the affected implementation begins:
   0, 1, and 2 respectively, following the stream conventions in section 14.
 - Reason: Small EL programs should be directly compilable without weakening the
   predictable manifest-driven project interface or overloading `el build`.
+
+### D-071 — Leading operators in multiline pipelines
+
+- Date: 2026-08-02
+- Status: accepted
+- Decision: A pipeline may remain on one line, but every stage that continues
+  on a later line begins with `|>` after optional indentation. A newline after
+  `|>` and before its target is rejected, including inside an open delimiter.
+- Interaction: This is the sole exception to D-030's rule that a leading
+  operator cannot continue a complete expression. It does not allow other
+  infix operators to begin a continued line.
+- Reason: Leading pipeline operators keep each transformation visually aligned
+  with its stage and make pipelines easier to extend and reorder.
 
 ## 21. Next design checkpoint
 

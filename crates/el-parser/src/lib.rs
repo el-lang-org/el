@@ -74,7 +74,7 @@ pub fn parse_recovering(file: FileId, source: &str) -> ParseOutcome {
     };
     let pair = pairs.next().expect("program rule produces one pair");
     let mut diagnostics = Vec::new();
-    validate_pair(file, pair.clone(), &mut diagnostics);
+    validate_pair(file, source, pair.clone(), &mut diagnostics);
     if diagnostics.is_empty() {
         match build_node(file, pair) {
             Ok(root) => ParseOutcome {
@@ -98,7 +98,12 @@ fn failed(error: ParseError) -> ParseOutcome {
     }
 }
 
-fn validate_pair(file: FileId, pair: Pair<'_, Rule>, diagnostics: &mut Vec<ParseError>) {
+fn validate_pair(
+    file: FileId,
+    source: &str,
+    pair: Pair<'_, Rule>,
+    diagnostics: &mut Vec<ParseError>,
+) {
     match pair.as_rule() {
         Rule::recovery_module_item
         | Rule::recovery_block_item
@@ -136,7 +141,7 @@ fn validate_pair(file: FileId, pair: Pair<'_, Rule>, diagnostics: &mut Vec<Parse
             diagnostics,
         ),
         Rule::pipeline_expr | Rule::segment_expression => {
-            validate_pipeline(file, &pair, diagnostics);
+            validate_pipeline(file, source, &pair, diagnostics);
         }
         Rule::assignment => validate_assignment(file, &pair, diagnostics),
         Rule::bitstring_expr | Rule::bitstring_pattern => {
@@ -147,7 +152,7 @@ fn validate_pair(file: FileId, pair: Pair<'_, Rule>, diagnostics: &mut Vec<Parse
         _ => {}
     }
     for child in pair.into_inner() {
-        validate_pair(file, child, diagnostics);
+        validate_pair(file, source, child, diagnostics);
     }
 }
 
@@ -207,12 +212,24 @@ fn validate_non_associative(
     }
 }
 
-fn validate_pipeline(file: FileId, pair: &Pair<'_, Rule>, diagnostics: &mut Vec<ParseError>) {
-    let mut expect_target = false;
+fn validate_pipeline(
+    file: FileId,
+    source: &str,
+    pair: &Pair<'_, Rule>,
+    diagnostics: &mut Vec<ParseError>,
+) {
+    let mut operator = None;
     for child in pair.clone().into_inner() {
         if child.as_rule() == Rule::pipeline_operator {
-            expect_target = true;
-        } else if expect_target {
+            operator = Some(child);
+        } else if let Some(operator) = operator.take() {
+            if source[operator.as_span().end()..child.as_span().start()].contains('\n') {
+                diagnostics.push(error_pair(
+                    file,
+                    &operator,
+                    "in a multiline pipeline, `|>` must begin the line containing its target",
+                ));
+            }
             if !is_statically_resolvable_call(&child) {
                 diagnostics.push(error_pair(
                     file,
@@ -220,7 +237,6 @@ fn validate_pipeline(file: FileId, pair: &Pair<'_, Rule>, diagnostics: &mut Vec<
                     "the right side of `|>` must be a statically resolvable call",
                 ));
             }
-            expect_target = false;
         }
     }
 }

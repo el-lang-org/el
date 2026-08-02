@@ -227,9 +227,9 @@ when the expression is visibly incomplete:
 total = subtotal +
   tax
 
-result = input |>
-  normalize() |>
-  validate()
+result = input
+  |> normalize()
+  |> validate()
 ```
 
 The pipeline operator inserts its left side as the first argument of the call

@@ -143,6 +143,41 @@ fn newlines_are_soft_only_at_normative_continuation_points() {
 }
 
 #[test]
+fn multiline_pipelines_require_the_operator_and_target_on_the_same_continued_line() {
+    for source in [
+        "defmodule Main do\n  def x() do\n    input\n      |> Main.first()\n      |> Main.second()\n  end\nend\n",
+        "defmodule Main do\r\n  def x() do\r\n    input\r\n      |> Main.first()\r\n  end\r\nend\r\n",
+        "defmodule Main do\n  def x() do\n    input |> Main.first()\n  end\nend\n",
+    ] {
+        parsed(source);
+    }
+
+    for (source, column) in [
+        (
+            "defmodule Main do\n  def x() do\n    input |>\n      Main.first()\n  end\nend\n",
+            11,
+        ),
+        (
+            "defmodule Main do\n  def x() do\n    (input |>\n      Main.first())\n  end\nend\n",
+            12,
+        ),
+    ] {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("src/main.ell", source);
+        let error = parse(file, source).expect_err("accepted a trailing multiline pipe");
+        assert_eq!(
+            error.message,
+            "in a multiline pipeline, `|>` must begin the line containing its target"
+        );
+        assert_eq!(
+            sources.location(file, error.span.start()),
+            Ok(Location { line: 3, column })
+        );
+        assert_eq!(error.span.end() - error.span.start(), 2);
+    }
+}
+
+#[test]
 fn rejects_private_or_malformed_protocol_implementation_members() {
     for source in [
         "defmodule Main do\n  defprotocol P do\n    value = 1\n  end\nend\n",

@@ -58,7 +58,7 @@ while_expr = { kw_while ~ expression ~ kw_do ~ block ~ kw_end }
 for_expr = { kw_for ~ pattern ~ kw_in ~ expression ~ kw_do ~ block ~ kw_end }
 
 expression = { pipeline_expr }
-pipeline_expr = { ascription_expr ~ (pipeline_operator ~ continuation* ~ ascription_expr)* }
+pipeline_expr = { ascription_expr ~ (continuation* ~ pipeline_operator ~ continuation* ~ ascription_expr)* }
 pipeline_operator = { "|>" }
 ascription_expr = { logical_or_expr ~ (ascription_operator ~ soft* ~ type_expr)* }
 ascription_operator = { "::" }
@@ -127,7 +127,7 @@ field_pattern = { identifier ~ ":" ~ pattern }
 
 bitstring_expr = { "<<" ~ soft* ~ (bit_expr_segment ~ (soft* ~ "," ~ soft* ~ bit_expr_segment)*)? ~ soft* ~ ">>" }
 bit_expr_segment = { segment_expression ~ "::" ~ bit_modifiers }
-segment_expression = { logical_or_expr ~ (pipeline_operator ~ continuation* ~ logical_or_expr)* }
+segment_expression = { logical_or_expr ~ (continuation* ~ pipeline_operator ~ continuation* ~ logical_or_expr)* }
 bitstring_pattern = { "<<" ~ soft* ~ (bit_pattern_segment ~ (soft* ~ "," ~ soft* ~ bit_pattern_segment)*)? ~ soft* ~ ">>" }
 bit_pattern_segment = { pattern ~ "::" ~ bit_modifiers }
 bit_modifiers = { bit_modifier ~ ("-" ~ bit_modifier)* }

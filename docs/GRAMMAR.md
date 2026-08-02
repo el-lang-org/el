@@ -59,23 +59,27 @@ the preceding tokens form a complete construct at the current delimiter depth.
 Multiple statements cannot be placed on one line with a separator.
 
 A newline is treated as whitespace when continuation is unambiguous: inside an
-open `(...)`, `[...]`, or `{...}` delimiter, after a comma, or after an operator
-that still requires a right operand. No backslash or other explicit line-
-continuation token exists. For example:
+open `(...)`, `[...]`, or `{...}` delimiter, after a comma, after a non-pipeline
+operator that requires a right operand, or before a pipeline operator that
+begins the next line. No backslash or other explicit line-continuation token
+exists. For example:
 
 ```el
 total = left +
   right
 
-result = input |>
-  normalize() |>
-  validate()
+result = input
+  |> normalize()
+  |> validate()
 ```
 
-An operator at the beginning of a line does not retroactively continue a
-complete expression on the previous line. Blank and comment-only lines do not
-produce empty statements. A semicolon receives a syntax diagnostic rather than
-being treated as optional punctuation.
+The pipeline operator is the only operator that may continue a complete
+expression from the preceding line. In a multiline pipeline, each `|>` must be
+at the beginning of its continued line (after optional indentation) and its
+right operand must begin on that same line. Other operators at the beginning of
+a line do not retroactively continue a complete expression. Blank and
+comment-only lines do not produce empty statements. A semicolon receives a
+syntax diagnostic rather than being treated as optional punctuation.
 
 ### 2.4 Literals
 
@@ -121,10 +125,11 @@ The notation below uses `/` for ordered choice and postfix `?`, `*`, and `+` for
 optionality and repetition. Lowercase lexical names are defined immediately
 after the syntactic productions. Horizontal
 space and comments may occur between tokens. `NL` is one physical newline that
-remains significant under section 2.3; newlines treated as
-continuation whitespace do not produce `NL`. `body(item)` means zero or more
-`item` forms separated by `NL`, with optional leading and trailing `NL`. There
-is no other statement separator.
+remains significant under section 2.3, either as a construct separator or
+before a leading pipeline operator; other newlines treated as continuation
+whitespace do not produce `NL`. `body(item)` means zero or more `item` forms
+separated by `NL`, with optional leading and trailing `NL`. There is no other
+statement separator.
 
 ```text
 program          <- SOI NL* module NL* EOI
@@ -179,7 +184,8 @@ for_expr         <- "for" pattern "in" expression
                     "do" body(block_item) "end"
 
 expression       <- pipeline_expr
-pipeline_expr    <- ascription_expr ("|>" ascription_expr)*
+pipeline_expr    <- ascription_expr pipeline_stage*
+pipeline_stage   <- "|>" ascription_expr / NL+ "|>" ascription_expr
 ascription_expr  <- logical_or_expr ("::" type)?
 logical_or_expr  <- logical_and_expr ("or" logical_and_expr)*
 logical_and_expr <- equality_expr ("and" equality_expr)*
@@ -235,7 +241,8 @@ field_pattern    <- ident ":" pattern
 
 bitstring_expr   <- "<<" (bit_expr_segment ("," bit_expr_segment)*)? ">>"
 bit_expr_segment <- segment_expression "::" bit_modifiers
-segment_expression <- logical_or_expr ("|>" logical_or_expr)*
+segment_expression <- logical_or_expr segment_pipeline_stage*
+segment_pipeline_stage <- "|>" logical_or_expr / NL+ "|>" logical_or_expr
 bitstring_pattern <- "<<" (bit_pattern_segment
                     ("," bit_pattern_segment)*)? ">>"
 bit_pattern_segment <- pattern "::" bit_modifiers
