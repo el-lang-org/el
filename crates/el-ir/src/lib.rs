@@ -1190,6 +1190,45 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::StructUpdate {
+                structure,
+                declaration,
+                field_types,
+                fields: updated_fields,
+            } => {
+                let old = self.lower_expr(structure)?;
+                let mut updates = BTreeMap::new();
+                for (index, value) in updated_fields {
+                    updates.insert(*index, self.lower_expr(value)?);
+                }
+                let mut fields = Vec::with_capacity(field_types.len());
+                for (index, ty) in field_types.iter().enumerate() {
+                    let value = if let Some(value) = updates.get(&index) {
+                        *value
+                    } else {
+                        let projected = self.value();
+                        self.operations.push(Operation::StructProject {
+                            result: projected,
+                            structure: old,
+                            declaration: *declaration,
+                            index,
+                            ty: *ty,
+                            origin: expression.span,
+                        });
+                        projected
+                    };
+                    fields.push((index, value));
+                }
+                let result = self.value();
+                self.operations.push(Operation::Struct {
+                    result,
+                    declaration: *declaration,
+                    fields,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::StructProject {
                 value,
                 declaration,

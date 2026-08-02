@@ -326,6 +326,12 @@ pub enum TypedExprKind {
         field_count: usize,
         fields: Vec<(usize, TypedExpr)>,
     },
+    StructUpdate {
+        structure: Box<TypedExpr>,
+        declaration: DeclId,
+        field_types: Vec<TypeId>,
+        fields: Vec<(usize, TypedExpr)>,
+    },
     StructProject {
         value: Box<TypedExpr>,
         declaration: DeclId,
@@ -1810,6 +1816,7 @@ impl<'a> Checker<'a> {
             "with_expr" => self.check_with(node, expected, owner, scopes),
             "tuple_literal" => self.check_tuple(node, expected, owner, scopes),
             "struct_literal" => self.check_struct_literal(node, expected, owner, scopes),
+            "struct_update" => self.check_struct_update(node, owner, scopes),
             "ascription_expr" => self.check_ascription(node, owner, scopes),
             "qualified_value" | "identifier" => self.check_name(node, expected, owner, scopes),
             "additive_expr" | "multiplicative_expr" => {
@@ -4555,6 +4562,91 @@ impl<'a> Checker<'a> {
             kind: TypedExprKind::Struct {
                 declaration: structure.id,
                 field_count: structure.fields.len(),
+                fields,
+            },
+            ty,
+            span: node.span,
+        })
+    }
+
+    fn check_struct_update(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let structure_node = node.children.first()?;
+        let structure = self.check_expr(structure_node, None, owner, scopes)?;
+        let Type::Struct {
+            declaration,
+            arguments,
+        } = self.types[structure.ty.0 as usize].clone()
+        else {
+            self.diagnostics.push(Diagnostic::error(
+                "E2143",
+                structure.span,
+                "struct update requires a struct value",
+            ));
+            return None;
+        };
+        let declaration_info = self
+            .structs
+            .values()
+            .find(|candidate| candidate.id == declaration)?
+            .clone();
+        let substitutions = declaration_info
+            .parameters
+            .iter()
+            .cloned()
+            .zip(arguments)
+            .collect::<BTreeMap<_, _>>();
+        let field_types = declaration_info
+            .fields
+            .iter()
+            .map(|field| self.resolve_type(&field.ty, &substitutions))
+            .collect::<Option<Vec<_>>>()?;
+        let mut seen = BTreeMap::<String, Span>::new();
+        let mut fields = Vec::new();
+        for field_node in &node.children[1..] {
+            let name_node = field_node.children.first()?;
+            let name = text(name_node);
+            if let Some(previous) = seen.insert(name.clone(), name_node.span) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "E2147",
+                        name_node.span,
+                        format!("duplicate struct field `{name}`"),
+                    )
+                    .with_label(previous, "first field here"),
+                );
+                return None;
+            }
+            let Some(index) = declaration_info
+                .fields
+                .iter()
+                .position(|field| field.name == name)
+            else {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2144",
+                    name_node.span,
+                    format!("unknown field `{name}` on `{}`", declaration_info.name),
+                ));
+                return None;
+            };
+            let value = self.check_expr(
+                field_node.children.get(1)?,
+                Some(field_types[index]),
+                owner,
+                scopes,
+            )?;
+            fields.push((index, value));
+        }
+        let ty = structure.ty;
+        Some(TypedExpr {
+            kind: TypedExprKind::StructUpdate {
+                structure: Box::new(structure),
+                declaration,
+                field_types,
                 fields,
             },
             ty,
@@ -7921,6 +8013,14 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
                 collect_expr_locals(value, output);
             }
         }
+        TypedExprKind::StructUpdate {
+            structure, fields, ..
+        } => {
+            collect_expr_locals(structure, output);
+            for (_, value) in fields {
+                collect_expr_locals(value, output);
+            }
+        }
         TypedExprKind::StructProject { value, .. } => collect_expr_locals(value, output),
         TypedExprKind::Index { value, index, .. } => {
             collect_expr_locals(value, output);
@@ -8260,6 +8360,44 @@ fn verify_expr(
             }
             if seen.len() != *field_count {
                 errors.push("struct expression does not initialize every field".to_owned());
+            }
+        }
+        TypedExprKind::StructUpdate {
+            structure,
+            declaration,
+            field_types,
+            fields,
+        } => {
+            verify_expr(
+                structure,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if expression.ty != structure.ty
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::Struct { declaration: found, .. }) if found == declaration)
+            {
+                errors.push("struct update has an incorrect nominal type".to_owned());
+            }
+            let mut seen = BTreeSet::new();
+            for (index, value) in fields {
+                verify_expr(
+                    value,
+                    types,
+                    type_count,
+                    declarations,
+                    symbols,
+                    mutable_symbols,
+                    errors,
+                );
+                if *index >= field_types.len() || !seen.insert(*index) {
+                    errors.push("struct update has an invalid field index".to_owned());
+                } else if value.ty != field_types[*index] {
+                    errors.push("struct update field has an incorrect type".to_owned());
+                }
             }
         }
         TypedExprKind::StructProject {
@@ -10291,6 +10429,9 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::MapToList(_) => "map to list".to_owned(),
         TypedExprKind::Tuple(_) => "tuple".to_owned(),
         TypedExprKind::Struct { declaration, .. } => format!("struct d{}", declaration.0),
+        TypedExprKind::StructUpdate { declaration, .. } => {
+            format!("struct update d{}", declaration.0)
+        }
         TypedExprKind::StructProject {
             declaration, field, ..
         } => format!("struct project d{} .{}", declaration.0, field),
@@ -10423,6 +10564,14 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
             }
         }
         TypedExprKind::Struct { fields, .. } => {
+            for (_, value) in fields {
+                write_expr(program, output, value, depth + 1);
+            }
+        }
+        TypedExprKind::StructUpdate {
+            structure, fields, ..
+        } => {
+            write_expr(program, output, structure, depth + 1);
             for (_, value) in fields {
                 write_expr(program, output, value, depth + 1);
             }

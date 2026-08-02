@@ -95,7 +95,7 @@ index_access = { "[" ~ soft* ~ expression ~ soft* ~ "]" }
 call_expression = { primary_expr ~ non_call_postfix* ~ call_arguments ~ postfix_part* }
 call_arguments = { "(" ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ ")" }
 
-primary_expr = { if_expr | match_expr | with_expr | bitstring_expr | struct_literal | map_literal | array_literal | list_literal | tuple_literal | literal | qualified_value | grouped_expr }
+primary_expr = { if_expr | match_expr | with_expr | bitstring_expr | struct_update | struct_literal | map_literal | array_literal | list_literal | tuple_literal | literal | qualified_value | grouped_expr }
 grouped_expr = { "(" ~ soft* ~ expression ~ soft* ~ ")" }
 qualified_value = { identifier | (type_name ~ ".")+ ~ identifier }
 if_expr = { kw_if ~ expression ~ kw_do ~ block ~ (kw_else ~ block)? ~ kw_end }
@@ -111,6 +111,7 @@ list_tail_separator = { "|" }
 array_literal = { array_open ~ soft* ~ (expression ~ (soft* ~ "," ~ soft* ~ expression)*)? ~ soft* ~ "]" }
 map_literal = { "%{" ~ soft* ~ (map_entry ~ (soft* ~ "," ~ soft* ~ map_entry)*)? ~ soft* ~ "}" }
 map_entry = { expression ~ fat_arrow ~ continuation* ~ expression }
+struct_update = { "%{" ~ soft* ~ postfix_expr ~ soft* ~ "|" ~ soft* ~ field_value ~ (soft* ~ "," ~ soft* ~ field_value)* ~ soft* ~ "}" }
 struct_literal = { "%" ~ type_path ~ "{" ~ soft* ~ (field_value ~ (soft* ~ "," ~ soft* ~ field_value)*)? ~ soft* ~ "}" }
 field_value = { identifier ~ ":" ~ continuation* ~ expression }
 

@@ -14047,6 +14047,17 @@ mod tests {
     }
 
     #[test]
+    fn lowers_immutable_struct_update_expressions() {
+        let core = concrete(
+            "defmodule Main do\n  defstruct Pair do\n    first: i32\n    second: i32\n  end\n  def main() -> i32 do\n    a = %Pair{first: 1, second: 40}\n    b = %{a | first: 2}\n    a.first + b.first + b.second - 1\n  end\nend\n",
+        );
+
+        let llvm = lower_to_llvm_ir(&core).expect("immutable struct update lowers and verifies");
+        let text = llvm.as_str();
+        assert!(text.contains("ret i32"), "{text}");
+    }
+
+    #[test]
     fn lowers_static_strings_and_exhaustive_integer_string_unions() {
         let core = concrete(
             "defmodule Main do\n  @type Scalar = i64 | string\n  def choose(text: bool) -> Scalar do\n    if text do\n      \"forty-two\"\n    else\n      42\n    end\n  end\n  def classify(value: Scalar) -> i32 do\n    match value do\n      number: i64 -> 40\n      text: string -> 2\n    end\n  end\n  def main() -> i32 do\n    classify(choose(true))\n  end\nend\n",

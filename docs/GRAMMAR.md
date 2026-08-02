@@ -216,6 +216,7 @@ tuple_literal    <- "{" expression "," expression
 list_literal     <- "[" (expression ("," expression)*
                     ("|" expression)?)? "]"
 array_literal    <- "#[" (expression ("," expression)*)? "]"
+struct_update    <- "%{" postfix_expr "|" field_value ("," field_value)* "}"
 map_literal      <- "%{" (map_entry ("," map_entry)*)? "}"
 map_entry        <- expression "=>" expression
 struct_literal   <- "%" type_path "{" (field_value ("," field_value)*)? "}"

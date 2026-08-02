@@ -80,3 +80,15 @@ fn parses_with_clauses_and_body() {
     assert!(tree.contains("with_expr"), "{tree}");
     assert_eq!(tree.matches("with_clause").count(), 2, "{tree}");
 }
+
+#[test]
+fn parses_immutable_struct_updates() {
+    let source = "defmodule Main do\n  defstruct User do\n    name: string\n  end\n  def main() -> string do\n    a = %User{name: \"alex\"}\n    b = %{a | name: \"bob\"}\n    b.name\n  end\nend\n";
+    let mut sources = SourceMap::new();
+    let file = sources.add_file("src/main.ell", source);
+    let program = parse(file, source).expect("struct update parses");
+    let tree = program.debug_tree();
+
+    assert!(tree.contains("struct_update"), "{tree}");
+    assert!(tree.contains("field_value"), "{tree}");
+}

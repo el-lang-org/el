@@ -292,14 +292,16 @@ user = %User{id: 1, name: "Ada"}
 ```
 
 All fields must be initialized in v1. Fields are immutable components of the
-struct value; `mutable_local.field := value` reconstructs the struct and rebinds
-the mutable root rather than mutating a field through object identity. There is
-no implicit zero-value construction. Structs have value semantics: a binding,
-argument, return, or aggregate field contains a struct value rather than an
-observable reference with identity. A struct copy is shallow and fieldwise, so
-immutable reference-backed fields may share storage. The compiler may keep a
-struct in registers, place it inline, pass it indirectly, share immutable
-storage, or allocate it on the managed heap when those choices cannot be
+struct value. `%{value | field: replacement}` returns a new struct with the
+named field replaced and leaves `value` unchanged; multiple fields may be
+replaced in one expression. `mutable_local.field := value` reconstructs the
+struct and rebinds the mutable root rather than mutating a field through object
+identity. There is no implicit zero-value construction. Structs have value
+semantics: a binding, argument, return, or aggregate field contains a struct
+value rather than an observable reference with identity. A struct copy is
+shallow and fieldwise, so immutable reference-backed fields may share storage.
+The compiler may keep a struct in registers, place it inline, pass it indirectly,
+share immutable storage, or allocate it on the managed heap when those choices cannot be
 observed by EL code. Struct values are never null and have no identity operation.
 
 A recursive struct is well formed only when every recursive containment cycle
