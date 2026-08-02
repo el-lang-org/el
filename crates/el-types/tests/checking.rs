@@ -646,6 +646,15 @@ fn checks_tagged_tuple_unions_and_inserts_the_member() {
 }
 
 #[test]
+fn selects_a_tagged_tuple_member_from_multiple_tuple_alternatives() {
+    let source = "defmodule Main do\n  @type Result = {:ok, i64} | {:error, string}\n  def main() -> Result do\n    {:ok, 1}\n  end\nend\n";
+
+    let typed = checked(source).expect("the tuple tag selects the union member");
+
+    assert!(typed.debug_tree().contains("inject {:ok, i64}"));
+}
+
+#[test]
 fn injects_each_if_branch_into_an_expected_union() {
     let source = "defmodule Main do\n  @type Parsed = {:ok, i32} | :error\n  def parse(valid: bool) -> Parsed do\n    if valid do\n      {:ok, 40}\n    else\n      :error\n    end\n  end\nend\n";
 

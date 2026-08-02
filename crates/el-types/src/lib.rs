@@ -1893,7 +1893,19 @@ impl<'a> Checker<'a> {
                 .iter()
                 .copied()
                 .filter(|member| {
-                    matches!(&self.types[member.0 as usize], Type::Tuple(elements) if elements.len() == node.children.len())
+                    let Type::Tuple(elements) = &self.types[member.0 as usize] else {
+                        return false;
+                    };
+                    elements.len() == node.children.len()
+                        && node.children.iter().zip(elements).all(|(child, expected)| {
+                            let Some(Value::Atom { name, .. }) = child.value.as_ref() else {
+                                return true;
+                            };
+                            matches!(
+                                &self.types[expected.0 as usize],
+                                Type::Atom(expected_name) if expected_name == name
+                            )
+                        })
                 })
                 .collect(),
             _ => Vec::new(),
