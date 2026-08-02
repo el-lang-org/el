@@ -1,0 +1,8 @@
+version = 1
+
+[[package]]
+name = "registration_validation"
+namespace = "RegistrationValidation"
+version = "1.0.0"
+source = "root"
+dependencies = []

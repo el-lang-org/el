@@ -1,0 +1,9 @@
+[package]
+name = "registration_validation"
+namespace = "RegistrationValidation"
+version = "1.0.0"
+
+[deps]
+
+[target]
+main = "Main"

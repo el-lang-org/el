@@ -1,0 +1,132 @@
+defmodule Main do
+  defstruct Registration do
+    username: string
+    email: string
+    age: i64
+    referral: {:some, string} | :none
+  end
+
+  @derive [Eq]
+  defstruct User do
+    username: string
+    email: string
+    age: i64
+    referral: {:some, string} | :none
+  end
+
+  @type ValidationResult = {:ok, User} |
+    {:error_invalid_username_length, usize} |
+    {:error_invalid_email, string} |
+    {:error_invalid_age, i64} |
+    {:error_invalid_referral_length, usize}
+
+  def main() -> i32 do
+    [
+      %Registration{
+        username: "Mina",
+        email: "mina@example.com",
+        age: 28,
+        referral: {:some, "EL2026"}
+      },
+      %Registration{
+        username: "李雷",
+        email: "li@example.com",
+        age: 31,
+        referral: :none
+      },
+      %Registration{
+        username: "Nora",
+        email: "nora.example.com",
+        age: 22,
+        referral: :none
+      },
+      %Registration{
+        username: "Sam",
+        email: "sam@example.com",
+        age: 12,
+        referral: :none
+      },
+      %Registration{
+        username: "Grace",
+        email: "grace@example.com",
+        age: 37,
+        referral: {:some, "SHORT"}
+      }
+    ] |> Enum.each(print_result)
+    0
+  end
+
+  def print_result(registration: Registration) -> unit do
+    match validate(registration) do
+      {:ok, user} ->
+        IO.println("accepted: #{user.username}")
+      {:error_invalid_username_length, length} ->
+        IO.println("rejected: username has #{length} code points (expected 3..20)")
+      {:error_invalid_email, email} ->
+        IO.println("rejected: invalid email #{email}")
+      {:error_invalid_age, age} ->
+        IO.println("rejected: age #{age} is outside 13..120")
+      {:error_invalid_referral_length, length} ->
+        IO.println("rejected: referral has #{length} code points (expected 6)")
+    end
+  end
+
+  def validate(registration: Registration) -> ValidationResult do
+    with :ok <- validate_username(registration.username),
+         :ok <- validate_email(registration.email),
+         :ok <- validate_age(registration.age),
+         :ok <- validate_referral(registration.referral) do
+      {:ok, %User{
+        username: registration.username,
+        email: registration.email,
+        age: registration.age,
+        referral: registration.referral
+      }}
+    end
+  end
+
+  def validate_username(username: string) -> :ok |
+    {:error_invalid_username_length, usize} do
+    username_length = username |> String.codepoint_view() |> Enum.count()
+    if username_length < 3 or username_length > 20 do
+      {:error_invalid_username_length, username_length}
+    else
+      :ok
+    end
+  end
+
+  def validate_email(email: string) -> :ok | {:error_invalid_email, string} do
+    match String.split(email, "@") do
+      [local | [domain | []]] ->
+        if String.empty(local) == false and
+             String.empty(domain) == false and
+             String.contains(domain, ".") do
+          :ok
+        else
+          {:error_invalid_email, email}
+        end
+      _ -> {:error_invalid_email, email}
+    end
+  end
+
+  def validate_age(age: i64) -> :ok | {:error_invalid_age, i64} do
+    match age >= 13 and age <= 120 do
+      true -> :ok
+      false -> {:error_invalid_age, age}
+    end
+  end
+
+  def validate_referral(referral: {:some, string} | :none) -> :ok |
+    {:error_invalid_referral_length, usize} do
+    match referral do
+      {:some, code} ->
+        code_length = code |> String.codepoint_view() |> Enum.count()
+        if code_length != 6 do
+          {:error_invalid_referral_length, code_length}
+        else
+          :ok
+        end
+      :none -> :ok
+    end
+  end
+end
