@@ -84,8 +84,9 @@ its prefix before enabling the managed runtime:
 export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm
 export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
 
-cargo build --release -p el-cli --features el-driver/managed-runtime
+cargo build --release -p el-cli --features managed-runtime
 ./target/release/el --version
+./target/release/elc --version
 ```
 
 LLVM, Boehm GC, validation, and release-gate details are maintained in
@@ -107,7 +108,7 @@ executable="$(find build -type f -path '*/debug/unicode_report' -perm -111 -prin
 "$executable" "Café 🇸🇬 🇸🇬 🙂"
 ```
 
-The complete v1 command surface is:
+The complete v1 `el` project-command surface is:
 
 ```text
 el --help
@@ -120,6 +121,26 @@ el emit llvm-ir --module <Module>
 EL v1 intentionally has no `run`, `test`, REPL, JIT, or cross-compilation
 command. Native executables are written beneath
 `build/<target-triple>/<debug-or-release>/` in the project directory.
+
+## Compile one source file
+
+Use `elc` when a program does not need a project manifest or dependencies:
+
+```sh
+elc hello.ell
+./hello
+```
+
+The source must declare `Main.main() -> i32`. By default, `elc` writes an
+executable named after the source file in the current directory. Use `-o` (or
+`--output`) to select another path and `--release` to enable optimizations:
+
+```sh
+elc --release -o hello-fast hello.ell
+```
+
+`elc` compiles exactly one `.ell` module and does not discover `el.toml`, load
+dependencies, create a lockfile, or write project build metadata.
 
 ## Examples
 

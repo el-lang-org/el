@@ -2144,8 +2144,8 @@ but correctness is more important than aggressive recovery in the first slice.
 
 ## 14. Normative v1 CLI contract
 
-The executable is named `el`. The following invocations are the complete
-normative v1 command surface:
+The project/package executable is named `el`. The following invocations are its
+complete normative v1 command surface:
 
 ```text
 el --help
@@ -2158,6 +2158,21 @@ el build --locked
 el build --release --locked
 el emit llvm-ir --module Main
 ```
+
+The standalone compiler is named `elc` and accepts:
+
+```text
+elc --help
+elc --version
+elc [--release] [-o executable] source.ell
+```
+
+`--output` is the long spelling of `-o`. `elc` compiles exactly one source
+module without manifest discovery, dependencies, lockfiles, or project build
+metadata. The module must provide `Main.main() -> i32`. Without `-o`, the
+executable uses the source stem plus any host executable suffix and is written
+in the current directory. An explicit output path is interpreted relative to
+the current directory.
 
 The project commands `check`, `build`, and `emit` use `el.toml` in the current
 directory when present; otherwise they walk toward the filesystem root and use
@@ -2184,10 +2199,10 @@ package-relative module name, performs the same resolution and checking as
 `check`, and writes that module's textual LLVM IR to standard output. The LLVM
 text and symbol names are diagnostic output and are not a stable language API.
 
-`--help` prints usage covering every command above to standard output, and
-`--version` prints exactly `el <compiler-version>` plus one newline to standard
-output, where `<compiler-version>` is the compiler distribution's semantic
-version. A successful invocation exits with status 0. A
+`--help` prints the respective executable's usage to standard output.
+`--version` prints exactly the executable name, one space, the compiler
+distribution's semantic version, and one newline to standard output. A
+successful invocation exits with status 0. A
 reported source, manifest, dependency, lockfile, code-generation, or linker
 failure exits with status 1. An unknown command or option, a duplicate option,
 a missing option value, or an otherwise malformed invocation prints usage to
@@ -2195,11 +2210,11 @@ standard error and exits with status 2. Diagnostics go to standard error;
 `check` and `build` need not print anything on standard output when successful.
 Internal compiler defects are outside this CLI exit-status contract.
 
-Options are command-local: v1 has no global project-directory, color, verbosity,
-target, or output-path flag. Command names and options are case-sensitive. A
-single-file developer mode may exist during bootstrapping but is not accepted by
-a conforming v1 distribution. V1 has no `el run` or `el test`; users execute the
-built native program directly and pass process arguments to that executable.
+Options are executable- and command-local: v1 has no global project-directory,
+color, verbosity, or target flag, and `el` has no output-path flag. Command
+names and options are case-sensitive. V1 has no `el run` or `el test`; users
+execute the built native program directly and pass process arguments to that
+executable.
 
 ## 15. Implementation roadmap
 
@@ -3739,9 +3754,11 @@ These require explicit decisions before the affected implementation begins:
   malformed invocation is status 2. Diagnostics and usage errors use standard
   error; help, version, and emitted LLVM IR use standard output.
 - Scope: Build products retain the target/profile paths from section 14.
-  Single-file, run, test, multi-target, output-selection, and cross-target modes
-  are outside the conforming v1 interface. LLVM IR text remains diagnostic and
-  unstable even though its command is supported.
+  Single-file and output-selection modes remain outside the unified `el`
+  interface; D-070 defines the separate `elc` interface. Run, test,
+  multi-target, and cross-target modes are outside the conforming v1 interface.
+  LLVM IR text remains diagnostic and unstable even though its command is
+  supported.
 - Reason: Fixing commands and observable outcomes lets scripts and conformance
   tests rely on the tool before v1 stabilization without treating every CLI
   implementation choice as a language feature.
@@ -3881,6 +3898,24 @@ These require explicit decisions before the affected implementation begins:
 - Reason: Tagged-result validation and resource pipelines should preserve
   explicit failure values without requiring deeply nested exhaustive matches or
   repeated early returns.
+
+### D-070 — Separate `elc` single-file compiler
+
+- Date: 2026-08-02
+- Status: accepted
+- Interface: `elc [--release] [-o executable] source.ell` compiles one module
+  containing `Main.main() -> i32`; `--output` is the long output-option spelling.
+  It also provides its own `--help` and `--version` modes.
+- Output: Without an output option, the source stem plus the host executable
+  suffix is written in the current directory. Compilation uses a temporary
+  object and leaves only the linked executable on success.
+- Isolation: `elc` performs no manifest discovery, dependency or lockfile
+  processing, or project metadata emission. The manifest-driven workflow stays
+  under `el`, and `el build` continues to reject source and output arguments.
+- Results: Success, compilation failure, and malformed invocation use statuses
+  0, 1, and 2 respectively, following the stream conventions in section 14.
+- Reason: Small EL programs should be directly compilable without weakening the
+  predictable manifest-driven project interface or overloading `el build`.
 
 ## 21. Next design checkpoint
 

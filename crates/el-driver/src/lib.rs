@@ -172,6 +172,74 @@ pub fn analyze_source(file: FileId, source: &str) -> Result<GenericModule, Vec<D
     analyze_package_sources(&[(file, source)])
 }
 
+/// Compiles one standalone source module to a host-native executable.
+///
+/// Unlike project commands, this does not discover a manifest, resolve package
+/// dependencies, or write project build metadata.
+pub fn compile_single_source(
+    source_path: &Path,
+    executable: &Path,
+    profile: BuildProfile,
+) -> Result<(), SingleFileError> {
+    if paths_refer_to_same_file(source_path, executable) {
+        return Err(SingleFileError::OutputMatchesSource(
+            source_path.to_path_buf(),
+        ));
+    }
+    let source =
+        std::fs::read_to_string(source_path).map_err(|error| SingleFileError::ReadSource {
+            path: source_path.to_path_buf(),
+            kind: error.kind(),
+            message: error.to_string(),
+        })?;
+    let mut sources = SourceMap::new();
+    let file = sources.add_file(source_path.display().to_string(), &source);
+    let generic = analyze_source(file, &source).map_err(|diagnostics| {
+        SingleFileError::Diagnostics(DiagnosticReport::new(sources, diagnostics))
+    })?;
+    compile_single_module(&generic, executable, profile)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    left == right
+        || match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+}
+
+#[cfg(feature = "llvm")]
+fn compile_single_module(
+    generic: &GenericModule,
+    executable: &Path,
+    profile: BuildProfile,
+) -> Result<(), SingleFileError> {
+    let roots = el_ir::executable_reachability_roots(generic).map_err(|error| {
+        SingleFileError::Backend(format!("invalid executable entry point: {error:?}"))
+    })?;
+    let concrete = el_ir::monomorphize(generic, &roots)
+        .map_err(|error| SingleFileError::Backend(format!("monomorphization failed: {error:?}")))?;
+    let object = TemporaryObject::create(executable)?;
+    el_codegen::emit_host_object_with_profile(&concrete, object.path(), profile.codegen_profile())
+        .map_err(|error| SingleFileError::Backend(error.to_string()))?;
+    #[cfg(feature = "managed-runtime")]
+    el_codegen::link_host_managed_executable(&[object.path()], executable)
+        .map_err(|error| SingleFileError::Backend(error.to_string()))?;
+    #[cfg(not(feature = "managed-runtime"))]
+    el_codegen::link_host_executable(object.path(), executable)
+        .map_err(|error| SingleFileError::Backend(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "llvm"))]
+fn compile_single_module(
+    _: &GenericModule,
+    _: &Path,
+    _: BuildProfile,
+) -> Result<(), SingleFileError> {
+    Err(SingleFileError::BackendUnavailable)
+}
+
 /// Runs the target-independent frontend for all modules in one source package.
 ///
 /// Inputs must already be in deterministic package-relative path order. Manifest,
@@ -541,6 +609,121 @@ impl fmt::Display for ProjectError {
 }
 
 impl Error for ProjectError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SingleFileError {
+    ReadSource {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    OutputMatchesSource(PathBuf),
+    Diagnostics(DiagnosticReport),
+    BackendUnavailable,
+    Backend(String),
+    TemporaryObject {
+        directory: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl fmt::Display for SingleFileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadSource { path, message, .. } => {
+                write!(
+                    formatter,
+                    "could not read source file `{}`: {message}",
+                    path.display()
+                )
+            }
+            Self::OutputMatchesSource(path) => write!(
+                formatter,
+                "output path would overwrite source file `{}`",
+                path.display()
+            ),
+            Self::Diagnostics(report) => {
+                write!(formatter, "compilation failed")?;
+                for diagnostic in &report.diagnostics {
+                    formatter.write_str("\n")?;
+                    match render_diagnostic(&report.sources, diagnostic) {
+                        Ok(rendered) => formatter.write_str(rendered.trim_end())?,
+                        Err(error) => write!(
+                            formatter,
+                            "internal error: invalid source diagnostic [{}]: {error}",
+                            diagnostic.code
+                        )?,
+                    }
+                }
+                Ok(())
+            }
+            Self::BackendUnavailable => formatter.write_str(
+                "single-file compilation requires an EL compiler built with the LLVM backend",
+            ),
+            Self::Backend(message) => formatter.write_str(message),
+            Self::TemporaryObject {
+                directory, message, ..
+            } => write!(
+                formatter,
+                "could not create a temporary object in `{}`: {message}",
+                directory.display()
+            ),
+        }
+    }
+}
+
+impl Error for SingleFileError {}
+
+#[cfg(feature = "llvm")]
+struct TemporaryObject {
+    path: PathBuf,
+}
+
+#[cfg(feature = "llvm")]
+impl TemporaryObject {
+    fn create(executable: &Path) -> Result<Self, SingleFileError> {
+        let directory = executable.parent().unwrap_or_else(|| Path::new("."));
+        let name = executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output");
+        for sequence in 0..1_000_u16 {
+            let path = directory.join(format!(".{name}.elc-{}-{sequence}.o", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(SingleFileError::TemporaryObject {
+                        directory: directory.to_path_buf(),
+                        kind: error.kind(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        Err(SingleFileError::TemporaryObject {
+            directory: directory.to_path_buf(),
+            kind: std::io::ErrorKind::AlreadyExists,
+            message: "all temporary object names are already in use".to_owned(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(feature = "llvm")]
+impl Drop for TemporaryObject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 #[cfg(test)]
 mod tests {

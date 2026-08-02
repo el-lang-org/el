@@ -21,11 +21,36 @@ Options:
 
 pub const VERSION: &str = concat!("el ", env!("CARGO_PKG_VERSION"), "\n");
 
+pub const ELC_HELP: &str = "EL single-file compiler
+
+Usage:
+  elc --help
+  elc --version
+  elc [--release] [-o <executable>] <source.ell>
+
+Options:
+  --release       Build with optimizations
+  -o, --output    Write the executable to this path
+";
+
+pub const ELC_VERSION: &str = concat!("elc ", env!("CARGO_PKG_VERSION"), "\n");
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invocation {
     Help,
     Version,
     Project(ProjectInvocation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompilerInvocation {
+    Help,
+    Version,
+    Compile {
+        source: String,
+        output: Option<String>,
+        release: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +111,70 @@ pub fn parse(arguments: &[String]) -> Result<Invocation, InvocationError> {
         }
         [command, ..] => Err(InvocationError::new(format!("unknown command `{command}`"))),
     }
+}
+
+pub fn parse_compiler(arguments: &[String]) -> Result<CompilerInvocation, InvocationError> {
+    match arguments {
+        [flag] if flag == "--help" => return Ok(CompilerInvocation::Help),
+        [flag] if flag == "--version" => return Ok(CompilerInvocation::Version),
+        _ => {}
+    }
+
+    let mut source = None;
+    let mut output = None;
+    let mut release = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--release" if release => {
+                return Err(InvocationError::new(
+                    "option `--release` was provided more than once",
+                ));
+            }
+            "--release" => release = true,
+            "-o" | "--output" if output.is_some() => {
+                return Err(InvocationError::new(
+                    "output option was provided more than once",
+                ));
+            }
+            option @ ("-o" | "--output") => {
+                index += 1;
+                let Some(value) = arguments.get(index) else {
+                    return Err(InvocationError::new(format!(
+                        "option `{option}` requires a value"
+                    )));
+                };
+                if value.starts_with('-') {
+                    return Err(InvocationError::new(format!(
+                        "option `{option}` requires a value"
+                    )));
+                }
+                output = Some(value.clone());
+            }
+            option if option.starts_with('-') => {
+                return Err(InvocationError::new(format!("unknown option `{option}`")));
+            }
+            value if source.is_some() => {
+                return Err(InvocationError::new(format!(
+                    "unexpected argument `{value}`"
+                )));
+            }
+            value => source = Some(value.to_owned()),
+        }
+        index += 1;
+    }
+
+    let source = source.ok_or_else(|| InvocationError::new("no source file was provided"))?;
+    if !source.ends_with(".ell") {
+        return Err(InvocationError::new(
+            "source file must use the `.ell` extension",
+        ));
+    }
+    Ok(CompilerInvocation::Compile {
+        source,
+        output,
+        release,
+    })
 }
 
 fn parse_check(arguments: &[String]) -> Result<Invocation, InvocationError> {
@@ -277,6 +366,48 @@ mod tests {
         for invocation in rejected {
             assert!(
                 parse(&arguments(&invocation)).is_err(),
+                "accepted {invocation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_single_file_compiler_surface() {
+        assert_eq!(
+            parse_compiler(&arguments(&["--release", "-o", "program", "source.ell"])),
+            Ok(CompilerInvocation::Compile {
+                source: "source.ell".to_owned(),
+                output: Some("program".to_owned()),
+                release: true,
+            })
+        );
+        assert_eq!(
+            parse_compiler(&arguments(&["source.ell", "--output", "program"])),
+            Ok(CompilerInvocation::Compile {
+                source: "source.ell".to_owned(),
+                output: Some("program".to_owned()),
+                release: false,
+            })
+        );
+        assert_eq!(
+            parse_compiler(&arguments(&["--help"])),
+            Ok(CompilerInvocation::Help)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_single_file_compiler_invocations() {
+        for invocation in [
+            vec![],
+            vec!["source.el"],
+            vec!["one.ell", "two.ell"],
+            vec!["-o"],
+            vec!["-o", "one", "--output", "two", "source.ell"],
+            vec!["--release", "--release", "source.ell"],
+            vec!["--locked", "source.ell"],
+        ] {
+            assert!(
+                parse_compiler(&arguments(&invocation)).is_err(),
                 "accepted {invocation:?}"
             );
         }

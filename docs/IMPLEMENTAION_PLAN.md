@@ -116,7 +116,7 @@ every individual compiler pass:
 │   ├── el-codegen/            # LLVM lowering, objects, host-linker integration
 │   ├── el-runtime/            # private runtime ABI, GC, and platform support
 │   ├── el-driver/             # project loading and check/build/emit pipeline
-│   └── el-cli/                # thin user-facing `el` binary
+│   └── el-cli/                # thin user-facing `el` and `elc` binaries
 ├── runtime/
 │   └── vendor/                # pinned native sources and notices
 ├── stdlib/                    # EL standard-library modules and intrinsics
@@ -280,7 +280,7 @@ shell without implementing the language.
 **Deliverables**
 
 - [x] Pin the exact Rust toolchain.
-- [x] Create the workspace plus `el-cli` (with binary name `el`), `el-driver`,
+- [x] Create the workspace plus `el-cli` (with binary names `el` and `elc`), `el-driver`,
   `el-span`, and `el-runtime`; add the remaining stage crates with their first
   vertical slice instead of landing empty future scaffolding.
 - [x] Pin direct Rust dependencies exactly in `Cargo.lock`; start with `pest` and

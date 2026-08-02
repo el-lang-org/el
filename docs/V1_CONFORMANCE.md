@@ -18,7 +18,7 @@ tested.
 | LLVM layout, verification, optimization profiles, runtime origins | `IR.md` §§12–15; `DESIGN.md` §§7–9 | `el-codegen` unit tests and `el-driver/tests/native.rs` |
 | Private allocation ABI, failures, Unicode 17, I/O, process/path behavior | `DESIGN.md` §§6.8, 7, 9, 13 | `el-runtime` unit/native tests, grapheme corpus, and managed native driver tests |
 | Strict manifest, packages, lockfiles, path mapping | `DESIGN.md` §§10–11 | `el-driver::package` tests and driver project tests |
-| Commands, options, streams, and statuses | `DESIGN.md` §14 | `el-cli` parser tests, process tests, and golden output |
+| Commands, options, streams, and statuses | `DESIGN.md` §14 | `el-cli` `el`/`elc` parser tests, process tests, and golden output |
 | Reference accepted and rejected programs | `EXAMPLES.md` §§1–13, 21 | `tests/conformance/v1` via `el-driver/tests/v1_conformance.rs` |
 
 Every rejected repository-level fixture records `phase`, `code`, and `spec` in

@@ -1,0 +1,10 @@
+EL single-file compiler
+
+Usage:
+  elc --help
+  elc --version
+  elc [--release] [-o <executable>] <source.ell>
+
+Options:
+  --release       Build with optimizations
+  -o, --output    Write the executable to this path

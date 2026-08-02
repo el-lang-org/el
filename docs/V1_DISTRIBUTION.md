@@ -18,7 +18,7 @@ or an incidental build happen to work.
 
 A matching technical distribution contains:
 
-- the `el` executable built from Rust 1.97.1;
+- the `el` and `elc` executables built from Rust 1.97.1;
 - LLVM 22.1.8 shared libraries required by Inkwell 0.9.0;
 - the statically linked EL runtime and Boehm GC 8.2.12;
 - Unicode 17.0.0 generated tables;
@@ -38,9 +38,11 @@ Until signed packages exist, build from the exact source revision:
 ```sh
 export LLVM_SYS_221_PREFIX=/opt/homebrew/opt/llvm
 export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
-cargo build --release -p el-cli --features el-driver/managed-runtime
+cargo build --release -p el-cli --features managed-runtime
 install -m 0755 target/release/el /usr/local/bin/el
+install -m 0755 target/release/elc /usr/local/bin/elc
 el --version
+elc --version
 ```
 
 Distributions must include the project and third-party notices described in
