@@ -42,11 +42,7 @@ fn registration_validation_uses_with_and_is_a_locked_buildable_project() {
     let example =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/registration_validation");
     fs::create_dir(temp.path().join("src")).unwrap();
-    fs::copy(
-        example.join("main.ell"),
-        temp.path().join("src/main.ell"),
-    )
-    .unwrap();
+    fs::copy(example.join("main.ell"), temp.path().join("src/main.ell")).unwrap();
     fs::write(
         temp.path().join("el.toml"),
         "[package]\nname = \"registration_validation\"\nnamespace = \"RegistrationValidation\"\nversion = \"1.0.0\"\n\n[deps]\n\n[target]\nmain = \"Main\"\n",

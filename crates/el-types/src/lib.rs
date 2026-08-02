@@ -3343,9 +3343,14 @@ impl<'a> Checker<'a> {
             Type::Array { item, .. } => {
                 self.build_iterable_show(source_expr, item, ("#[", "]"), owner, span, string_ty)?
             }
-            Type::Slice(item) => {
-                self.build_iterable_show(source_expr, item, ("Slice[", "]"), owner, span, string_ty)?
-            }
+            Type::Slice(item) => self.build_iterable_show(
+                source_expr,
+                item,
+                ("Slice[", "]"),
+                owner,
+                span,
+                string_ty,
+            )?,
             Type::Map { key, value } => {
                 self.build_map_show(source_expr, key, value, owner, span, string_ty)?
             }
