@@ -907,6 +907,25 @@ This is not a general implicit conversion to `string`. Programs needing
 recoverable behavior use the `Reader` and `Writer` protocols with `IO.stdin`,
 `IO.stdout`, or `IO.stderr`.
 
+Standard collections use recursive diagnostic formatting. Map keys and values
+must both implement `Show`, and map entries retain insertion order:
+
+```el
+counts: Map(string, usize) = %{"first" => 1, "second" => 2}
+IO.println(counts)
+IO.println(["nested", Show.show(#[3, 4])])
+```
+
+This prints:
+
+```text
+%{first => 1, second => 2}
+[nested, #[3, 4]]
+```
+
+These forms are intended for human-readable diagnostics, not parsing or stable
+serialization.
+
 `File.open_read` returns `File.Reader`; `File.create` and `File.append` return
 `File.Writer`. Copying one of these opaque handles aliases the same OS resource.
 Closing through one alias invalidates all aliases, and subsequent operations or

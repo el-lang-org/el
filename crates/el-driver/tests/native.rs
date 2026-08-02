@@ -317,6 +317,33 @@ fn show_interpolation_formats_scalars_once_from_left_to_right() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn structural_show_formats_collections_in_iteration_order() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map(string, usize) = %{\"first\" => 1, \"second\" => 2}\n    IO.println(values)\n    IO.println([\"nested\", Show.show([3, 4])])\n    0\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        let executable = build_managed_executable(
+            &temp.0,
+            &format!("structural-show-{label}"),
+            source,
+            profile,
+        );
+        let output = Command::new(executable)
+            .output()
+            .expect("run structural Show fixture");
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            output.stdout,
+            b"%{first => 1, second => 2}\n[nested, [3, 4]]\n"
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn milestone_eight_manifest_exit_gate_handles_every_recoverable_file_result() {
     let temp = TempDir::new();
     fs::create_dir(temp.0.join("src")).expect("create project source directory");

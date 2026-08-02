@@ -688,6 +688,9 @@ struct Checker<'a> {
     structs: BTreeMap<DeclId, Struct>,
     diagnostics: Vec<Diagnostic>,
     next_symbol: u32,
+    next_generated_decl: u32,
+    generated_functions: Vec<TypedFunction>,
+    show_helpers: BTreeMap<TypeId, DeclId>,
     defer_depth: usize,
 }
 
@@ -700,6 +703,16 @@ impl<'a> Checker<'a> {
             .map(|parameter| parameter.symbol.0 + 1)
             .max()
             .unwrap_or(0);
+        let next_generated_decl = program
+            .functions
+            .iter()
+            .map(|function| function.id.0)
+            .chain(program.structs.iter().map(|structure| structure.id.0))
+            .chain(program.aliases.iter().map(|alias| alias.id.0))
+            .chain(program.protocols.iter().map(|protocol| protocol.id.0))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         Self {
             program,
             types: vec![Type::I32, Type::I64, Type::Bool, Type::Unit],
@@ -728,6 +741,9 @@ impl<'a> Checker<'a> {
                 .collect(),
             diagnostics: Vec::new(),
             next_symbol,
+            next_generated_decl,
+            generated_functions: Vec::new(),
+            show_helpers: BTreeMap::new(),
             defer_depth: 0,
         }
     }
@@ -800,6 +816,7 @@ impl<'a> Checker<'a> {
                 functions.push(typed);
             }
         }
+        functions.append(&mut self.generated_functions);
         if !self.diagnostics.is_empty() {
             return Err(self.diagnostics);
         }
@@ -3221,6 +3238,13 @@ impl<'a> Checker<'a> {
                 ty: string_ty,
                 span,
             }),
+            Some(
+                Type::List(_)
+                | Type::Array { .. }
+                | Type::Slice(_)
+                | Type::Map { .. }
+                | Type::Tuple(_),
+            ) => self.structural_show_call(value, owner),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
                     "E2105",
@@ -3233,6 +3257,402 @@ impl<'a> Checker<'a> {
                 None
             }
         }
+    }
+
+    fn fresh_generated_decl(&mut self) -> DeclId {
+        let id = DeclId(self.next_generated_decl);
+        self.next_generated_decl += 1;
+        id
+    }
+
+    fn fresh_symbol(&mut self) -> SymbolId {
+        let symbol = SymbolId(self.next_symbol);
+        self.next_symbol += 1;
+        symbol
+    }
+
+    fn show_string(&self, value: impl Into<String>, span: Span, string_ty: TypeId) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::String(value.into()),
+            ty: string_ty,
+            span,
+        }
+    }
+
+    fn show_concat(&self, parts: Vec<TypedExpr>, span: Span, string_ty: TypeId) -> TypedExpr {
+        parts
+            .into_iter()
+            .reduce(|left, right| TypedExpr {
+                kind: TypedExprKind::Concat {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                ty: string_ty,
+                span,
+            })
+            .unwrap_or_else(|| self.show_string("", span, string_ty))
+    }
+
+    fn show_local(&self, symbol: SymbolId, ty: TypeId, span: Span) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::Local(symbol),
+            ty,
+            span,
+        }
+    }
+
+    fn structural_show_call(&mut self, value: TypedExpr, owner: DeclId) -> Option<TypedExpr> {
+        let source_ty = value.ty;
+        let span = value.span;
+        let string_ty = self.intern(Type::String);
+        let helper = if let Some(helper) = self.show_helpers.get(&source_ty) {
+            *helper
+        } else {
+            let helper = self.fresh_generated_decl();
+            // Reserve the ID before recursively constructing element formatters.
+            self.show_helpers.insert(source_ty, helper);
+            self.build_structural_show_helper(helper, source_ty, owner, span, string_ty)?;
+            helper
+        };
+        Some(TypedExpr {
+            kind: TypedExprKind::Call {
+                function: helper,
+                substitutions: Vec::new(),
+                arguments: vec![value],
+            },
+            ty: string_ty,
+            span,
+        })
+    }
+
+    fn build_structural_show_helper(
+        &mut self,
+        helper: DeclId,
+        source_ty: TypeId,
+        owner: DeclId,
+        span: Span,
+        string_ty: TypeId,
+    ) -> Option<()> {
+        let source = self.fresh_symbol();
+        let source_expr = self.show_local(source, source_ty, span);
+        let source_kind = self.types.get(source_ty.0 as usize)?.clone();
+        let body_expr = match source_kind {
+            Type::List(item) => {
+                self.build_iterable_show(source_expr, item, "[", "]", owner, span, string_ty)?
+            }
+            Type::Array { item, .. } => {
+                self.build_iterable_show(source_expr, item, "#[", "]", owner, span, string_ty)?
+            }
+            Type::Slice(item) => {
+                self.build_iterable_show(source_expr, item, "Slice[", "]", owner, span, string_ty)?
+            }
+            Type::Map { key, value } => {
+                self.build_map_show(source_expr, key, value, owner, span, string_ty)?
+            }
+            Type::Tuple(elements) => {
+                self.build_tuple_show(source_expr, source_ty, &elements, owner, span, string_ty)?
+            }
+            _ => return None,
+        };
+        self.generated_functions.push(TypedFunction {
+            id: helper,
+            module_name: self.program.module_name.clone(),
+            name: format!("__el_show_{}", helper.0),
+            visibility: Visibility::Private,
+            span,
+            parameters: vec![TypedParameter {
+                symbol: source,
+                name: "value".to_owned(),
+                span,
+                ty: source_ty,
+            }],
+            type_parameters: Vec::new(),
+            constraints: Vec::new(),
+            result: string_ty,
+            body: TypedBlock {
+                span,
+                ty: string_ty,
+                items: vec![TypedItem::Expr(body_expr)],
+            },
+        });
+        Some(())
+    }
+
+    fn build_iterable_show(
+        &mut self,
+        source: TypedExpr,
+        item_ty: TypeId,
+        opening: &str,
+        closing: &str,
+        owner: DeclId,
+        span: Span,
+        string_ty: TypeId,
+    ) -> Option<TypedExpr> {
+        let visitor = self.build_show_visitor(item_ty, None, opening, owner, span, string_ty)?;
+        let function_ty = self.intern(Type::Function {
+            parameters: vec![string_ty, item_ty],
+            result: string_ty,
+        });
+        let reduced = TypedExpr {
+            kind: TypedExprKind::EnumVisit {
+                value: Box::new(source),
+                initial: Some(Box::new(self.show_string(opening, span, string_ty))),
+                function: Box::new(TypedExpr {
+                    kind: TypedExprKind::FunctionRef {
+                        function: visitor,
+                        substitutions: Vec::new(),
+                    },
+                    ty: function_ty,
+                    span,
+                }),
+                kind: EnumVisitKind::Reduce,
+            },
+            ty: string_ty,
+            span,
+        };
+        Some(self.show_concat(
+            vec![reduced, self.show_string(closing, span, string_ty)],
+            span,
+            string_ty,
+        ))
+    }
+
+    fn build_map_show(
+        &mut self,
+        source: TypedExpr,
+        key_ty: TypeId,
+        value_ty: TypeId,
+        owner: DeclId,
+        span: Span,
+        string_ty: TypeId,
+    ) -> Option<TypedExpr> {
+        let item_ty = self.intern(Type::Tuple(vec![key_ty, value_ty]));
+        let visitor = self.build_show_visitor(
+            item_ty,
+            Some((key_ty, value_ty)),
+            "%{",
+            owner,
+            span,
+            string_ty,
+        )?;
+        let function_ty = self.intern(Type::Function {
+            parameters: vec![string_ty, item_ty],
+            result: string_ty,
+        });
+        let reduced = TypedExpr {
+            kind: TypedExprKind::EnumVisit {
+                value: Box::new(source),
+                initial: Some(Box::new(self.show_string("%{", span, string_ty))),
+                function: Box::new(TypedExpr {
+                    kind: TypedExprKind::FunctionRef {
+                        function: visitor,
+                        substitutions: Vec::new(),
+                    },
+                    ty: function_ty,
+                    span,
+                }),
+                kind: EnumVisitKind::Reduce,
+            },
+            ty: string_ty,
+            span,
+        };
+        Some(self.show_concat(
+            vec![reduced, self.show_string("}", span, string_ty)],
+            span,
+            string_ty,
+        ))
+    }
+
+    fn build_show_visitor(
+        &mut self,
+        item_ty: TypeId,
+        map_pair: Option<(TypeId, TypeId)>,
+        opening: &str,
+        owner: DeclId,
+        span: Span,
+        string_ty: TypeId,
+    ) -> Option<DeclId> {
+        let visitor = self.fresh_generated_decl();
+        let accumulator = self.fresh_symbol();
+        let item = self.fresh_symbol();
+        let separator = TypedExpr {
+            kind: TypedExprKind::If {
+                condition: Box::new(TypedExpr {
+                    kind: TypedExprKind::Comparison {
+                        operator: ComparisonOperator::Equal,
+                        left: Box::new(self.show_local(accumulator, string_ty, span)),
+                        right: Box::new(self.show_string(opening, span, string_ty)),
+                    },
+                    ty: self.intern(Type::Bool),
+                    span,
+                }),
+                then_block: TypedBlock {
+                    span,
+                    ty: string_ty,
+                    items: vec![TypedItem::Expr(self.show_string("", span, string_ty))],
+                },
+                else_block: Some(TypedBlock {
+                    span,
+                    ty: string_ty,
+                    items: vec![TypedItem::Expr(self.show_string(", ", span, string_ty))],
+                }),
+            },
+            ty: string_ty,
+            span,
+        };
+        let rendered = if let Some((key_ty, value_ty)) = map_pair {
+            let key = self.fresh_symbol();
+            let mapped = self.fresh_symbol();
+            let key_value = self.show_value(self.show_local(key, key_ty, span), owner)?;
+            let mapped_value = self.show_value(self.show_local(mapped, value_ty, span), owner)?;
+            let pair_text = self.show_concat(
+                vec![
+                    key_value,
+                    self.show_string(" => ", span, string_ty),
+                    mapped_value,
+                ],
+                span,
+                string_ty,
+            );
+            let binding = |symbol, name: &str, ty| TypedPattern {
+                kind: TypedPatternKind::Binding {
+                    symbol,
+                    name: name.to_owned(),
+                },
+                ty,
+                span,
+                facts: PatternFacts {
+                    reachable: true,
+                    irrefutable: true,
+                },
+            };
+            TypedExpr {
+                kind: TypedExprKind::Match {
+                    subject: Box::new(self.show_local(item, item_ty, span)),
+                    arms: vec![TypedMatchArm {
+                        pattern: TypedPattern {
+                            kind: TypedPatternKind::Tuple(vec![
+                                binding(key, "key", key_ty),
+                                binding(mapped, "mapped", value_ty),
+                            ]),
+                            ty: item_ty,
+                            span,
+                            facts: PatternFacts {
+                                reachable: true,
+                                irrefutable: true,
+                            },
+                        },
+                        body: TypedBlock {
+                            span,
+                            ty: string_ty,
+                            items: vec![TypedItem::Expr(pair_text)],
+                        },
+                    }],
+                    exhaustive: true,
+                },
+                ty: string_ty,
+                span,
+            }
+        } else {
+            self.show_value(self.show_local(item, item_ty, span), owner)?
+        };
+        let result = self.show_concat(
+            vec![
+                self.show_local(accumulator, string_ty, span),
+                separator,
+                rendered,
+            ],
+            span,
+            string_ty,
+        );
+        self.generated_functions.push(TypedFunction {
+            id: visitor,
+            module_name: self.program.module_name.clone(),
+            name: format!("__el_show_visit_{}", visitor.0),
+            visibility: Visibility::Private,
+            span,
+            parameters: vec![
+                TypedParameter {
+                    symbol: accumulator,
+                    name: "accumulator".to_owned(),
+                    span,
+                    ty: string_ty,
+                },
+                TypedParameter {
+                    symbol: item,
+                    name: "item".to_owned(),
+                    span,
+                    ty: item_ty,
+                },
+            ],
+            type_parameters: Vec::new(),
+            constraints: Vec::new(),
+            result: string_ty,
+            body: TypedBlock {
+                span,
+                ty: string_ty,
+                items: vec![TypedItem::Expr(result)],
+            },
+        });
+        Some(visitor)
+    }
+
+    fn build_tuple_show(
+        &mut self,
+        source: TypedExpr,
+        tuple_ty: TypeId,
+        elements: &[TypeId],
+        owner: DeclId,
+        span: Span,
+        string_ty: TypeId,
+    ) -> Option<TypedExpr> {
+        let mut patterns = Vec::new();
+        let mut parts = vec![self.show_string("{", span, string_ty)];
+        for (index, ty) in elements.iter().copied().enumerate() {
+            let symbol = self.fresh_symbol();
+            patterns.push(TypedPattern {
+                kind: TypedPatternKind::Binding {
+                    symbol,
+                    name: format!("item{index}"),
+                },
+                ty,
+                span,
+                facts: PatternFacts {
+                    reachable: true,
+                    irrefutable: true,
+                },
+            });
+            if index != 0 {
+                parts.push(self.show_string(", ", span, string_ty));
+            }
+            parts.push(self.show_value(self.show_local(symbol, ty, span), owner)?);
+        }
+        parts.push(self.show_string("}", span, string_ty));
+        let rendered = self.show_concat(parts, span, string_ty);
+        Some(TypedExpr {
+            kind: TypedExprKind::Match {
+                subject: Box::new(source),
+                arms: vec![TypedMatchArm {
+                    pattern: TypedPattern {
+                        kind: TypedPatternKind::Tuple(patterns),
+                        ty: tuple_ty,
+                        span,
+                        facts: PatternFacts {
+                            reachable: true,
+                            irrefutable: true,
+                        },
+                    },
+                    body: TypedBlock {
+                        span,
+                        ty: string_ty,
+                        items: vec![TypedItem::Expr(rendered)],
+                    },
+                }],
+                exhaustive: true,
+            },
+            ty: string_ty,
+            span,
+        })
     }
 
     fn check_bitstring(
@@ -6457,10 +6877,16 @@ impl<'a> Checker<'a> {
             },
             Type::Map { key, value } => match protocol {
                 "Iterable" => true,
-                "Eq" | "Show" => {
+                "Eq" => {
                     self.type_satisfies(*key, "Eq", owner)
                         && self.type_satisfies(*key, "Hash", owner)
                         && self.type_satisfies(*value, protocol, owner)
+                }
+                "Show" => {
+                    self.type_satisfies(*key, "Eq", owner)
+                        && self.type_satisfies(*key, "Hash", owner)
+                        && self.type_satisfies(*key, "Show", owner)
+                        && self.type_satisfies(*value, "Show", owner)
                 }
                 _ => false,
             },

@@ -1405,6 +1405,33 @@ fn checks_show_backed_string_interpolation() {
 }
 
 #[test]
+fn checks_structural_show_for_standard_collections() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    values: Map(string, usize) = %{\"first\" => 1, \"second\" => 2}\n    IO.println(values)\n    IO.println([1, 2])\n    IO.println(#[true, false])\n    IO.println({\"nested\", [3]})\n    0\n  end\nend\n";
+    let typed = checked(source).expect("standard collections implement Show");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("enum Reduce"), "{debug}");
+    assert!(
+        typed
+            .functions
+            .iter()
+            .any(|function| function.name.starts_with("__el_show_")),
+        "structural Show helpers were not generated"
+    );
+    verify(&typed).expect("structural Show Typed AST verifies");
+}
+
+#[test]
+fn map_show_requires_show_for_both_keys_and_values() {
+    let source = "defmodule Main do\n  @derive [Eq, Hash]\n  defstruct Key do\n    value: i32\n  end\n  def main() -> i32 do\n    key = %Key{value: 1}\n    values: Map(Key, i32) = %{key => 1}\n    IO.println(values)\n    0\n  end\nend\n";
+    assert!(
+        checked(source)
+            .expect_err("a map with non-Show keys cannot implement Show")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2120")
+    );
+}
+
+#[test]
 fn checks_arbitrary_bit_views_indexing_and_alignment_conversion() {
     let source = "defmodule Main do\n  def convert(data: bytes) -> {:some, bytes} | :none do\n    bits = Bytes.to_bits(data)\n    Bits.bit_size(bits)\n    view = Bits.slice(bits, 1, 7)\n    view[0]\n    Bits.to_bytes(view)\n  end\nend\n";
     let typed = checked(source).expect("bits APIs and direct indexing type check");

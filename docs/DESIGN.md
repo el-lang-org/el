@@ -1163,10 +1163,15 @@ The standard implementations are fixed as follows:
 - `Hash` covers the lawful `Eq` scalar and sequential types and extends to
   tuples and derived structs when every component implements `Hash`. Strings
   hash their exact UTF-8 bytes. Maps do not implement `Hash` in v1.
-- `Show` covers standard scalar and collection types and derived structs. Its
-  output is human-readable diagnostics, not a stable serialization format, and
-  formatting may evolve between language releases. Standard I/O and file error
-  types also implement `Show`.
+- `Show` covers standard scalar and collection types and derived structs. A
+  tuple implements `Show` when every element does; a list, array, or slice does
+  when its item type does; and `Map(k, v)` does when both `k` and `v` do (with
+  the map's existing `k: Eq + Hash` requirement). Collection displays use
+  `{a, b}`, `[a, b]`, `#[a, b]`, `Slice[a, b]`, and `%{key => value}` forms.
+  Maps display entries in insertion order. This output is human-readable
+  diagnostics, not a stable serialization format, and formatting may evolve
+  between language releases. Standard I/O and file error types also implement
+  `Show`.
 
 The opaque standard errors `IO.Error`, `File.Error`, and `String.Utf8Error`
 implement `Eq`, `Hash`, and `Show` according to their documented inspection
