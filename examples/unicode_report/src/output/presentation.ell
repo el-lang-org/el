@@ -13,25 +13,19 @@ defmodule Output.Presentation do
   def print_frequency(entry: {string, i32}) -> unit do
     match entry do
       {grapheme, count} ->
-        IO.print("  ")
-        IO.print(grapheme)
-        IO.print(": ")
-        IO.println(Output.Format.positive_i32(count))
+        IO.println("  #{grapheme}: #{count}")
     end
   end
 
   def print(summary: Analysis.TextStats.Summary) -> unit do
     IO.println(banner())
-    IO.println("Input:")
-    IO.println(summary.text)
-    IO.println("UTF-8 bytes:")
-    IO.println(Output.Format.decimal(summary.byte_count))
-    IO.println("Unicode code points:")
-    IO.println(Output.Format.decimal(summary.codepoint_count))
-    IO.println("Extended grapheme clusters:")
-    IO.println(Output.Format.decimal(summary.grapheme_count))
-    IO.println("Unique grapheme clusters:")
-    IO.println(Output.Format.decimal(summary.unique_graphemes))
+    IO.println("Input: #{summary.text}")
+    IO.println("UTF-8 bytes: #{summary.byte_count}")
+    IO.println("Unicode code points: #{summary.codepoint_count}")
+    IO.println("Extended grapheme clusters: #{summary.grapheme_count}")
+    IO.println("Unique grapheme clusters: #{summary.unique_graphemes}")
+    IO.println("Space-delimited words: #{summary.word_count}")
+    IO.println("Contains 🙂: #{summary.contains_smile}")
     IO.println("Frequency map (first-seen order):")
     Enum.each(summary.frequencies, print_frequency)
   end
