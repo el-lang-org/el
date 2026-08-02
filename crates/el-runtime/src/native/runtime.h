@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EL_PRIVATE_ABI_VERSION 6u
+#define EL_PRIVATE_ABI_VERSION 7u
 
 _Noreturn void __el_runtime_fail(uint32_t category, uint32_t file,
                                  uint64_t start, uint64_t end);
@@ -51,5 +51,14 @@ void *__el_runtime_string_split(const uint8_t *data, size_t size,
                                 const uint8_t *separator,
                                 size_t separator_size, uint32_t file,
                                 uint64_t start, uint64_t end);
+void __el_runtime_string_downcase(const uint8_t *data, size_t size,
+                                  uint8_t **output, size_t *output_size,
+                                  uint32_t file, uint64_t start, uint64_t end);
+void __el_runtime_string_replace(const uint8_t *data, size_t size,
+                                 const uint8_t *pattern, size_t pattern_size,
+                                 const uint8_t *replacement,
+                                 size_t replacement_size, uint8_t **output,
+                                 size_t *output_size, uint32_t file,
+                                 uint64_t start, uint64_t end);
 
 #endif

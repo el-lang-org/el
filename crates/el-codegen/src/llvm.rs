@@ -18,8 +18,9 @@ use el_runtime::{
     ERROR_CODE_SYMBOL, ERROR_KIND_SYMBOL, ERROR_OPERATION_SYMBOL, FILE_CLOSE_SYMBOL,
     FILE_OPEN_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL, INTEGER_TO_STRING_SYMBOL,
     PROCESS_ARGUMENTS_SYMBOL, PROCESS_GET_ENV_SYMBOL, PROCESS_SNAPSHOT_SYMBOL, READER_READ_SYMBOL,
-    STDERR_SYMBOL, STDIN_SYMBOL, STDOUT_SYMBOL, STRING_CONTAINS_SYMBOL, STRING_SPLIT_SYMBOL,
-    UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL, WRITER_WRITE_SYMBOL,
+    STDERR_SYMBOL, STDIN_SYMBOL, STDOUT_SYMBOL, STRING_CONTAINS_SYMBOL, STRING_DOWNCASE_SYMBOL,
+    STRING_REPLACE_SYMBOL, STRING_SPLIT_SYMBOL, UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL,
+    WRITER_WRITE_SYMBOL,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory, GRAPHEME_COUNT_SYMBOL, GRAPHEME_NEXT_SYMBOL};
 use inkwell::AddressSpace;
@@ -361,6 +362,10 @@ struct ModuleLowerer<'ctx, 'core> {
     string_contains: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     string_split: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    string_downcase: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    string_replace: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     allocate_scanned: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
@@ -841,6 +846,56 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             None,
         );
         #[cfg(feature = "managed-runtime")]
+        let string_downcase = module.add_function(
+            STRING_DOWNCASE_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
+        let string_replace = module.add_function(
+            STRING_REPLACE_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context
+                        .custom_width_int_type(NonZeroU32::new(usize::BITS).unwrap())
+                        .expect("host usize type")
+                        .into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
         let hash_seed = module.add_function(
             HASH_SEED_SYMBOL,
             context
@@ -1063,6 +1118,10 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             string_contains,
             #[cfg(feature = "managed-runtime")]
             string_split,
+            #[cfg(feature = "managed-runtime")]
+            string_downcase,
+            #[cfg(feature = "managed-runtime")]
+            string_replace,
             #[cfg(feature = "managed-runtime")]
             allocate_scanned,
             #[cfg(feature = "managed-runtime")]
@@ -5458,6 +5517,261 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
         built(builder.build_load(self.basic_type(ty)?, output_slot, &format!("v{}", result.0)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "managed-runtime")]
+    fn lower_enum_frequencies(
+        &self,
+        result: ValueId,
+        source: ValueId,
+        source_ty: TypeId,
+        ty: TypeId,
+        origin: el_span::Span,
+        builder: &Builder<'ctx>,
+        values: &BTreeMap<ValueId, BasicValueEnum<'ctx>>,
+        slots: &BTreeMap<SlotId, PointerValue<'ctx>>,
+        roots: &el_ir::CollectionPointRoots,
+        root_slots: &BTreeMap<ValueId, PointerValue<'ctx>>,
+        value_types: &BTreeMap<ValueId, TypeId>,
+        slot_types: &BTreeMap<SlotId, TypeId>,
+        partial: PointerValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let Some(Type::List(item_ty)) = self.core.types.get(source_ty.0 as usize) else {
+            return Err(BackendError::UnsupportedType(source_ty));
+        };
+        let item_ty = *item_ty;
+        let Some(Type::Map {
+            key,
+            value: count_ty,
+        }) = self.core.types.get(ty.0 as usize)
+        else {
+            return Err(BackendError::UnsupportedType(ty));
+        };
+        if *key != item_ty || !matches!(self.core.types.get(count_ty.0 as usize), Some(Type::Usize))
+        {
+            return Err(BackendError::UnsupportedType(ty));
+        }
+        let llvm_function = builder
+            .get_insert_block()
+            .and_then(|block| block.get_parent())
+            .ok_or_else(|| BackendError::Builder("builder has no function".to_owned()))?;
+        let pointer_ty = self.context.ptr_type(AddressSpace::default());
+        let null = pointer_ty.const_null();
+        let output_slot =
+            built(builder.build_alloca(pointer_ty, &format!("v{}.frequencies", result.0)))?;
+        set_volatile(built(builder.build_store(output_slot, null))?)?;
+        set_volatile(built(builder.build_store(partial, null))?)?;
+        self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+        let seed = built(builder.build_call(self.hash_seed, &[], "frequencies.seed"))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| BackendError::Builder("hash seed returned void".to_owned()))?
+            .into_int_value();
+        let list_node = self.list_node_type(source_ty)?;
+        let map_node = self.map_node_type(ty)?;
+        let native_size = map_node
+            .size_of()
+            .ok_or(BackendError::UnsupportedType(ty))?;
+        let size = if native_size.get_type() == self.context.i64_type() {
+            native_size
+        } else {
+            built(builder.build_int_cast(
+                native_size,
+                self.context.i64_type(),
+                "frequencies.node_size",
+            ))?
+        };
+        let source_origin =
+            FailureOrigin::from_span(origin).map_err(|()| BackendError::SourceOriginOutOfRange)?;
+        let loop_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.loop");
+        let item_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.item");
+        let search_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.search");
+        let inspect_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.inspect");
+        let advance_search = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.search_advance");
+        let increment_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.increment");
+        let append_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.append");
+        let install_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.install");
+        let link_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.link");
+        let next_item = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.next");
+        let done_block = self
+            .context
+            .append_basic_block(llvm_function, "frequencies.done");
+        let preheader = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        builder.position_at_end(loop_block);
+        let source_cursor = built(builder.build_phi(pointer_ty, "frequencies.source_cursor"))?;
+        source_cursor.add_incoming(&[(&pointer_value(values, source)?, preheader)]);
+        let source_cursor_value = source_cursor.as_basic_value().into_pointer_value();
+        let exhausted = built(builder.build_is_null(source_cursor_value, "frequencies.exhausted"))?;
+        built(builder.build_conditional_branch(exhausted, done_block, item_block))?;
+        builder.position_at_end(item_block);
+        let item_ptr = built(builder.build_struct_gep(
+            list_node,
+            source_cursor_value,
+            0,
+            "frequencies.item_ptr",
+        ))?;
+        let item =
+            built(builder.build_load(self.basic_type(item_ty)?, item_ptr, "frequencies.item"))?;
+        let item_hash = self.map_key_hash(builder, item, item_ty, seed, "frequencies.item_hash")?;
+        let head = built(builder.build_load(pointer_ty, output_slot, "frequencies.head"))?
+            .into_pointer_value();
+        let item_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(search_block))?;
+        builder.position_at_end(search_block);
+        let cursor = built(builder.build_phi(pointer_ty, "frequencies.cursor"))?;
+        let previous = built(builder.build_phi(pointer_ty, "frequencies.previous"))?;
+        cursor.add_incoming(&[(&head, item_end)]);
+        previous.add_incoming(&[(&null, item_end)]);
+        let current = cursor.as_basic_value().into_pointer_value();
+        let missing = built(builder.build_is_null(current, "frequencies.missing"))?;
+        built(builder.build_conditional_branch(missing, append_block, inspect_block))?;
+        builder.position_at_end(inspect_block);
+        let hash_ptr =
+            built(builder.build_struct_gep(map_node, current, 0, "frequencies.hash_ptr"))?;
+        let key_ptr = built(builder.build_struct_gep(map_node, current, 1, "frequencies.key_ptr"))?;
+        let stored_hash =
+            built(builder.build_load(self.usize_type()?, hash_ptr, "frequencies.hash"))?
+                .into_int_value();
+        let stored_key =
+            built(builder.build_load(self.basic_type(item_ty)?, key_ptr, "frequencies.key"))?;
+        let same_hash = built(builder.build_int_compare(
+            IntPredicate::EQ,
+            stored_hash,
+            item_hash,
+            "frequencies.same_hash",
+        ))?;
+        let same_key =
+            self.map_key_equal(builder, stored_key, item, item_ty, "frequencies.same_key")?;
+        let equal = built(builder.build_and(same_hash, same_key, "frequencies.equal"))?;
+        built(builder.build_conditional_branch(equal, increment_block, advance_search))?;
+        builder.position_at_end(advance_search);
+        let next_ptr =
+            built(builder.build_struct_gep(map_node, current, 3, "frequencies.map_next_ptr"))?;
+        let next = built(builder.build_load(pointer_ty, next_ptr, "frequencies.map_next"))?
+            .into_pointer_value();
+        let search_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(search_block))?;
+        cursor.add_incoming(&[(&next, search_end)]);
+        previous.add_incoming(&[(&current, search_end)]);
+        builder.position_at_end(increment_block);
+        let count_ptr =
+            built(builder.build_struct_gep(map_node, current, 2, "frequencies.count_ptr"))?;
+        let count = built(builder.build_load(self.usize_type()?, count_ptr, "frequencies.count"))?
+            .into_int_value();
+        let incremented = built(builder.build_int_add(
+            count,
+            self.usize_type()?.const_int(1, false),
+            "frequencies.incremented",
+        ))?;
+        built(builder.build_store(count_ptr, incremented))?;
+        built(builder.build_unconditional_branch(next_item))?;
+        builder.position_at_end(append_block);
+        let allocation = built(
+            builder.build_call(
+                self.allocate_scanned,
+                &[
+                    size.into(),
+                    self.context
+                        .i32_type()
+                        .const_int(u64::from(source_origin.file), false)
+                        .into(),
+                    self.context
+                        .i64_type()
+                        .const_int(source_origin.start, false)
+                        .into(),
+                    self.context
+                        .i64_type()
+                        .const_int(source_origin.end, false)
+                        .into(),
+                ],
+                "frequencies.node",
+            ),
+        )?;
+        let node = allocation
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| BackendError::Builder("frequency allocation returned void".to_owned()))?
+            .into_pointer_value();
+        for (field, field_value) in [
+            item_hash.into(),
+            item,
+            self.usize_type()?.const_int(1, false).into(),
+            null.into(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = built(builder.build_struct_gep(
+                map_node,
+                node,
+                field as u32,
+                "frequencies.node_field",
+            ))?;
+            built(builder.build_store(destination, field_value))?;
+        }
+        let was_empty = built(builder.build_is_null(head, "frequencies.was_empty"))?;
+        built(builder.build_conditional_branch(was_empty, install_block, link_block))?;
+        builder.position_at_end(install_block);
+        set_volatile(built(builder.build_store(output_slot, node))?)?;
+        set_volatile(built(builder.build_store(partial, node))?)?;
+        built(builder.build_unconditional_branch(next_item))?;
+        builder.position_at_end(link_block);
+        let tail_next = built(builder.build_struct_gep(
+            map_node,
+            previous.as_basic_value().into_pointer_value(),
+            3,
+            "frequencies.tail_next",
+        ))?;
+        built(builder.build_store(tail_next, node))?;
+        built(builder.build_unconditional_branch(next_item))?;
+        builder.position_at_end(next_item);
+        let source_next_ptr = built(builder.build_struct_gep(
+            list_node,
+            source_cursor_value,
+            1,
+            "frequencies.source_next_ptr",
+        ))?;
+        let source_next =
+            built(builder.build_load(pointer_ty, source_next_ptr, "frequencies.source_next"))?
+                .into_pointer_value();
+        let next_end = builder
+            .get_insert_block()
+            .ok_or_else(|| BackendError::Builder("builder has no block".to_owned()))?;
+        built(builder.build_unconditional_branch(loop_block))?;
+        source_cursor.add_incoming(&[(&source_next, next_end)]);
+        builder.position_at_end(done_block);
+        let output = built(builder.build_load(pointer_ty, output_slot, &format!("v{}", result.0)))?;
+        self.clear_value_roots(roots, builder, root_slots, value_types)?;
+        set_volatile(built(builder.build_store(partial, null))?)?;
+        Ok(output)
+    }
+
     fn lower_function(&self, function: &CoreFunction) -> Result<(), BackendError> {
         let llvm_function = self
             .functions
@@ -5546,6 +5860,7 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                             | Operation::MapToList { .. }
                             | Operation::BytesToList { .. }
                             | Operation::EnumToList { .. }
+                            | Operation::EnumFrequencies { .. }
                             | Operation::StringCodepoints { .. }
                     )
                 {
@@ -7905,6 +8220,89 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                 ))?;
                 values.insert(*result, empty.into());
             }
+            Operation::StringDowncase {
+                result,
+                string,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, string, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_downcase",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *string)?;
+                    let data = built(builder.build_extract_value(source, 0, "downcase.data"))?;
+                    let length = built(builder.build_extract_value(source, 1, "downcase.length"))?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let data_slot =
+                        built(builder.build_alloca(pointer_ty, "downcase.output_data"))?;
+                    let size_slot =
+                        built(builder.build_alloca(self.usize_type()?, "downcase.output_size"))?;
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    built(
+                        builder.build_call(
+                            self.string_downcase,
+                            &[
+                                data.into(),
+                                length.into(),
+                                data_slot.into(),
+                                size_slot.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            "downcase",
+                        ),
+                    )?;
+                    let output_data =
+                        built(builder.build_load(pointer_ty, data_slot, "downcase.result_data"))?;
+                    let output_size = built(builder.build_load(
+                        self.usize_type()?,
+                        size_slot,
+                        "downcase.result_size",
+                    ))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(
+                        output,
+                        output_data,
+                        0,
+                        "downcase.string_data",
+                    ))?;
+                    output = built(builder.build_insert_value(
+                        output,
+                        output_size,
+                        1,
+                        "downcase.string_size",
+                    ))?;
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
             Operation::StringContains {
                 result,
                 string,
@@ -8020,6 +8418,112 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                         .ok_or(BackendError::MissingValue(*result))?;
                     self.clear_value_roots(roots, builder, root_slots, value_types)?;
                     values.insert(*result, output);
+                }
+            }
+            Operation::StringReplace {
+                result,
+                string,
+                pattern,
+                replacement,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, string, pattern, replacement, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "string_replace",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source = struct_value(values, *string)?;
+                    let needle = struct_value(values, *pattern)?;
+                    let replacement = struct_value(values, *replacement)?;
+                    let fields =
+                        [source, needle, replacement].map(|value| -> Result<_, BackendError> {
+                            Ok((
+                                built(builder.build_extract_value(value, 0, "replace.data"))?,
+                                built(builder.build_extract_value(value, 1, "replace.size"))?,
+                            ))
+                        });
+                    let [
+                        (data, size),
+                        (pattern_data, pattern_size),
+                        (replacement_data, replacement_size),
+                    ] = fields
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?
+                        .try_into()
+                        .map_err(|_| {
+                            BackendError::Builder("invalid replace arguments".to_owned())
+                        })?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let data_slot = built(builder.build_alloca(pointer_ty, "replace.output_data"))?;
+                    let size_slot =
+                        built(builder.build_alloca(self.usize_type()?, "replace.output_size"))?;
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    built(
+                        builder.build_call(
+                            self.string_replace,
+                            &[
+                                data.into(),
+                                size.into(),
+                                pattern_data.into(),
+                                pattern_size.into(),
+                                replacement_data.into(),
+                                replacement_size.into(),
+                                data_slot.into(),
+                                size_slot.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            "replace",
+                        ),
+                    )?;
+                    let output_data =
+                        built(builder.build_load(pointer_ty, data_slot, "replace.result_data"))?;
+                    let output_size = built(builder.build_load(
+                        self.usize_type()?,
+                        size_slot,
+                        "replace.result_size",
+                    ))?;
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(
+                        output,
+                        output_data,
+                        0,
+                        "replace.string_data",
+                    ))?;
+                    output = built(builder.build_insert_value(
+                        output,
+                        output_size,
+                        1,
+                        "replace.string_size",
+                    ))?;
+                    values.insert(*result, output.into_struct_value().into());
                 }
             }
             Operation::Bitstring {
@@ -11728,6 +12232,50 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     values.insert(*result, output);
                 }
             }
+            Operation::EnumFrequencies {
+                result,
+                value: source,
+                source_ty,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, source, source_ty, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "enum_frequencies",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    let partial = _partial_list_root.ok_or_else(|| {
+                        BackendError::Builder("Enum.frequencies has no partial-map root".to_owned())
+                    })?;
+                    let output = self.lower_enum_frequencies(
+                        *result,
+                        *source,
+                        *source_ty,
+                        *ty,
+                        *origin,
+                        builder,
+                        values,
+                        slots,
+                        roots,
+                        root_slots,
+                        value_types,
+                        slot_types,
+                        partial,
+                    )?;
+                    values.insert(*result, output);
+                }
+            }
             Operation::ListHead {
                 result, list, ty, ..
             } => {
@@ -13497,8 +14045,10 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringGraphemeView { result, ty, .. }
                     | Operation::StringLength { result, ty, .. }
                     | Operation::StringEmpty { result, ty, .. }
+                    | Operation::StringDowncase { result, ty, .. }
                     | Operation::StringContains { result, ty, .. }
                     | Operation::StringSplit { result, ty, .. }
+                    | Operation::StringReplace { result, ty, .. }
                     | Operation::Bitstring { result, ty, .. }
                     | Operation::BitstringPatternInteger { result, ty, .. }
                     | Operation::BitstringPatternBytes { result, ty, .. }
@@ -13519,6 +14069,7 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::CollectionLength { result, ty, .. }
                     | Operation::EnumAt { result, ty, .. }
                     | Operation::EnumToList { result, ty, .. }
+                    | Operation::EnumFrequencies { result, ty, .. }
                     | Operation::EnumVisit { result, ty, .. }
                     | Operation::Map { result, ty, .. }
                     | Operation::MapPut { result, ty, .. }

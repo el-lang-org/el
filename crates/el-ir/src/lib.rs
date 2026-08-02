@@ -237,6 +237,12 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    StringDowncase {
+        result: ValueId,
+        string: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
     StringContains {
         result: ValueId,
         string: ValueId,
@@ -248,6 +254,14 @@ pub enum Operation {
         result: ValueId,
         string: ValueId,
         separator: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    StringReplace {
+        result: ValueId,
+        string: ValueId,
+        pattern: ValueId,
+        replacement: ValueId,
         ty: TypeId,
         origin: Span,
     },
@@ -393,6 +407,13 @@ pub enum Operation {
         origin: Span,
     },
     EnumToList {
+        result: ValueId,
+        value: ValueId,
+        source_ty: TypeId,
+        ty: TypeId,
+        origin: Span,
+    },
+    EnumFrequencies {
         result: ValueId,
         value: ValueId,
         source_ty: TypeId,
@@ -1392,6 +1413,17 @@ impl<'a> Lowerer<'a> {
                 });
                 result
             }
+            TypedExprKind::StringDowncase(value) => {
+                let string = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::StringDowncase {
+                    result,
+                    string,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
             TypedExprKind::StringContains { string, pattern } => {
                 let string = self.lower_expr(string)?;
                 let pattern = self.lower_expr(pattern)?;
@@ -1413,6 +1445,25 @@ impl<'a> Lowerer<'a> {
                     result,
                     string,
                     separator,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::StringReplace {
+                string,
+                pattern,
+                replacement,
+            } => {
+                let string = self.lower_expr(string)?;
+                let pattern = self.lower_expr(pattern)?;
+                let replacement = self.lower_expr(replacement)?;
+                let result = self.value();
+                self.operations.push(Operation::StringReplace {
+                    result,
+                    string,
+                    pattern,
+                    replacement,
                     ty: expression.ty,
                     origin: expression.span,
                 });
@@ -1701,6 +1752,19 @@ impl<'a> Lowerer<'a> {
                 let value = self.lower_expr(value)?;
                 let result = self.value();
                 self.operations.push(Operation::EnumToList {
+                    result,
+                    value,
+                    source_ty,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::EnumFrequencies(value) => {
+                let source_ty = value.ty;
+                let value = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::EnumFrequencies {
                     result,
                     value,
                     source_ty,
@@ -3399,12 +3463,15 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
                 | Operation::Concat { .. }
                 | Operation::MapToList { .. }
                 | Operation::StringCodepoints { .. }
+                | Operation::StringDowncase { .. }
                 | Operation::StringSplit { .. }
+                | Operation::StringReplace { .. }
                 | Operation::Bitstring { .. }
                 | Operation::StringFromBytes { .. }
                 | Operation::BytesFromList { .. }
                 | Operation::BytesToList { .. }
                 | Operation::EnumToList { .. }
+                | Operation::EnumFrequencies { .. }
                 | Operation::RuneToString { .. }
                 | Operation::IntegerToString { .. }
                 | Operation::BooleanToString { .. }
@@ -3649,7 +3716,9 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         | Operation::StringGraphemeView { string, .. } => {
             live.values.insert(*string);
         }
-        Operation::StringLength { string, .. } | Operation::StringEmpty { string, .. } => {
+        Operation::StringLength { string, .. }
+        | Operation::StringEmpty { string, .. }
+        | Operation::StringDowncase { string, .. } => {
             live.values.insert(*string);
         }
         Operation::StringContains {
@@ -3661,6 +3730,14 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
             string, separator, ..
         } => {
             live.values.extend([*string, *separator]);
+        }
+        Operation::StringReplace {
+            string,
+            pattern,
+            replacement,
+            ..
+        } => {
+            live.values.extend([*string, *pattern, *replacement]);
         }
         Operation::Bitstring { segments, .. } => {
             for segment in segments {
@@ -3764,6 +3841,9 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::EnumToList { value, .. } => {
             live.values.insert(*value);
         }
+        Operation::EnumFrequencies { value, .. } => {
+            live.values.insert(*value);
+        }
         Operation::EnumVisit {
             value,
             initial,
@@ -3865,8 +3945,10 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::StringGraphemeView { result, .. }
         | Operation::StringLength { result, .. }
         | Operation::StringEmpty { result, .. }
+        | Operation::StringDowncase { result, .. }
         | Operation::StringContains { result, .. }
         | Operation::StringSplit { result, .. }
+        | Operation::StringReplace { result, .. }
         | Operation::Bitstring { result, .. }
         | Operation::BitstringPatternInteger { result, .. }
         | Operation::BitstringPatternBytes { result, .. }
@@ -3887,6 +3969,7 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::CollectionLength { result, .. }
         | Operation::EnumAt { result, .. }
         | Operation::EnumToList { result, .. }
+        | Operation::EnumFrequencies { result, .. }
         | Operation::EnumVisit { result, .. }
         | Operation::Map { result, .. }
         | Operation::MapPut { result, .. }
@@ -4858,8 +4941,10 @@ impl<'a> Monomorphizer<'a> {
             | Operation::StringGraphemeView { ty, .. }
             | Operation::StringLength { ty, .. }
             | Operation::StringEmpty { ty, .. }
+            | Operation::StringDowncase { ty, .. }
             | Operation::StringContains { ty, .. }
             | Operation::StringSplit { ty, .. }
+            | Operation::StringReplace { ty, .. }
             | Operation::BitstringPatternInteger { ty, .. }
             | Operation::BitstringPatternBytes { ty, .. }
             | Operation::StringFromBytes { ty, .. }
@@ -4907,7 +4992,8 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
             Operation::EnumAt { source_ty, ty, .. }
-            | Operation::EnumToList { source_ty, ty, .. } => {
+            | Operation::EnumToList { source_ty, ty, .. }
+            | Operation::EnumFrequencies { source_ty, ty, .. } => {
                 *source_ty = self.materialize_type(*source_ty, substitution)?;
                 *ty = self.materialize_type(*ty, substitution)?;
             }
@@ -5385,8 +5471,10 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::StringGraphemeView { ty, .. }
         | Operation::StringLength { ty, .. }
         | Operation::StringEmpty { ty, .. }
+        | Operation::StringDowncase { ty, .. }
         | Operation::StringContains { ty, .. }
         | Operation::StringSplit { ty, .. }
+        | Operation::StringReplace { ty, .. }
         | Operation::BitstringPatternInteger { ty, .. }
         | Operation::BitstringPatternBytes { ty, .. }
         | Operation::StringFromBytes { ty, .. }
@@ -5426,7 +5514,9 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
             output.push(*source_ty);
             output.push(*ty);
         }
-        Operation::EnumAt { source_ty, ty, .. } | Operation::EnumToList { source_ty, ty, .. } => {
+        Operation::EnumAt { source_ty, ty, .. }
+        | Operation::EnumToList { source_ty, ty, .. }
+        | Operation::EnumFrequencies { source_ty, ty, .. } => {
             output.push(*source_ty);
             output.push(*ty);
         }
@@ -5828,8 +5918,10 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringGraphemeView { result, ty, .. }
                     | Operation::StringLength { result, ty, .. }
                     | Operation::StringEmpty { result, ty, .. }
+                    | Operation::StringDowncase { result, ty, .. }
                     | Operation::StringContains { result, ty, .. }
                     | Operation::StringSplit { result, ty, .. }
+                    | Operation::StringReplace { result, ty, .. }
                     | Operation::Bitstring { result, ty, .. }
                     | Operation::BitstringPatternInteger { result, ty, .. }
                     | Operation::BitstringPatternBytes { result, ty, .. }
@@ -5850,6 +5942,7 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::CollectionLength { result, ty, .. }
                     | Operation::EnumAt { result, ty, .. }
                     | Operation::EnumToList { result, ty, .. }
+                    | Operation::EnumFrequencies { result, ty, .. }
                     | Operation::EnumVisit { result, ty, .. }
                     | Operation::Map { result, ty, .. }
                     | Operation::MapPut { result, ty, .. }
@@ -6839,6 +6932,16 @@ fn verify_operation(
             }
             define(*result, *ty, values, errors);
         }
+        Operation::StringDowncase {
+            result, string, ty, ..
+        } => {
+            if values.get(string) != Some(ty)
+                || !matches!(types.get(ty.0 as usize), Some(Type::String))
+            {
+                errors.push(format!("string downcase {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
         Operation::StringContains {
             result,
             string,
@@ -6885,6 +6988,31 @@ fn verify_operation(
                 )
             {
                 errors.push(format!("string split {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::StringReplace {
+            result,
+            string,
+            pattern,
+            replacement,
+            ty,
+            ..
+        } => {
+            let string_value = |value: &ValueId| {
+                matches!(
+                    values
+                        .get(value)
+                        .and_then(|source| types.get(source.0 as usize)),
+                    Some(Type::String)
+                )
+            };
+            if !string_value(string)
+                || !string_value(pattern)
+                || !string_value(replacement)
+                || !matches!(types.get(ty.0 as usize), Some(Type::String))
+            {
+                errors.push(format!("string replace {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -7342,6 +7470,24 @@ fn verify_operation(
                 });
             if !valid {
                 errors.push(format!("Enum.to_list {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::EnumFrequencies {
+            result,
+            value,
+            source_ty,
+            ty,
+            ..
+        } => {
+            let item = standard_iterable_item_type(types, *source_ty);
+            let valid = values.get(value) == Some(source_ty)
+                && item.is_some_and(|item| matches!(
+                    types.get(ty.0 as usize),
+                    Some(Type::Map { key, value }) if *key == item && matches!(types.get(value.0 as usize), Some(Type::Usize))
+                ));
+            if !valid {
+                errors.push(format!("Enum.frequencies {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -8838,6 +8984,11 @@ fn display_operation(operation: &Operation) -> String {
         Operation::StringEmpty {
             result, string, ty, ..
         } => format!("v{} = string_empty v{}: t{}", result.0, string.0, ty.0),
+        Operation::StringDowncase {
+            result, string, ty, ..
+        } => {
+            format!("v{} = string_downcase v{}: t{}", result.0, string.0, ty.0)
+        }
         Operation::StringContains {
             result,
             string,
@@ -8857,6 +9008,17 @@ fn display_operation(operation: &Operation) -> String {
         } => format!(
             "v{} = string_split v{} v{}: t{}",
             result.0, string.0, separator.0, ty.0
+        ),
+        Operation::StringReplace {
+            result,
+            string,
+            pattern,
+            replacement,
+            ty,
+            ..
+        } => format!(
+            "v{} = string_replace v{} v{} v{}: t{}",
+            result.0, string.0, pattern.0, replacement.0, ty.0
         ),
         Operation::StringFromBytes {
             result, bytes, ty, ..
@@ -8967,6 +9129,16 @@ fn display_operation(operation: &Operation) -> String {
             ..
         } => format!(
             "v{} = enum_to_list v{}: t{} -> t{}",
+            result.0, value.0, source_ty.0, ty.0
+        ),
+        Operation::EnumFrequencies {
+            result,
+            value,
+            source_ty,
+            ty,
+            ..
+        } => format!(
+            "v{} = enum_frequencies v{}: t{} -> t{}",
             result.0, value.0, source_ty.0, ty.0
         ),
         Operation::EnumVisit {

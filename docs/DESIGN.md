@@ -1253,8 +1253,10 @@ Programs use these `String` functions instead:
 String.byte_size(text)
 String.length(text)
 String.empty(text)
+String.downcase(text)
 String.contains(text, pattern)
 String.split(text, separator)
+String.replace(text, pattern, replacement)
 String.bytes(text)
 String.codepoints(text)
 String.graphemes(text)
@@ -3848,6 +3850,12 @@ These require explicit decisions before the affected implementation begins:
   at the beginning, end, and between adjacent separators are retained. An empty
   separator performs no split and returns a one-element list containing the
   source string.
+- Transformation: `downcase` applies the pinned Unicode lowercase mapping and
+  is independent of the host locale. `replace` consumes exact, non-overlapping
+  UTF-8 matches from left to right; an empty pattern is a no-op.
+- Frequencies: `Enum.frequencies(iterable) -> Map(item, usize)` traverses once
+  in iterable order. Keys must satisfy `Eq` and `Hash`; the resulting map stores
+  one entry per distinct item and counts duplicate occurrences.
 - Reason: Common validation and parsing should state their intent directly
   without hand-written recursive grapheme traversal. Keeping Unicode-aware
   segmentation under the distinct `graphemes` API makes the matching unit

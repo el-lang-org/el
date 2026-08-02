@@ -619,6 +619,111 @@ void *__el_runtime_string_split(const uint8_t *data, size_t size,
   }
 }
 
+typedef struct {
+  uint32_t codepoint;
+  uint8_t bytes[12];
+  uint8_t size;
+} ElLowercaseMapping;
+
+static const ElLowercaseMapping el_lowercase_mappings[] = {
+#include "unicode_lowercase_data.inc"
+};
+
+static const ElLowercaseMapping *el_lowercase_mapping(uint32_t codepoint) {
+  size_t low = 0;
+  size_t high = sizeof(el_lowercase_mappings) / sizeof(el_lowercase_mappings[0]);
+  while (low < high) {
+    const size_t middle = low + (high - low) / 2;
+    if (el_lowercase_mappings[middle].codepoint < codepoint) low = middle + 1;
+    else high = middle;
+  }
+  return low < sizeof(el_lowercase_mappings) / sizeof(el_lowercase_mappings[0]) &&
+                 el_lowercase_mappings[low].codepoint == codepoint
+             ? &el_lowercase_mappings[low]
+             : NULL;
+}
+
+static uint32_t el_string_utf8_decode(const uint8_t *data, size_t *width) {
+  if (data[0] <= 0x7f) { *width = 1; return data[0]; }
+  if (data[0] <= 0xdf) {
+    *width = 2;
+    return ((uint32_t)(data[0] & 0x1f) << 6) | (uint32_t)(data[1] & 0x3f);
+  }
+  if (data[0] <= 0xef) {
+    *width = 3;
+    return ((uint32_t)(data[0] & 0x0f) << 12) |
+           ((uint32_t)(data[1] & 0x3f) << 6) | (uint32_t)(data[2] & 0x3f);
+  }
+  *width = 4;
+  return ((uint32_t)(data[0] & 0x07) << 18) |
+         ((uint32_t)(data[1] & 0x3f) << 12) |
+         ((uint32_t)(data[2] & 0x3f) << 6) | (uint32_t)(data[3] & 0x3f);
+}
+
+void __el_runtime_string_downcase(const uint8_t *data, size_t size,
+                                  uint8_t **output, size_t *output_size,
+                                  uint32_t file, uint64_t start, uint64_t end) {
+  size_t result_size = 0;
+  for (size_t offset = 0; offset < size;) {
+    size_t width;
+    const ElLowercaseMapping *mapping = el_lowercase_mapping(el_string_utf8_decode(data + offset, &width));
+    if (mapping != NULL && result_size > SIZE_MAX - mapping->size) __el_runtime_fail(7, file, start, end);
+    if (mapping == NULL && result_size > SIZE_MAX - width) __el_runtime_fail(7, file, start, end);
+    result_size += mapping == NULL ? width : mapping->size;
+    offset += width;
+  }
+  uint8_t *result = __el_runtime_alloc_atomic((uint64_t)(result_size == 0 ? 1 : result_size), file, start, end);
+  size_t destination = 0;
+  for (size_t offset = 0; offset < size;) {
+    size_t width;
+    const ElLowercaseMapping *mapping = el_lowercase_mapping(el_string_utf8_decode(data + offset, &width));
+    if (mapping == NULL) { memcpy(result + destination, data + offset, width); destination += width; }
+    else { memcpy(result + destination, mapping->bytes, mapping->size); destination += mapping->size; }
+    offset += width;
+  }
+  *output = result;
+  *output_size = result_size;
+}
+
+void __el_runtime_string_replace(const uint8_t *data, size_t size,
+                                 const uint8_t *pattern, size_t pattern_size,
+                                 const uint8_t *replacement, size_t replacement_size,
+                                 uint8_t **output, size_t *output_size,
+                                 uint32_t file, uint64_t start, uint64_t end) {
+  size_t count = 0;
+  if (pattern_size != 0) {
+    for (size_t offset = 0;;) {
+      const size_t found = el_string_find(data, size, pattern, pattern_size, offset);
+      if (found == SIZE_MAX) break;
+      count += 1;
+      offset = found + pattern_size;
+    }
+  }
+  size_t result_size = size;
+  if (replacement_size >= pattern_size) {
+    const size_t growth = replacement_size - pattern_size;
+    if (growth != 0 && count > (SIZE_MAX - size) / growth) __el_runtime_fail(7, file, start, end);
+    result_size += count * growth;
+  } else {
+    result_size -= count * (pattern_size - replacement_size);
+  }
+  uint8_t *result = __el_runtime_alloc_atomic((uint64_t)(result_size == 0 ? 1 : result_size), file, start, end);
+  size_t source = 0;
+  size_t destination = 0;
+  while (source < size && pattern_size != 0) {
+    const size_t found = el_string_find(data, size, pattern, pattern_size, source);
+    if (found == SIZE_MAX) break;
+    memcpy(result + destination, data + source, found - source);
+    destination += found - source;
+    memcpy(result + destination, replacement, replacement_size);
+    destination += replacement_size;
+    source = found + pattern_size;
+  }
+  memcpy(result + destination, data + source, size - source);
+  *output = result;
+  *output_size = result_size;
+}
+
 static ElFileStream *el_stream(FILE *file, int owned, int readable,
                                int writable) {
   ElFileStream *stream = (ElFileStream *)GC_malloc(sizeof(ElFileStream));

@@ -17,12 +17,14 @@ fn main() {
     println!("cargo:rerun-if-changed=src/native/unicode_grapheme_data.inc");
     println!("cargo:rerun-if-changed=../../runtime/vendor/boehm-gc/gc-8.2.12.tar.gz");
 
+    let output = PathBuf::from(env::var_os("OUT_DIR").expect("output dir"));
+    generate_lowercase_table(&output);
+
     if env::var_os("CARGO_FEATURE_BOEHM").is_none() {
         return;
     }
 
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("output dir"));
     let source_root = output.join("boehm-source");
     let source = source_root.join("gc-8.2.12");
     let install = output.join("boehm-install");
@@ -73,6 +75,34 @@ fn main() {
     );
 }
 
+fn generate_lowercase_table(output: &Path) {
+    let mut table = String::from("/* generated from Rust's Unicode lowercase tables */\n");
+    for codepoint in 0..=0x10ffff {
+        let Some(character) = char::from_u32(codepoint) else {
+            continue;
+        };
+        let lowered = character.to_lowercase().collect::<String>();
+        if lowered == character.to_string() {
+            continue;
+        }
+        let bytes = lowered.as_bytes();
+        table.push_str(&format!(
+            "{{0x{codepoint:x}u, {{{}",
+            bytes
+                .iter()
+                .map(|byte| format!("0x{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        for _ in bytes.len()..12 {
+            table.push_str(",0");
+        }
+        table.push_str(&format!("}}, {}}},\n", bytes.len()));
+    }
+    fs::write(output.join("unicode_lowercase_data.inc"), table)
+        .expect("write generated Unicode lowercase table");
+}
+
 fn compile_runtime(manifest: &Path, output: &Path, install: &Path) {
     let compiler = env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
     let object = output.join("el_runtime.o");
@@ -85,6 +115,8 @@ fn compile_runtime(manifest: &Path, output: &Path, install: &Path) {
         .arg("-Werror")
         .arg("-I")
         .arg(install.join("include"))
+        .arg("-I")
+        .arg(output)
         .arg("-c")
         .arg(manifest.join("src/native/runtime.c"))
         .arg("-o")

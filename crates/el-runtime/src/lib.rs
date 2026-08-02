@@ -15,7 +15,7 @@ pub use standard::{
 use std::path::{Path, PathBuf};
 
 /// Current private compiler/runtime ABI revision.
-pub const PRIVATE_ABI_VERSION: u32 = 6;
+pub const PRIVATE_ABI_VERSION: u32 = 7;
 /// Unicode data version fixed by the EL v1 language contract.
 pub const UNICODE_VERSION: &str = "17.0.0";
 /// Vendored collector release shipped with the matching compiler distribution.
@@ -61,6 +61,8 @@ pub const CONSOLE_ERROR_SYMBOL: &str = "__el_runtime_console_error";
 pub const INTEGER_TO_STRING_SYMBOL: &str = "__el_runtime_integer_to_string";
 pub const STRING_CONTAINS_SYMBOL: &str = "__el_runtime_string_contains";
 pub const STRING_SPLIT_SYMBOL: &str = "__el_runtime_string_split";
+pub const STRING_DOWNCASE_SYMBOL: &str = "__el_runtime_string_downcase";
+pub const STRING_REPLACE_SYMBOL: &str = "__el_runtime_string_replace";
 
 /// Static archives required when linking a managed EL executable.
 #[cfg(feature = "boehm")]
@@ -174,7 +176,7 @@ mod tests {
 
     #[test]
     fn private_abi_tracks_the_unicode_segmentation_boundary() {
-        assert_eq!(PRIVATE_ABI_VERSION, 6);
+        assert_eq!(PRIVATE_ABI_VERSION, 7);
         assert_eq!(BOEHM_GC_VERSION, "8.2.12");
         assert_eq!(
             BOEHM_GC_REVISION,

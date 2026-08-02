@@ -358,6 +358,7 @@ pub enum TypedExprKind {
     StringGraphemeView(Box<TypedExpr>),
     StringLength(Box<TypedExpr>),
     StringEmpty(Box<TypedExpr>),
+    StringDowncase(Box<TypedExpr>),
     StringContains {
         string: Box<TypedExpr>,
         pattern: Box<TypedExpr>,
@@ -365,6 +366,11 @@ pub enum TypedExprKind {
     StringSplit {
         string: Box<TypedExpr>,
         separator: Box<TypedExpr>,
+    },
+    StringReplace {
+        string: Box<TypedExpr>,
+        pattern: Box<TypedExpr>,
+        replacement: Box<TypedExpr>,
     },
     Bitstring(Vec<TypedBitstringSegment>),
     StringFromBytes(Box<TypedExpr>),
@@ -407,6 +413,7 @@ pub enum TypedExprKind {
         index: Box<TypedExpr>,
     },
     EnumToList(Box<TypedExpr>),
+    EnumFrequencies(Box<TypedExpr>),
     EnumVisit {
         value: Box<TypedExpr>,
         initial: Option<Box<TypedExpr>>,
@@ -4981,6 +4988,7 @@ impl<'a> Checker<'a> {
                     | "Enum.count"
                     | "Enum.at"
                     | "Enum.to_list"
+                    | "Enum.frequencies"
                     | "Enum.each"
                     | "Enum.any"
                     | "Enum.all"
@@ -4994,8 +5002,10 @@ impl<'a> Checker<'a> {
                     | "String.byte_size"
                     | "String.length"
                     | "String.empty"
+                    | "String.downcase"
                     | "String.contains"
                     | "String.split"
+                    | "String.replace"
                     | "String.bytes"
                     | "String.codepoints"
                     | "String.graphemes"
@@ -5485,7 +5495,8 @@ impl<'a> Checker<'a> {
             });
         }
         let required = match name {
-            "Slice.subslice" | "Bytes.slice" | "Bits.slice" | "Map.put" | "Enum.reduce" => 3,
+            "Slice.subslice" | "Bytes.slice" | "Bits.slice" | "Map.put" | "Enum.reduce"
+            | "String.replace" => 3,
             "Map.remove"
             | "Map.fetch"
             | "Enum.at"
@@ -5598,6 +5609,10 @@ impl<'a> Checker<'a> {
                 let ty = self.intern(Type::Bool);
                 (TypedExprKind::StringEmpty(Box::new(first)), ty)
             }
+            ("String.downcase", Type::String) => {
+                let ty = first.ty;
+                (TypedExprKind::StringDowncase(Box::new(first)), ty)
+            }
             ("String.contains", Type::String) => {
                 let string_ty = self.intern(Type::String);
                 let pattern = self.check_expr(arguments[1], Some(string_ty), owner, scopes)?;
@@ -5620,6 +5635,19 @@ impl<'a> Checker<'a> {
                         separator: Box::new(separator),
                     },
                     ty,
+                )
+            }
+            ("String.replace", Type::String) => {
+                let string_ty = self.intern(Type::String);
+                let pattern = self.check_expr(arguments[1], Some(string_ty), owner, scopes)?;
+                let replacement = self.check_expr(arguments[2], Some(string_ty), owner, scopes)?;
+                (
+                    TypedExprKind::StringReplace {
+                        string: Box::new(first),
+                        pattern: Box::new(pattern),
+                        replacement: Box::new(replacement),
+                    },
+                    string_ty,
                 )
             }
             ("String.bytes", Type::String) => {
@@ -5880,6 +5908,96 @@ impl<'a> Checker<'a> {
                 let item = self.intern(Type::String);
                 let ty = self.intern(Type::List(item));
                 (TypedExprKind::EnumToList(Box::new(first)), ty)
+            }
+            ("Enum.frequencies", source) => {
+                let (item, normalized) = match source {
+                    Type::List(item) => (item, first),
+                    Type::Array { item, .. } | Type::Slice(item) => {
+                        let list_ty = self.intern(Type::List(item));
+                        (
+                            item,
+                            TypedExpr {
+                                kind: TypedExprKind::EnumToList(Box::new(first)),
+                                ty: list_ty,
+                                span,
+                            },
+                        )
+                    }
+                    Type::Bytes => {
+                        let item = self.intern(Type::U8);
+                        let list_ty = self.intern(Type::List(item));
+                        (
+                            item,
+                            TypedExpr {
+                                kind: TypedExprKind::BytesToList(Box::new(first)),
+                                ty: list_ty,
+                                span,
+                            },
+                        )
+                    }
+                    Type::Map { key, value } => {
+                        let item = self.intern(Type::Tuple(vec![key, value]));
+                        let list_ty = self.intern(Type::List(item));
+                        (
+                            item,
+                            TypedExpr {
+                                kind: TypedExprKind::MapToList(Box::new(first)),
+                                ty: list_ty,
+                                span,
+                            },
+                        )
+                    }
+                    Type::CodepointView => {
+                        let item = self.intern(Type::Rune);
+                        let list_ty = self.intern(Type::List(item));
+                        (
+                            item,
+                            TypedExpr {
+                                kind: TypedExprKind::EnumToList(Box::new(first)),
+                                ty: list_ty,
+                                span,
+                            },
+                        )
+                    }
+                    Type::GraphemeView => {
+                        let item = self.intern(Type::String);
+                        let list_ty = self.intern(Type::List(item));
+                        (
+                            item,
+                            TypedExpr {
+                                kind: TypedExprKind::EnumToList(Box::new(first)),
+                                ty: list_ty,
+                                span,
+                            },
+                        )
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2151",
+                            arguments[0].span,
+                            "`Enum.frequencies` requires a standard iterable value",
+                        ));
+                        return None;
+                    }
+                };
+                if !self.type_satisfies(item, "Eq", owner)
+                    || !self.type_satisfies(item, "Hash", owner)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E2108",
+                        arguments[0].span,
+                        format!(
+                            "frequency key type `{}` must implement `Eq` and `Hash`",
+                            self.type_name(item)
+                        ),
+                    ));
+                    return None;
+                }
+                let ty = self.intern(Type::Map {
+                    key: item,
+                    value: usize_ty,
+                });
+                (TypedExprKind::EnumFrequencies(Box::new(normalized)), ty)
             }
             (
                 "Enum.each" | "Enum.any" | "Enum.all" | "Enum.reduce" | "Enum.filter" | "Enum.map",
@@ -8034,6 +8152,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::StringGraphemeView(value)
         | TypedExprKind::StringLength(value)
         | TypedExprKind::StringEmpty(value)
+        | TypedExprKind::StringDowncase(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -8046,6 +8165,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::EnumToList(value)
+        | TypedExprKind::EnumFrequencies(value)
         | TypedExprKind::CollectionLength { value, .. } => collect_expr_locals(value, output),
         TypedExprKind::StringContains { string, pattern } => {
             collect_expr_locals(string, output);
@@ -8054,6 +8174,15 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         TypedExprKind::StringSplit { string, separator } => {
             collect_expr_locals(string, output);
             collect_expr_locals(separator, output);
+        }
+        TypedExprKind::StringReplace {
+            string,
+            pattern,
+            replacement,
+        } => {
+            for child in [string.as_ref(), pattern.as_ref(), replacement.as_ref()] {
+                collect_expr_locals(child, output);
+            }
         }
         TypedExprKind::EnumAt { value, index } => {
             collect_expr_locals(value, output);
@@ -10445,8 +10574,10 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::StringGraphemeView(_) => "string grapheme view".to_owned(),
         TypedExprKind::StringLength(_) => "string grapheme length".to_owned(),
         TypedExprKind::StringEmpty(_) => "string empty".to_owned(),
+        TypedExprKind::StringDowncase(_) => "string downcase".to_owned(),
         TypedExprKind::StringContains { .. } => "string contains".to_owned(),
         TypedExprKind::StringSplit { .. } => "string split".to_owned(),
+        TypedExprKind::StringReplace { .. } => "string replace".to_owned(),
         TypedExprKind::Bitstring(_) => "bitstring".to_owned(),
         TypedExprKind::StringFromBytes(_) => "string from bytes".to_owned(),
         TypedExprKind::Utf8ErrorOffset(_) => "UTF-8 error offset".to_owned(),
@@ -10467,6 +10598,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::CollectionLength { .. } => "collection length".to_owned(),
         TypedExprKind::EnumAt { .. } => "enum at".to_owned(),
         TypedExprKind::EnumToList(_) => "enum to list".to_owned(),
+        TypedExprKind::EnumFrequencies(_) => "enum frequencies".to_owned(),
         TypedExprKind::EnumVisit { kind, .. } => format!("enum {kind:?}"),
         TypedExprKind::If { .. } => "if".to_owned(),
         TypedExprKind::Match { exhaustive, .. } => format!("match exhaustive={exhaustive}"),
@@ -10597,6 +10729,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::StringCodepoints(value)
         | TypedExprKind::StringLength(value)
         | TypedExprKind::StringEmpty(value)
+        | TypedExprKind::StringDowncase(value)
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
@@ -10609,6 +10742,7 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::BytesFromList(value)
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::EnumToList(value)
+        | TypedExprKind::EnumFrequencies(value)
         | TypedExprKind::CollectionLength { value, .. } => {
             write_expr(program, output, value, depth + 1);
         }
@@ -10619,6 +10753,15 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::StringSplit { string, separator } => {
             write_expr(program, output, string, depth + 1);
             write_expr(program, output, separator, depth + 1);
+        }
+        TypedExprKind::StringReplace {
+            string,
+            pattern,
+            replacement,
+        } => {
+            for child in [string.as_ref(), pattern.as_ref(), replacement.as_ref()] {
+                write_expr(program, output, child, depth + 1);
+            }
         }
         TypedExprKind::ShowConstant { value, .. } => {
             write_expr(program, output, value, depth + 1);

@@ -1217,6 +1217,34 @@ fn checks_basic_string_operations() {
 }
 
 #[test]
+fn checks_string_downcase_replace_and_enum_frequencies() {
+    let source = "defmodule Main do\n  def main() -> i32 do\n    lowered: string = String.downcase(\"ÉL İ\")\n    replaced: string = String.replace(lowered, \"é\", \"e\")\n    counts: Map(string, usize) = Enum.frequencies([replaced, replaced, \"x\"])\n    if Map.size(counts) == 2 do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let typed = checked(source).expect("new String and Enum operations type-check");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("string downcase: string"), "{debug}");
+    assert!(debug.contains("string replace: string"), "{debug}");
+    assert!(
+        debug.contains("enum frequencies: Map(string, usize)"),
+        "{debug}"
+    );
+    verify(&typed).expect("new operations produce valid Typed AST");
+
+    for invalid in [
+        "String.downcase(1)",
+        "String.replace(\"a\", 1, \"b\")",
+        "Enum.frequencies(42)",
+    ] {
+        let invalid_source = format!(
+            "defmodule Main do\n  def main() -> i32 do\n    {invalid}\n    0\n  end\nend\n"
+        );
+        assert!(
+            checked(&invalid_source).is_err(),
+            "{invalid} must be rejected"
+        );
+    }
+}
+
+#[test]
 fn checks_eager_graphemes_and_lazy_string_views() {
     let source = "defmodule Main do\n  def graphemes(text: string) -> [string] do\n    String.graphemes(text)\n  end\n  def codepoint_view(text: string) -> String.CodepointView do\n    String.codepoint_view(text)\n  end\n  def grapheme_view(text: string) -> String.GraphemeView do\n    String.grapheme_view(text)\n  end\n  def main() -> i32 do\n    if graphemes(\"é🇸🇬\") == [\"é\", \"🇸🇬\"] and Enum.to_list(codepoint_view(\"A🙂\")) == ['A', '🙂'] and Enum.to_list(grapheme_view(\"é🇸🇬\")) == [\"é\", \"🇸🇬\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("grapheme APIs and lazy views type-check");

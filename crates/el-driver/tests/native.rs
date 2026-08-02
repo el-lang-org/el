@@ -716,6 +716,29 @@ fn basic_string_operations_preserve_fields_under_gc_stress() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn string_transformations_and_frequencies_run_under_gc_stress() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  def frequency(values: Map(string, usize), key: string) -> usize do\n    match Map.fetch(values, key) do\n      some: {:some, usize} -> match some do\n        {:some, count} -> count\n      end\n      _ -> 0\n    end\n  end\n  def main() -> i32 do\n    lowered = String.downcase(\"ÉL İ\")\n    replaced = String.replace(String.downcase(\"ÉL É\"), \"é\", \"e\")\n    counts = Enum.frequencies([replaced, \"x\", replaced])\n    array_counts = Enum.frequencies(#[1, 2, 1])\n    if lowered == \"él i̇\" and replaced == \"el e\" and frequency(counts, replaced) == 2 and frequency(counts, \"x\") == 1 and Map.size(array_counts) == 2 do\n      42\n    else\n      0\n    end\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        assert_eq!(
+            build_and_run_managed(
+                &temp.0,
+                &format!("{label}-string-transform-frequency"),
+                source,
+                profile
+            )
+            .code(),
+            Some(42),
+            "String transformations and Enum.frequencies must preserve values in {label}"
+        );
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn string_length_uses_unicode_17_extended_graphemes() {
     let temp = TempDir::new();
     let source = "defmodule Main do\n  def main() -> i32 do\n    if String.length(\"\") == 0 and String.length(\"A\") == 1 and String.length(\"é\") == 1 and String.length(\"🇸🇬\") == 1 and String.length(\"👩‍👩‍👧‍👦\") == 1 and String.length(\"Aé🇸🇬👩‍👩‍👧‍👦\") == 4 do\n      42\n    else\n      0\n    end\n  end\nend\n";

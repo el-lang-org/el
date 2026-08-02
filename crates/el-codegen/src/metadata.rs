@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(metadata.pointer_width(), 64);
         assert_eq!(
             metadata.reproducibility_text(),
-            "compiler_version = \"0.1.0\"\nllvm_version = \"22.1.8\"\nllvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\nruntime_abi_version = 6\nboehm_gc_version = \"8.2.12\"\nboehm_gc_revision = \"4fab5386df64466b2b61fc7209bef033cad1e6cc\"\nunicode_version = \"17.0.0\"\n"
+            "compiler_version = \"0.1.0\"\nllvm_version = \"22.1.8\"\nllvm_target_triple = \"aarch64-unknown-test\"\npointer_width = 64\nruntime_abi_version = 7\nboehm_gc_version = \"8.2.12\"\nboehm_gc_revision = \"4fab5386df64466b2b61fc7209bef033cad1e6cc\"\nunicode_version = \"17.0.0\"\n"
         );
         assert_eq!(
             metadata.to_string(),
