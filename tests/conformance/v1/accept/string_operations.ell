@@ -2,12 +2,15 @@
 defmodule Main do
   def main() -> i32 do
     fields = String.split("a,,é,", ",")
+    words = "abc def" |> String.split()
     if String.empty("") and
       String.empty("a") == false and
       String.contains("café", "fé") and
       String.contains("abc", "") and
       fields == ["a", "", "é", ""] and
-      String.split("abc", "") == ["abc"] do
+      String.split("abc", "") == ["abc"] and
+      String.split("abc def") == ["abc", "def"] and
+      words == ["abc", "def"] do
       0
     else
       1

@@ -778,7 +778,7 @@ The basic text predicates and separator operation have these fixed signatures:
 String.empty(text: string) -> bool
 String.downcase(text: string) -> string
 String.contains(text: string, pattern: string) -> bool
-String.split(text: string, separator: string = "") -> [string]
+String.split(text: string, separator: string = " ") -> [string]
 String.replace(text: string, pattern: string, replacement: string) -> string
 Enum.frequencies(values: a) -> Map(b, usize) when a: Iterable(Item = b), b: Eq + Hash
 ```

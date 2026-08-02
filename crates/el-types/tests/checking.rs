@@ -1193,7 +1193,7 @@ fn checks_unicode_grapheme_length() {
 
 #[test]
 fn checks_basic_string_operations() {
-    let source = "defmodule Main do\n  def fields(text: string) -> [string] do\n    String.split(text, \",\")\n  end\n  def main() -> i32 do\n    if String.empty(\"\") and String.contains(\"café\", \"fé\") and fields(\"a,,b,\") == [\"a\", \"\", \"b\", \"\"] and String.split(\"abc\") == [\"abc\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
+    let source = "defmodule Main do\n  def fields(text: string) -> [string] do\n    String.split(text, \",\")\n  end\n  def main() -> i32 do\n    if String.empty(\"\") and String.contains(\"café\", \"fé\") and fields(\"a,,b,\") == [\"a\", \"\", \"b\", \"\"] and String.split(\"abc def\") == [\"abc\", \"def\"] do\n      0\n    else\n      1\n    end\n  end\nend\n";
     let typed = checked(source).expect("basic String operations type-check");
     let debug = typed.debug_tree();
     assert!(debug.contains("string empty: bool"), "{debug}");

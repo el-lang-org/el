@@ -6053,7 +6053,7 @@ impl<'a> Checker<'a> {
                     self.check_expr(separator, Some(string_ty), owner, scopes)?
                 } else {
                     TypedExpr {
-                        kind: TypedExprKind::String(String::new()),
+                        kind: TypedExprKind::String(" ".to_owned()),
                         ty: string_ty,
                         span,
                     }
