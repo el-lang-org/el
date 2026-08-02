@@ -121,6 +121,27 @@ EL v1 intentionally has no `run`, `test`, REPL, JIT, or cross-compilation
 command. Native executables are written beneath
 `build/<target-triple>/<debug-or-release>/` in the project directory.
 
+## Examples
+
+Example projects under [examples/](examples) exercise the v1 toolchain with
+manifests, lockfiles, and checked-in source. Each has its own README with build
+and run instructions:
+
+- [examples/unicode_report](examples/unicode_report/README.md) — a multi-module
+  program reporting UTF-8 byte, Unicode scalar, grapheme-cluster, word, and
+  emoji counts for an optional text argument. Demonstrates modules, derived
+  structs, tagged results, pattern matching, pipelines, generics, maps,
+  buffers, and Unicode 17.0.0 semantics.
+- [examples/file_copy](examples/file_copy/README.md) — copies `input.txt` to
+  `output.txt` in chunks. Demonstrates recoverable file operations, the
+  `Reader`/`Writer` protocols, end-of-file handling, and `defer` cleanup.
+- [examples/registration_validation](examples/registration_validation/README.md) —
+  the same registration-validation rules implemented in EL and Rust.
+  Demonstrates structural unions, exhaustive pattern matching, immutable
+  structs, `with` result propagation, and explicit Unicode string views.
+
+See [docs/EXAMPLES.md](docs/EXAMPLES.md) for a guided tour of the language.
+
 ## Language and compiler documentation
 
 - [docs/DESIGN.md](docs/DESIGN.md) — vision, runtime semantics, architecture,
@@ -138,12 +159,15 @@ precedence; examples do not override the language specification.
 ## Repository layout
 
 ```text
-crates/                    Rust compiler and runtime crates
-docs/                      Language and compiler specification documents
-examples/unicode_report/  Multi-module EL v1 example project
-runtime/                   Vendored GC and pinned Unicode inputs
-tests/conformance/v1/      Accepted and rejected v1 fixtures
-tools/                     Deterministic source-data generators
+.github/workflows/      Continuous integration workflow
+build/                 Native build output (project-local)
+crates/                Rust compiler and runtime crates
+docs/                  Language and compiler specification documents
+examples/              EL v1 example projects (file_copy, registration_validation, unicode_report)
+runtime/               Vendored GC and pinned Unicode inputs
+scripts/               Repository helper scripts (license checks)
+tests/conformance/v1/  Accepted and rejected v1 fixtures
+tools/                 Deterministic source-data generators
 ```
 
 Changes should follow the milestone and compiler-stage boundaries in
