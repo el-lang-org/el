@@ -3338,13 +3338,13 @@ impl<'a> Checker<'a> {
         let source_kind = self.types.get(source_ty.0 as usize)?.clone();
         let body_expr = match source_kind {
             Type::List(item) => {
-                self.build_iterable_show(source_expr, item, "[", "]", owner, span, string_ty)?
+                self.build_iterable_show(source_expr, item, ("[", "]"), owner, span, string_ty)?
             }
             Type::Array { item, .. } => {
-                self.build_iterable_show(source_expr, item, "#[", "]", owner, span, string_ty)?
+                self.build_iterable_show(source_expr, item, ("#[", "]"), owner, span, string_ty)?
             }
             Type::Slice(item) => {
-                self.build_iterable_show(source_expr, item, "Slice[", "]", owner, span, string_ty)?
+                self.build_iterable_show(source_expr, item, ("Slice[", "]"), owner, span, string_ty)?
             }
             Type::Map { key, value } => {
                 self.build_map_show(source_expr, key, value, owner, span, string_ty)?
@@ -3382,12 +3382,12 @@ impl<'a> Checker<'a> {
         &mut self,
         source: TypedExpr,
         item_ty: TypeId,
-        opening: &str,
-        closing: &str,
+        delimiters: (&str, &str),
         owner: DeclId,
         span: Span,
         string_ty: TypeId,
     ) -> Option<TypedExpr> {
+        let (opening, closing) = delimiters;
         let visitor = self.build_show_visitor(item_ty, None, opening, owner, span, string_ty)?;
         let function_ty = self.intern(Type::Function {
             parameters: vec![string_ty, item_ty],
