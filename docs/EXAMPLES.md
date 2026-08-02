@@ -849,8 +849,9 @@ grapheme clusters, not bytes or code points.
 
 `String.split` retains empty fields: splitting `"a,,b,"` on `","` yields
 `["a", "", "b", ""]`. An empty separator performs no split and returns the
-source as a one-element list. Use `String.graphemes` when the desired unit is a
-Unicode extended grapheme cluster.
+source as a one-element list; the separator defaults to `""`, so
+`String.split(text)` has the same behavior. Use `String.graphemes` when the
+desired unit is a Unicode extended grapheme cluster.
 
 All grapheme APIs use EL v1's bundled Unicode 17.0.0 data and the untailored
 default extended-grapheme rules from UAX #29 revision 47. Their results do not

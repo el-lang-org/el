@@ -5928,7 +5928,9 @@ impl<'a> Checker<'a> {
             | "Buffer.append_byte"
             | "Buffer.append_bytes"
             | "Buffer.append_string" => 2,
-            "String.contains" | "String.split" => 2,
+            "String.contains" => 2,
+            "String.split" if matches!(arguments.len(), 1 | 2) => arguments.len(),
+            "String.split" => 2,
             _ => 1,
         };
         if arguments.len() != required {
@@ -6047,7 +6049,15 @@ impl<'a> Checker<'a> {
             }
             ("String.split", Type::String) => {
                 let string_ty = self.intern(Type::String);
-                let separator = self.check_expr(arguments[1], Some(string_ty), owner, scopes)?;
+                let separator = if let Some(separator) = arguments.get(1) {
+                    self.check_expr(separator, Some(string_ty), owner, scopes)?
+                } else {
+                    TypedExpr {
+                        kind: TypedExprKind::String(String::new()),
+                        ty: string_ty,
+                        span,
+                    }
+                };
                 let ty = self.intern(Type::List(string_ty));
                 (
                     TypedExprKind::StringSplit {

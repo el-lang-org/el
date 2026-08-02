@@ -1264,7 +1264,7 @@ String.length(text)
 String.empty(text)
 String.downcase(text)
 String.contains(text, pattern)
-String.split(text, separator)
+String.split(text, separator = "")
 String.replace(text, pattern, replacement)
 String.bytes(text)
 String.codepoints(text)
@@ -1283,7 +1283,7 @@ Their semantics are:
 - `empty(s) -> bool` is equivalent to `byte_size(s) == 0`.
 - `contains(s, pattern) -> bool` performs an exact, case-sensitive substring
   search over UTF-8 bytes. The empty pattern is contained in every string.
-- `split(s, separator) -> [string]` separates from left to right at exact,
+- `split(s, separator = "") -> [string]` separates from left to right at exact,
   non-overlapping separator matches and preserves leading, trailing, and
   adjacent empty fields. An empty separator performs no split and returns
   `[s]`.
@@ -3867,7 +3867,7 @@ These require explicit decisions before the affected implementation begins:
 - Status: accepted
 - API: `String.empty(string) -> bool`,
   `String.contains(string, string) -> bool`, and
-  `String.split(string, string) -> [string]` are part of the v1 `String`
+  `String.split(string, string = "") -> [string]` are part of the v1 `String`
   surface.
 - Matching: `contains` and `split` use exact, case-sensitive UTF-8 byte
   matching without normalization, case folding, or locale tailoring. The empty
