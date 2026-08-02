@@ -283,6 +283,18 @@ pub enum Operation {
         ty: TypeId,
         origin: Span,
     },
+    IntegerToString {
+        result: ValueId,
+        integer: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
+    BooleanToString {
+        result: ValueId,
+        boolean: ValueId,
+        ty: TypeId,
+        origin: Span,
+    },
     BufferNew {
         result: ValueId,
         ty: TypeId,
@@ -1380,6 +1392,36 @@ impl<'a> Lowerer<'a> {
                     origin: expression.span,
                 });
                 result
+            }
+            TypedExprKind::IntegerToString(value) => {
+                let integer = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::IntegerToString {
+                    result,
+                    integer,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::BooleanToString(value) => {
+                let boolean = self.lower_expr(value)?;
+                let result = self.value();
+                self.operations.push(Operation::BooleanToString {
+                    result,
+                    boolean,
+                    ty: expression.ty,
+                    origin: expression.span,
+                });
+                result
+            }
+            TypedExprKind::ShowConstant { value, rendered } => {
+                let _ = self.lower_expr(value)?;
+                self.constant(
+                    Constant::String(rendered.clone()),
+                    expression.ty,
+                    expression.span,
+                )
             }
             TypedExprKind::BufferNew => {
                 let result = self.value();
@@ -3267,6 +3309,8 @@ pub const fn operation_collection_effect(operation: &Operation) -> CollectionEff
                 | Operation::BytesToList { .. }
                 | Operation::EnumToList { .. }
                 | Operation::RuneToString { .. }
+                | Operation::IntegerToString { .. }
+                | Operation::BooleanToString { .. }
                 | Operation::BufferAppend { .. }
                 | Operation::BufferToBytes { .. }
                 | Operation::BitsToBytes { .. }
@@ -3563,6 +3607,12 @@ fn transfer_operation(operation: &Operation, live: &mut LiveState) {
         Operation::RuneToString { rune, .. } => {
             live.values.insert(*rune);
         }
+        Operation::IntegerToString { integer, .. } => {
+            live.values.insert(*integer);
+        }
+        Operation::BooleanToString { boolean, .. } => {
+            live.values.insert(*boolean);
+        }
         Operation::BufferNew { .. } => {}
         Operation::BufferAppend { buffer, value, .. } => {
             live.values.extend([*buffer, *value]);
@@ -3713,6 +3763,8 @@ fn operation_result(operation: &Operation) -> Option<ValueId> {
         | Operation::StringFromBytes { result, .. }
         | Operation::Utf8ErrorOffset { result, .. }
         | Operation::RuneToString { result, .. }
+        | Operation::IntegerToString { result, .. }
+        | Operation::BooleanToString { result, .. }
         | Operation::BufferNew { result, .. }
         | Operation::BufferAppend { result, .. }
         | Operation::BufferToBytes { result, .. }
@@ -4700,6 +4752,8 @@ impl<'a> Monomorphizer<'a> {
             | Operation::StringFromBytes { ty, .. }
             | Operation::Utf8ErrorOffset { ty, .. }
             | Operation::RuneToString { ty, .. }
+            | Operation::IntegerToString { ty, .. }
+            | Operation::BooleanToString { ty, .. }
             | Operation::BufferNew { ty, .. }
             | Operation::BufferAppend { ty, .. }
             | Operation::BufferToBytes { ty, .. }
@@ -5222,6 +5276,8 @@ fn operation_type_ids(operation: &Operation, output: &mut Vec<TypeId>) {
         | Operation::StringFromBytes { ty, .. }
         | Operation::Utf8ErrorOffset { ty, .. }
         | Operation::RuneToString { ty, .. }
+        | Operation::IntegerToString { ty, .. }
+        | Operation::BooleanToString { ty, .. }
         | Operation::BufferNew { ty, .. }
         | Operation::BufferAppend { ty, .. }
         | Operation::BufferToBytes { ty, .. }
@@ -5661,6 +5717,8 @@ fn function_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringFromBytes { result, ty, .. }
                     | Operation::Utf8ErrorOffset { result, ty, .. }
                     | Operation::RuneToString { result, ty, .. }
+                    | Operation::IntegerToString { result, ty, .. }
+                    | Operation::BooleanToString { result, ty, .. }
                     | Operation::BufferNew { result, ty, .. }
                     | Operation::BufferAppend { result, ty, .. }
                     | Operation::BufferToBytes { result, ty, .. }
@@ -6808,6 +6866,53 @@ fn verify_operation(
             ) || !matches!(types.get(ty.0 as usize), Some(Type::String))
             {
                 errors.push(format!("rune to-string {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::IntegerToString {
+            result,
+            integer,
+            ty,
+            ..
+        } => {
+            if !values
+                .get(integer)
+                .and_then(|source| types.get(source.0 as usize))
+                .is_some_and(|source| {
+                    matches!(
+                        source,
+                        Type::I8
+                            | Type::I16
+                            | Type::I32
+                            | Type::I64
+                            | Type::Isize
+                            | Type::U8
+                            | Type::U16
+                            | Type::U32
+                            | Type::U64
+                            | Type::Usize
+                    )
+                })
+                || !matches!(types.get(ty.0 as usize), Some(Type::String))
+            {
+                errors.push(format!("integer to-string {result:?} has invalid types"));
+            }
+            define(*result, *ty, values, errors);
+        }
+        Operation::BooleanToString {
+            result,
+            boolean,
+            ty,
+            ..
+        } => {
+            if !matches!(
+                values
+                    .get(boolean)
+                    .and_then(|source| types.get(source.0 as usize)),
+                Some(Type::Bool)
+            ) || !matches!(types.get(ty.0 as usize), Some(Type::String))
+            {
+                errors.push(format!("boolean to-string {result:?} has invalid types"));
             }
             define(*result, *ty, values, errors);
         }
@@ -8557,6 +8662,24 @@ fn display_operation(operation: &Operation) -> String {
         Operation::RuneToString {
             result, rune, ty, ..
         } => format!("v{} = rune_to_string v{}: t{}", result.0, rune.0, ty.0),
+        Operation::IntegerToString {
+            result,
+            integer,
+            ty,
+            ..
+        } => format!(
+            "v{} = integer_to_string v{}: t{}",
+            result.0, integer.0, ty.0
+        ),
+        Operation::BooleanToString {
+            result,
+            boolean,
+            ty,
+            ..
+        } => format!(
+            "v{} = boolean_to_string v{}: t{}",
+            result.0, boolean.0, ty.0
+        ),
         Operation::BufferNew { result, ty, .. } => {
             format!("v{} = buffer_new: t{}", result.0, ty.0)
         }

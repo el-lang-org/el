@@ -31,7 +31,7 @@ stress tests add the runtime archive and collection-at-every-allocation mode.
 
 - Manifest syntax revision: 1 (`el_driver::MANIFEST_FORMAT_VERSION`).
 - Lockfile syntax revision: 1 (`el_driver::LOCKFILE_FORMAT_VERSION`).
-- Private compiler/runtime ABI revision: 4 (`el_runtime::PRIVATE_ABI_VERSION`
+- Private compiler/runtime ABI revision: 5 (`el_runtime::PRIVATE_ABI_VERSION`
   and `EL_PRIVATE_ABI_VERSION`).
 - LLVM: 22.1.8.
 - Boehm GC: 8.2.12, source revision

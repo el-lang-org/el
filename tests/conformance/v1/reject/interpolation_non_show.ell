@@ -1,0 +1,7 @@
+# conformance: reject; phase=type; code=E2120; spec=docs/GRAMMAR.md §2.4, docs/TYPES.md §7
+defmodule Main do
+  def main() -> i32 do
+    "buffer #{Buffer.new()}"
+    0
+  end
+end

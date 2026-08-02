@@ -290,6 +290,33 @@ fn process_snapshots_error_accessors_and_console_output_run_under_gc_stress() {
 
 #[cfg(feature = "gc-stress-test")]
 #[test]
+fn show_interpolation_formats_scalars_once_from_left_to_right() {
+    let temp = TempDir::new();
+    let source = "defmodule Main do\n  defstruct Label do\n    text: string\n  end\n  defimpl Show, for: Label do\n    def show(value: Label) -> string do\n      value.text\n    end\n  end\n  def first() -> i64 do\n    IO.print(\"A\")\n    -12\n  end\n  def second() -> bool do\n    IO.print(\"B\")\n    true\n  end\n  def main() -> i32 do\n    IO.println(\"values #{first()} #{second()} #{:ok} #{unit} #{'λ'} #{%Label{text: \"custom\"}}\")\n    IO.println(Show.show(7))\n    IO.println(8)\n    0\n  end\nend\n";
+    for (label, profile) in [
+        ("development", BuildProfile::Development),
+        ("release", BuildProfile::Release),
+    ] {
+        let executable = build_managed_executable(
+            &temp.0,
+            &format!("show-interpolation-order-{label}"),
+            source,
+            profile,
+        );
+        let output = Command::new(executable)
+            .output()
+            .expect("run interpolation fixture");
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            output.stdout,
+            "ABvalues -12 true :ok unit λ custom\n7\n8\n".as_bytes()
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[cfg(feature = "gc-stress-test")]
+#[test]
 fn milestone_eight_manifest_exit_gate_handles_every_recoverable_file_result() {
     let temp = TempDir::new();
     fs::create_dir(temp.0.join("src")).expect("create project source directory");

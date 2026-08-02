@@ -16,9 +16,10 @@ use el_ir::{
 use el_runtime::{
     ALLOCATE_ATOMIC_SYMBOL, ALLOCATE_SCANNED_SYMBOL, CONSOLE_ERROR_SYMBOL, CONSOLE_WRITE_SYMBOL,
     ERROR_CODE_SYMBOL, ERROR_KIND_SYMBOL, ERROR_OPERATION_SYMBOL, FILE_CLOSE_SYMBOL,
-    FILE_OPEN_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL, PROCESS_ARGUMENTS_SYMBOL,
-    PROCESS_GET_ENV_SYMBOL, PROCESS_SNAPSHOT_SYMBOL, READER_READ_SYMBOL, STDERR_SYMBOL,
-    STDIN_SYMBOL, STDOUT_SYMBOL, UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL, WRITER_WRITE_SYMBOL,
+    FILE_OPEN_SYMBOL, HASH_SEED_SYMBOL, INITIALIZE_SYMBOL, INTEGER_TO_STRING_SYMBOL,
+    PROCESS_ARGUMENTS_SYMBOL, PROCESS_GET_ENV_SYMBOL, PROCESS_SNAPSHOT_SYMBOL, READER_READ_SYMBOL,
+    STDERR_SYMBOL, STDIN_SYMBOL, STDOUT_SYMBOL, UTF8_VALIDATE_SYMBOL, WRITER_FLUSH_SYMBOL,
+    WRITER_WRITE_SYMBOL,
 };
 use el_runtime::{FAILURE_SYMBOL, FailureCategory, GRAPHEME_COUNT_SYMBOL, GRAPHEME_NEXT_SYMBOL};
 use inkwell::AddressSpace;
@@ -354,6 +355,8 @@ struct ModuleLowerer<'ctx, 'core> {
     console_write: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     console_error: FunctionValue<'ctx>,
+    #[cfg(feature = "managed-runtime")]
+    integer_to_string: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
     allocate_scanned: FunctionValue<'ctx>,
     #[cfg(feature = "managed-runtime")]
@@ -774,6 +777,23 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             None,
         );
         #[cfg(feature = "managed-runtime")]
+        let integer_to_string = module.add_function(
+            INTEGER_TO_STRING_SYMBOL,
+            context.void_type().fn_type(
+                &[
+                    context.i64_type().into(),
+                    context.i32_type().into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.ptr_type(AddressSpace::default()).into(),
+                    context.i32_type().into(),
+                    context.i64_type().into(),
+                    context.i64_type().into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        #[cfg(feature = "managed-runtime")]
         let hash_seed = module.add_function(
             HASH_SEED_SYMBOL,
             context
@@ -990,6 +1010,8 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
             console_write,
             #[cfg(feature = "managed-runtime")]
             console_error,
+            #[cfg(feature = "managed-runtime")]
+            integer_to_string,
             #[cfg(feature = "managed-runtime")]
             allocate_scanned,
             #[cfg(feature = "managed-runtime")]
@@ -8866,6 +8888,177 @@ impl<'ctx, 'core> ModuleLowerer<'ctx, 'core> {
                     values.insert(*result, output.into_struct_value().into());
                 }
             }
+            Operation::IntegerToString {
+                result,
+                integer,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, integer, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "integer_to_string",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let source_ty = value_types
+                        .get(integer)
+                        .and_then(|source| self.core.types.get(source.0 as usize))
+                        .ok_or(BackendError::MissingValue(*integer))?;
+                    let signed = matches!(
+                        source_ty,
+                        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::Isize
+                    );
+                    let value = integer_value(values, *integer)?;
+                    let value = built(builder.build_int_cast_sign_flag(
+                        value,
+                        self.context.i64_type(),
+                        signed,
+                        "show.integer.i64",
+                    ))?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let data_slot = built(builder.build_alloca(pointer_ty, "show.integer.data"))?;
+                    let size_slot =
+                        built(builder.build_alloca(self.usize_type()?, "show.integer.size"))?;
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    built(
+                        builder.build_call(
+                            self.integer_to_string,
+                            &[
+                                value.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(signed), false)
+                                    .into(),
+                                data_slot.into(),
+                                size_slot.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            "",
+                        ),
+                    )?;
+                    let data = built(builder.build_load(
+                        pointer_ty,
+                        data_slot,
+                        "show.integer.data.value",
+                    ))?
+                    .into_pointer_value();
+                    let size = built(builder.build_load(
+                        self.usize_type()?,
+                        size_slot,
+                        "show.integer.size.value",
+                    ))?
+                    .into_int_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(output, data, 0, "string.data"))?;
+                    output = built(builder.build_insert_value(output, size, 1, "string.length"))?;
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
+            Operation::BooleanToString {
+                result,
+                boolean,
+                ty,
+                origin,
+            } => {
+                #[cfg(not(feature = "managed-runtime"))]
+                {
+                    let _ = (result, boolean, ty, origin);
+                    return Err(BackendError::UnsupportedOperation {
+                        function,
+                        block,
+                        operation: "boolean_to_string",
+                    });
+                }
+                #[cfg(feature = "managed-runtime")]
+                {
+                    let roots = roots.ok_or_else(|| {
+                        BackendError::InvalidConcrete(vec![format!(
+                            "missing live-root set for collection point {function:?} {block:?}"
+                        )])
+                    })?;
+                    self.preserve_roots(roots, builder, values, slots, root_slots, slot_types)?;
+                    let value = built(builder.build_int_z_extend(
+                        integer_value(values, *boolean)?,
+                        self.context.i64_type(),
+                        "show.boolean.i64",
+                    ))?;
+                    let pointer_ty = self.context.ptr_type(AddressSpace::default());
+                    let data_slot = built(builder.build_alloca(pointer_ty, "show.boolean.data"))?;
+                    let size_slot =
+                        built(builder.build_alloca(self.usize_type()?, "show.boolean.size"))?;
+                    let source_origin = FailureOrigin::from_span(*origin)
+                        .map_err(|()| BackendError::SourceOriginOutOfRange)?;
+                    built(
+                        builder.build_call(
+                            self.integer_to_string,
+                            &[
+                                value.into(),
+                                self.context.i32_type().const_int(2, false).into(),
+                                data_slot.into(),
+                                size_slot.into(),
+                                self.context
+                                    .i32_type()
+                                    .const_int(u64::from(source_origin.file), false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.start, false)
+                                    .into(),
+                                self.context
+                                    .i64_type()
+                                    .const_int(source_origin.end, false)
+                                    .into(),
+                            ],
+                            "",
+                        ),
+                    )?;
+                    let data = built(builder.build_load(
+                        pointer_ty,
+                        data_slot,
+                        "show.boolean.data.value",
+                    ))?
+                    .into_pointer_value();
+                    let size = built(builder.build_load(
+                        self.usize_type()?,
+                        size_slot,
+                        "show.boolean.size.value",
+                    ))?
+                    .into_int_value();
+                    self.clear_value_roots(roots, builder, root_slots, value_types)?;
+                    let mut output = AggregateValueEnum::StructValue(
+                        self.basic_type(*ty)?.into_struct_type().get_undef(),
+                    );
+                    output = built(builder.build_insert_value(output, data, 0, "string.data"))?;
+                    output = built(builder.build_insert_value(output, size, 1, "string.length"))?;
+                    values.insert(*result, output.into_struct_value().into());
+                }
+            }
             Operation::BufferNew { result, ty, .. } => {
                 values.insert(*result, self.basic_type(*ty)?.const_zero());
             }
@@ -13120,6 +13313,8 @@ fn core_value_types(function: &CoreFunction) -> BTreeMap<ValueId, TypeId> {
                     | Operation::StringFromBytes { result, ty, .. }
                     | Operation::Utf8ErrorOffset { result, ty, .. }
                     | Operation::RuneToString { result, ty, .. }
+                    | Operation::IntegerToString { result, ty, .. }
+                    | Operation::BooleanToString { result, ty, .. }
                     | Operation::BufferNew { result, ty, .. }
                     | Operation::BufferAppend { result, ty, .. }
                     | Operation::BufferToBytes { result, ty, .. }

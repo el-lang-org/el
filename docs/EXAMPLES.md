@@ -123,8 +123,15 @@ letter = 'λ'
 status = :not_found
 ```
 
-V1 has no numeric suffixes, raw or multiline strings, interpolation,
+V1 has no numeric suffixes, raw or multiline strings, interpolation format specifiers,
 hexadecimal floating literals, or literal NaN and infinity.
+
+Values implementing `Show` may be embedded with `#{...}`:
+
+```el
+message = "user #{name} has #{count} messages"
+literal_marker = "write \#{value} to show interpolation syntax"
+```
 
 Evaluation is eager, exactly once, and left to right. This includes operator
 operands, function arguments, collection elements, struct initializers,

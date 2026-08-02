@@ -355,6 +355,12 @@ pub enum TypedExprKind {
     StringFromBytes(Box<TypedExpr>),
     Utf8ErrorOffset(Box<TypedExpr>),
     RuneToString(Box<TypedExpr>),
+    IntegerToString(Box<TypedExpr>),
+    BooleanToString(Box<TypedExpr>),
+    ShowConstant {
+        value: Box<TypedExpr>,
+        rendered: String,
+    },
     BufferNew,
     BufferAppend {
         buffer: Box<TypedExpr>,
@@ -1780,7 +1786,7 @@ impl<'a> Checker<'a> {
                 ty: TypeId(3),
                 span: node.span,
             }),
-            "string" => self.check_string(node),
+            "string" => self.check_string(node, owner, scopes),
             "rune" => self.check_rune(node),
             "bitstring_expr" => self.check_bitstring(node, owner, scopes),
             "atom" => self.check_atom(node),
@@ -2845,15 +2851,124 @@ impl<'a> Checker<'a> {
         })
     }
 
-    fn check_string(&mut self, node: &Node) -> Option<TypedExpr> {
-        let Some(Value::String { decoded, .. }) = &node.value else {
-            return None;
-        };
-        Some(TypedExpr {
-            kind: TypedExprKind::String(decoded.clone()),
-            ty: self.intern(Type::String),
+    fn check_string(
+        &mut self,
+        node: &Node,
+        owner: DeclId,
+        scopes: &mut Vec<BTreeMap<String, Local>>,
+    ) -> Option<TypedExpr> {
+        let string_ty = self.intern(Type::String);
+        if let Some(Value::String { decoded, .. }) = &node.value {
+            return Some(TypedExpr {
+                kind: TypedExprKind::String(decoded.clone()),
+                ty: string_ty,
+                span: node.span,
+            });
+        }
+        let mut parts = Vec::new();
+        for child in &node.children {
+            let part = match child.kind.as_str() {
+                "string_text" | "escape" | "escaped_interpolation" => {
+                    let Some(Value::String { decoded, .. }) = &child.value else {
+                        return None;
+                    };
+                    TypedExpr {
+                        kind: TypedExprKind::String(decoded.clone()),
+                        ty: string_ty,
+                        span: child.span,
+                    }
+                }
+                "interpolation" => {
+                    let value = self.check_expr(child.children.first()?, None, owner, scopes)?;
+                    if !self.type_satisfies(value.ty, "Show", owner) {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E2120",
+                            value.span,
+                            format!(
+                                "type `{}` does not satisfy `Show`",
+                                self.type_name(value.ty)
+                            ),
+                        ));
+                        return None;
+                    }
+                    self.show_value(value, owner)?
+                }
+                _ => return None,
+            };
+            parts.push(part);
+        }
+        let mut parts = parts.into_iter();
+        let mut result = parts.next().unwrap_or(TypedExpr {
+            kind: TypedExprKind::String(String::new()),
+            ty: string_ty,
             span: node.span,
-        })
+        });
+        for part in parts {
+            result = TypedExpr {
+                kind: TypedExprKind::Concat {
+                    left: Box::new(result),
+                    right: Box::new(part),
+                },
+                ty: string_ty,
+                span: node.span,
+            };
+        }
+        Some(result)
+    }
+
+    fn show_value(&mut self, value: TypedExpr, owner: DeclId) -> Option<TypedExpr> {
+        let string_ty = self.intern(Type::String);
+        let span = value.span;
+        if let Some(call) =
+            self.explicit_protocol_call(value.ty, "Show", "show", vec![value.clone()], span, owner)
+        {
+            return Some(call);
+        }
+        match self.types.get(value.ty.0 as usize) {
+            Some(Type::String) => Some(value),
+            Some(Type::Rune) => Some(TypedExpr {
+                kind: TypedExprKind::RuneToString(Box::new(value)),
+                ty: string_ty,
+                span,
+            }),
+            Some(ty) if is_integer_type(ty) => Some(TypedExpr {
+                kind: TypedExprKind::IntegerToString(Box::new(value)),
+                ty: string_ty,
+                span,
+            }),
+            Some(Type::Bool) => Some(TypedExpr {
+                kind: TypedExprKind::BooleanToString(Box::new(value)),
+                ty: string_ty,
+                span,
+            }),
+            Some(Type::Unit) => Some(TypedExpr {
+                kind: TypedExprKind::ShowConstant {
+                    value: Box::new(value),
+                    rendered: "unit".to_owned(),
+                },
+                ty: string_ty,
+                span,
+            }),
+            Some(Type::Atom(name)) => Some(TypedExpr {
+                kind: TypedExprKind::ShowConstant {
+                    value: Box::new(value),
+                    rendered: format!(":{name}"),
+                },
+                ty: string_ty,
+                span,
+            }),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2105",
+                    span,
+                    format!(
+                        "standard `Show` formatting for `{}` is not implemented",
+                        self.type_name(value.ty)
+                    ),
+                ));
+                None
+            }
+        }
     }
 
     fn check_bitstring(
@@ -4435,6 +4550,40 @@ impl<'a> Checker<'a> {
                 span,
             });
         }
+        if written.as_deref() == Some("Show.show") {
+            let arguments_node = node
+                .children
+                .iter()
+                .find(|node| node.kind.as_str() == "call_arguments")?;
+            let argument_nodes = input
+                .into_iter()
+                .chain(arguments_node.children.iter())
+                .collect::<Vec<_>>();
+            if argument_nodes.len() != 1 {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2111",
+                    span,
+                    format!(
+                        "function `Show.show` expects 1 argument but received {}",
+                        argument_nodes.len()
+                    ),
+                ));
+                return None;
+            }
+            let value = self.check_expr(argument_nodes[0], None, owner, scopes)?;
+            if !self.type_satisfies(value.ty, "Show", owner) {
+                self.diagnostics.push(Diagnostic::error(
+                    "E2120",
+                    value.span,
+                    format!(
+                        "type `{}` does not satisfy `Show`",
+                        self.type_name(value.ty)
+                    ),
+                ));
+                return None;
+            }
+            return self.show_value(value, owner);
+        }
         if written.as_deref().is_some_and(|name| {
             matches!(
                 name,
@@ -4880,6 +5029,12 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                     return None;
+                }
+                if !matches!(
+                    self.types.get(arguments[0].ty.0 as usize),
+                    Some(Type::String | Type::Opaque(OpaqueType::FileError | OpaqueType::IoError))
+                ) {
+                    arguments[0] = self.show_value(arguments[0].clone(), owner)?;
                 }
                 unit_ty
             }
@@ -7499,6 +7654,8 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
+        | TypedExprKind::IntegerToString(value)
+        | TypedExprKind::BooleanToString(value)
         | TypedExprKind::BufferToBytes(value)
         | TypedExprKind::BufferToString(value)
         | TypedExprKind::BytesToBits(value)
@@ -7545,6 +7702,7 @@ fn collect_expr_locals(expression: &TypedExpr, output: &mut BTreeSet<SymbolId>) 
             collect_expr_locals(buffer, output);
             collect_expr_locals(value, output);
         }
+        TypedExprKind::ShowConstant { value, .. } => collect_expr_locals(value, output),
         TypedExprKind::SliceSubslice {
             value,
             start,
@@ -8108,6 +8266,52 @@ fn verify_expr(
                 || !matches!(types.get(expression.ty.0 as usize), Some(Type::String))
             {
                 errors.push("rune to-string conversion has incorrect types".to_owned());
+            }
+        }
+        TypedExprKind::IntegerToString(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !types.get(value.ty.0 as usize).is_some_and(is_integer_type)
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::String))
+            {
+                errors.push("integer to-string has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::BooleanToString(value) => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(value.ty.0 as usize), Some(Type::Bool))
+                || !matches!(types.get(expression.ty.0 as usize), Some(Type::String))
+            {
+                errors.push("boolean to-string has invalid types".to_owned());
+            }
+        }
+        TypedExprKind::ShowConstant { value, .. } => {
+            verify_expr(
+                value,
+                types,
+                type_count,
+                declarations,
+                symbols,
+                mutable_symbols,
+                errors,
+            );
+            if !matches!(types.get(expression.ty.0 as usize), Some(Type::String)) {
+                errors.push("constant Show conversion must produce string".to_owned());
             }
         }
         TypedExprKind::BufferNew => {
@@ -9812,6 +10016,9 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         TypedExprKind::StringFromBytes(_) => "string from bytes".to_owned(),
         TypedExprKind::Utf8ErrorOffset(_) => "UTF-8 error offset".to_owned(),
         TypedExprKind::RuneToString(_) => "rune to string".to_owned(),
+        TypedExprKind::IntegerToString(_) => "integer to string".to_owned(),
+        TypedExprKind::BooleanToString(_) => "boolean to string".to_owned(),
+        TypedExprKind::ShowConstant { rendered, .. } => format!("show constant {rendered:?}"),
         TypedExprKind::BufferNew => "buffer new".to_owned(),
         TypedExprKind::BufferAppend { kind, .. } => format!("buffer append {kind:?}"),
         TypedExprKind::BufferToBytes(_) => "buffer to bytes".to_owned(),
@@ -9949,6 +10156,8 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::StringFromBytes(value)
         | TypedExprKind::Utf8ErrorOffset(value)
         | TypedExprKind::RuneToString(value)
+        | TypedExprKind::IntegerToString(value)
+        | TypedExprKind::BooleanToString(value)
         | TypedExprKind::BufferToBytes(value)
         | TypedExprKind::BufferToString(value)
         | TypedExprKind::BytesToBits(value)
@@ -9957,6 +10166,9 @@ fn write_expr(program: &TypedProgram, output: &mut String, expression: &TypedExp
         | TypedExprKind::BytesToList(value)
         | TypedExprKind::EnumToList(value)
         | TypedExprKind::CollectionLength { value, .. } => {
+            write_expr(program, output, value, depth + 1);
+        }
+        TypedExprKind::ShowConstant { value, .. } => {
             write_expr(program, output, value, depth + 1);
         }
         TypedExprKind::EnumAt { value, index } => {

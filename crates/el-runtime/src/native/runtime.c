@@ -1,5 +1,6 @@
 #include <gc.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -529,6 +530,26 @@ void __el_runtime_console_error(const void *value, uint32_t use_stderr,
   if (length < 0 || (size_t)length >= sizeof(text)) __el_runtime_fail(7, 0, 0, 0);
   __el_runtime_console_write((const uint8_t *)text, (size_t)length, use_stderr,
                              newline);
+}
+
+void __el_runtime_integer_to_string(uint64_t value, uint32_t kind,
+                                    uint8_t **data, size_t *size,
+                                    uint32_t file, uint64_t start,
+                                    uint64_t end) {
+  char temporary[32];
+  const int length = kind == 2
+      ? snprintf(temporary, sizeof(temporary), "%s", value != 0 ? "true" : "false")
+      : kind == 1
+          ? snprintf(temporary, sizeof(temporary), "%" PRId64, (int64_t)value)
+          : snprintf(temporary, sizeof(temporary), "%" PRIu64, value);
+  if (length < 0 || (size_t)length >= sizeof(temporary)) {
+    __el_runtime_fail(EL_FAILURE_ALLOCATION_EXHAUSTED, file, start, end);
+  }
+  uint8_t *copy = __el_runtime_alloc_atomic((uint64_t)(length == 0 ? 1 : length),
+                                            file, start, end);
+  if (length > 0) memcpy(copy, temporary, (size_t)length);
+  *data = copy;
+  *size = (size_t)length;
 }
 
 static ElFileStream *el_stream(FILE *file, int owned, int readable,

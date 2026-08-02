@@ -763,6 +763,13 @@ functions is unrecoverable. Programs that must recover use
 implement `Writer`; their associated error type is `IO.Error`. These
 process-owned handles are not closed by EL programs.
 
+An interpolated string expression has type `string`. Every expression inside a
+`#{...}` segment must satisfy `Show`, and the compiler statically selects the
+same implementation as an explicit `Show.show` call. Segment expressions are
+evaluated eagerly, exactly once, and from left to right. Interpolation performs
+human-readable conversion only; it is not serialization and provides no
+format-specifier syntax in v1.
+
 Files expose statically separated byte reader and writer handles:
 
 ```el

@@ -1297,6 +1297,25 @@ fn checks_value_style_buffer_operations_and_utf8_results() {
 }
 
 #[test]
+fn checks_show_backed_string_interpolation() {
+    let source = "defmodule Main do\n  def message(count: usize, ready: bool) -> string do\n    \"count=#{count} ready=#{ready} atom=#{:ok} unit=#{unit} rune=#{'λ'}\"\n  end\nend\n";
+    let typed = checked(source).expect("Show-backed interpolation type checks");
+    let debug = typed.debug_tree();
+    assert!(debug.contains("integer to string"), "{debug}");
+    assert!(debug.contains("boolean to string"), "{debug}");
+    assert!(debug.contains("show constant \":ok\""), "{debug}");
+    verify(&typed).expect("interpolated-string Typed AST verifies");
+
+    let invalid = "defmodule Main do\n  def message() -> string do\n    \"buffer=#{Buffer.new()}\"\n  end\nend\n";
+    assert!(
+        checked(invalid)
+            .expect_err("non-Show interpolation is rejected")
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E2120")
+    );
+}
+
+#[test]
 fn checks_arbitrary_bit_views_indexing_and_alignment_conversion() {
     let source = "defmodule Main do\n  def convert(data: bytes) -> {:some, bytes} | :none do\n    bits = Bytes.to_bits(data)\n    Bits.bit_size(bits)\n    view = Bits.slice(bits, 1, 7)\n    view[0]\n    Bits.to_bytes(view)\n  end\nend\n";
     let typed = checked(source).expect("bits APIs and direct indexing type check");

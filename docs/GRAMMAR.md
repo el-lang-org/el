@@ -91,12 +91,16 @@ underscore separators. An otherwise unconstrained floating literal defaults to
 `f64`. Hexadecimal floating literals and literal spellings for NaN and infinity
 are not supported in v1.
 
-A double-quoted string literal is valid UTF-8. A single-quoted rune literal must
+A double-quoted string is valid UTF-8 and may contain `#{expression}`
+interpolation. Each embedded expression is evaluated exactly once from left to
+right and must implement `Show`; its `Show.show` result is inserted without
+additional quoting. `\#{` inserts the literal two-character sequence `#{`.
+A single-quoted rune literal must
 contain exactly one Unicode scalar value. The supported escapes, where
 applicable, are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, `\xNN`, and
 `\u{...}`. The decoded result of a string literal must remain valid UTF-8, and a
 Unicode escape must denote a scalar value rather than a surrogate. String
-interpolation, raw strings, multiline strings, and adjacent-literal
+format specifiers, raw strings, multiline strings, and adjacent-literal
 concatenation are deferred.
 
 An atom literal is `:` followed by an ASCII `snake_case` identifier, such as
@@ -237,6 +241,10 @@ bit_modifier     <- "integer" / "signed" / "unsigned" / "big" / "little"
 
 literal          <- float / integer / string / rune / atom
                   / "true" / "false" / "unit"
+string           <- '"' (interpolation / escaped_interpolation
+                    / string_character)* '"'
+interpolation    <- "#{" expression "}"
+escaped_interpolation <- "\\#{"
 primitive_type   <- "bool" / "i8" / "i16" / "i32" / "i64" / "isize"
                   / "u8" / "u16" / "u32" / "u64" / "usize"
                   / "f32" / "f64" / "rune" / "string" / "bytes"

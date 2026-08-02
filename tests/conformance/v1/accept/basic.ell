@@ -3,6 +3,7 @@ defmodule Main do
   def main() -> i32 do
     left: i32 = 20
     right: i32 = 22
+    message = "sum #{left + right}"
     if left < right do
       left + right
     else

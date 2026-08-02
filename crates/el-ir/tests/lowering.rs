@@ -1927,6 +1927,18 @@ fn lowers_value_style_buffers_and_reuses_strict_utf8_validation() {
 }
 
 #[test]
+fn lowers_show_backed_interpolation_to_ordered_string_operations() {
+    let module = lowered(
+        "defmodule Main do\n  def message(value: i64) -> string do\n    \"value=#{value} ready=#{true}\"\n  end\nend\n",
+    );
+    let debug = module.debug_text();
+    assert!(debug.contains("integer_to_string"), "{debug}");
+    assert!(debug.contains("boolean_to_string"), "{debug}");
+    assert!(debug.contains("concat"), "{debug}");
+    verify(&module).expect("interpolation Core verifies");
+}
+
+#[test]
 fn lowers_arbitrary_bit_views_indexing_and_alignment_conversion() {
     let module = lowered(
         "defmodule Main do\n  def main() -> i32 do\n    bits = Bytes.to_bits(String.bytes(\"abc\"))\n    view = Bits.slice(bits, 3, 16)\n    Bits.to_bytes(view)\n    if Bits.bit_size(view) == 16 and view[0] do\n      0\n    else\n      1\n    end\n  end\nend\n",

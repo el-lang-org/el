@@ -1255,7 +1255,7 @@ every claimed host and freeze the v1 delivery contract.
 and repository-level accepted/rejected reference fixtures. Diagnostics now render
 stable codes, labels, notes, help, package-relative paths, Unicode-scalar locations,
 and deterministic source excerpts. Manifest/lock syntax revision 1 and private
-runtime ABI revision 4 are frozen and recorded with the compiler, LLVM 22.1.8,
+runtime ABI revision 5 are frozen and recorded with the compiler, LLVM 22.1.8,
 Boehm GC 8.2.12 revision, target, pointer width, and Unicode 17.0.0 in build
 metadata. Darwin arm64 is the sole supported native target and passes development
 and optimized workspace semantics, LLVM verification, the full Unicode corpus,

@@ -53,3 +53,18 @@ fn rejects_invalid_integer_separators_and_identifiers() {
         assert!(parse(file, &source).is_err(), "accepted {expression}");
     }
 }
+
+#[test]
+fn parses_interpolated_strings() {
+    let source = "defmodule Main do\n  def message(value: i64) -> string do\n    \"value: #{value}\"\n  end\nend\n";
+    let mut sources = SourceMap::new();
+    let file = sources.add_file("src/main.ell", source);
+    let program = parse(file, source).expect("interpolation parses");
+    assert!(program.debug_tree().contains("interpolation"));
+
+    let escaped =
+        "defmodule Main do\n  def message() -> string do\n    \"literal \\#{value}\"\n  end\nend\n";
+    let file = sources.add_file("src/escaped.ell", escaped);
+    let program = parse(file, escaped).expect("escaped interpolation marker parses");
+    assert!(program.debug_tree().contains("escaped_interpolation"));
+}

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EL_PRIVATE_ABI_VERSION 4u
+#define EL_PRIVATE_ABI_VERSION 5u
 
 _Noreturn void __el_runtime_fail(uint32_t category, uint32_t file,
                                  uint64_t start, uint64_t end);
@@ -40,5 +40,9 @@ void __el_runtime_console_write(const uint8_t *data, size_t size,
                                 uint32_t use_stderr, uint32_t newline);
 void __el_runtime_console_error(const void *error, uint32_t use_stderr,
                                 uint32_t newline);
+void __el_runtime_integer_to_string(uint64_t value, uint32_t kind,
+                                    uint8_t **data, size_t *size,
+                                    uint32_t file, uint64_t start,
+                                    uint64_t end);
 
 #endif

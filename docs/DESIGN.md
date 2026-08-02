@@ -240,8 +240,9 @@ contain exactly one Unicode scalar value. The supported escapes, where
 applicable, are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, `\xNN`, and
 `\u{...}`. The decoded result of a string literal must remain valid UTF-8, and a
 Unicode escape must denote a scalar value rather than a surrogate. String
-interpolation, raw strings, multiline strings, and adjacent-literal
-concatenation are deferred.
+format specifiers, raw strings, multiline strings, and adjacent-literal
+concatenation are deferred. Strings may interpolate a `Show` value with
+`#{expression}` as specified by `GRAMMAR.md` and `TYPES.md`.
 
 An atom literal is `:` followed by an ASCII `snake_case` identifier, such as
 `:ok` or `:not_found`. Quoted atoms and conversion of runtime strings to atoms
@@ -3165,7 +3166,7 @@ These require explicit decisions before the affected implementation begins:
   restricted underscore separators and no suffixes. Floats use decimal points
   or exponents. Strings are double-quoted UTF-8, runes are single-quoted Unicode
   scalar values, atoms are colon-prefixed ASCII `snake_case`, and `unit` is the
-  sole unit value. V1 excludes raw and multiline strings, interpolation,
+  sole unit value. V1 excludes raw and multiline strings, interpolation format specifiers,
   hexadecimal floats, and literal NaN or infinity.
 - Composites: Tuples use `{...}` and contain at least two elements, lists use
   `[...]` and `[head | tail]`, fixed arrays use `#[...]`, maps use
@@ -3784,6 +3785,22 @@ These require explicit decisions before the affected implementation begins:
 - Consequence: Project discovery, module-to-path mapping, examples, diagnostics,
   editor integrations, and compiler tooling must recognize `.ell` as the EL
   source extension. `.el` is not an alternate EL source extension.
+
+### D-067 — `Show`-backed string interpolation
+
+- Date: 2026-08-02
+- Status: accepted
+- Syntax: A double-quoted string may contain `#{expression}` segments; `\#{`
+  inserts the literal marker. Format specifiers and multiline interpolation are
+  outside v1.
+- Types: Every embedded expression must implement `Show`. Static protocol
+  selection is identical to `Show.show(expression)`, and the resulting text is
+  inserted without implicit quoting.
+- Evaluation: Segments evaluate eagerly, exactly once, and from left to right.
+  Formatting yields valid UTF-8 and allocation failure is unrecoverable.
+- Reason: Diagnostics and ordinary presentation should not require manual
+  `Buffer` construction or repeated concatenation while EL retains explicit,
+  statically selected conversion semantics.
 
 ## 21. Next design checkpoint
 

@@ -463,6 +463,14 @@ fn build_node(file: FileId, pair: Pair<'_, Rule>) -> Result<Node, ParseError> {
         return build_unary(file, pair);
     }
     let mut value = build_value(file, &pair)?;
+    if rule == Rule::string && value.is_some() {
+        return Ok(Node {
+            kind: SyntaxKind::new("string"),
+            span,
+            value,
+            children: Vec::new(),
+        });
+    }
     let mut children = Vec::new();
     for child in pair.clone().into_inner() {
         if is_ast_punctuation(child.as_rule()) {
@@ -760,9 +768,30 @@ fn build_value(file: FileId, pair: &Pair<'_, Rule>) -> Result<Option<Value>, Par
             spelling: spelling.to_owned(),
             normalized: spelling.replace('_', ""),
         }),
-        Rule::string => Some(Value::String {
+        Rule::string
+            if !descendants(pair.clone()).any(|node| {
+                matches!(
+                    node.as_rule(),
+                    Rule::interpolation | Rule::escaped_interpolation
+                )
+            }) =>
+        {
+            Some(Value::String {
+                spelling: spelling.to_owned(),
+                decoded: decode_quoted(file, pair, '"')?,
+            })
+        }
+        Rule::string_text => Some(Value::String {
             spelling: spelling.to_owned(),
-            decoded: decode_quoted(file, pair, '"')?,
+            decoded: spelling.to_owned(),
+        }),
+        Rule::escaped_interpolation => Some(Value::String {
+            spelling: spelling.to_owned(),
+            decoded: "#{".to_owned(),
+        }),
+        Rule::escape => Some(Value::String {
+            spelling: spelling.to_owned(),
+            decoded: decode_escape(file, pair)?,
         }),
         Rule::rune => {
             let decoded = decode_quoted(file, pair, '\'')?;
@@ -844,6 +873,54 @@ fn decode_quoted(file: FileId, pair: &Pair<'_, Rule>, quote: char) -> Result<Str
             }
             _ => unreachable!("grammar limits escapes"),
         }
+    }
+    Ok(output)
+}
+
+fn decode_escape(file: FileId, pair: &Pair<'_, Rule>) -> Result<String, ParseError> {
+    let wrapped = format!("\"{}\"", pair.as_str());
+    let content = &wrapped[1..wrapped.len() - 1];
+    let mut output = String::new();
+    let mut chars = content.char_indices();
+    let (_, slash) = chars.next().expect("escape begins with a slash");
+    debug_assert_eq!(slash, '\\');
+    let (_, escape) = chars.next().expect("grammar requires an escape body");
+    match escape {
+        '\\' => output.push('\\'),
+        '"' => output.push('"'),
+        '\'' => output.push('\''),
+        'n' => output.push('\n'),
+        'r' => output.push('\r'),
+        't' => output.push('\t'),
+        '0' => output.push('\0'),
+        'x' => {
+            let (_, high) = chars.next().expect("grammar requires two hex digits");
+            let (_, low) = chars.next().expect("grammar requires two hex digits");
+            output.push(
+                char::from_u32(
+                    high.to_digit(16).expect("hex digit") * 16
+                        + low.to_digit(16).expect("hex digit"),
+                )
+                .expect("one-byte value is a scalar"),
+            );
+        }
+        'u' => {
+            let _ = chars.next().expect("grammar requires `{`");
+            let digits = chars
+                .map(|(_, character)| character)
+                .take_while(|character| *character != '}')
+                .collect::<String>();
+            let scalar = u32::from_str_radix(&digits, 16).expect("grammar bounds Unicode hex");
+            let Some(character) = char::from_u32(scalar) else {
+                return Err(error_pair(
+                    file,
+                    pair,
+                    "Unicode escapes must denote scalar values",
+                ));
+            };
+            output.push(character);
+        }
+        _ => unreachable!("grammar limits escapes"),
     }
     Ok(output)
 }

@@ -15,7 +15,7 @@ pub use standard::{
 use std::path::{Path, PathBuf};
 
 /// Current private compiler/runtime ABI revision.
-pub const PRIVATE_ABI_VERSION: u32 = 4;
+pub const PRIVATE_ABI_VERSION: u32 = 5;
 /// Unicode data version fixed by the EL v1 language contract.
 pub const UNICODE_VERSION: &str = "17.0.0";
 /// Vendored collector release shipped with the matching compiler distribution.
@@ -58,6 +58,7 @@ pub const PROCESS_ARGUMENTS_SYMBOL: &str = "__el_runtime_process_arguments";
 pub const PROCESS_GET_ENV_SYMBOL: &str = "__el_runtime_process_get_env";
 pub const CONSOLE_WRITE_SYMBOL: &str = "__el_runtime_console_write";
 pub const CONSOLE_ERROR_SYMBOL: &str = "__el_runtime_console_error";
+pub const INTEGER_TO_STRING_SYMBOL: &str = "__el_runtime_integer_to_string";
 
 /// Static archives required when linking a managed EL executable.
 #[cfg(feature = "boehm")]
@@ -122,6 +123,7 @@ pub fn runtime_call_effect(symbol: &str) -> Option<RuntimeCallEffect> {
         | PROCESS_SNAPSHOT_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         PROCESS_ARGUMENTS_SYMBOL | PROCESS_GET_ENV_SYMBOL => Some(RuntimeCallEffect::Allocating),
         CONSOLE_WRITE_SYMBOL | CONSOLE_ERROR_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
+        INTEGER_TO_STRING_SYMBOL => Some(RuntimeCallEffect::Allocating),
         FAILURE_SYMBOL => Some(RuntimeCallEffect::NonAllocating),
         _ => None,
     }
@@ -169,7 +171,7 @@ mod tests {
 
     #[test]
     fn private_abi_tracks_the_unicode_segmentation_boundary() {
-        assert_eq!(PRIVATE_ABI_VERSION, 4);
+        assert_eq!(PRIVATE_ABI_VERSION, 5);
         assert_eq!(BOEHM_GC_VERSION, "8.2.12");
         assert_eq!(
             BOEHM_GC_REVISION,
